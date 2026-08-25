@@ -1,0 +1,168 @@
+"""Regression coverage for the high-risk TIDAL transfer audit fixes."""
+
+from __future__ import annotations
+
+import logging
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+from core.auth import TidalLibraryClient, UnsupportedOperationError
+from core.cleanup import CleanupManager, CleanupScope, DeleteQueue, DeleteQueueStore
+from core.models import AccountProfile, LibrarySnapshot, TransferReport
+from core.sorting import SortOrder, sort_items
+from core.state import TransferState, TransferStateStore
+from core.transfer import TransferOptions, TransferService
+from core.verification import VerificationService
+from core.retry import RetryExecutor, RetryPolicy
+import requests
+
+
+class PaginationTests(unittest.TestCase):
+    def _client(self) -> TidalLibraryClient:
+        return TidalLibraryClient(SimpleNamespace(), logging.getLogger("test.pagination"))
+
+    def test_offset_pagination_terminates_at_boundaries_and_over_100(self) -> None:
+        for count in (0, 1, 49, 50, 51, 101):
+            objects = [SimpleNamespace(id=str(index)) for index in range(count)]
+            calls: list[int] = []
+
+            def getter(*, limit: int, offset: int):
+                calls.append(offset)
+                return objects[offset : offset + limit]
+
+            result = self._client()._paginate_offset(getter, operation="test", unique_ids=True)
+            self.assertEqual([item.id for item in result], [str(index) for index in range(count)])
+            self.assertLessEqual(len(calls), count // 50 + 2)
+
+    def test_repeated_full_folder_page_is_stopped_without_duplicates(self) -> None:
+        page = [SimpleNamespace(id=str(index)) for index in range(50)]
+        result = self._client()._paginate_offset(
+            lambda **_: page, operation="folders", unique_ids=True
+        )
+        self.assertEqual(len(result), 50)
+
+    def test_rate_limit_retry_after_is_not_shortened(self) -> None:
+        response = SimpleNamespace(status_code=429, headers={"Retry-After": "13"})
+        error = requests.HTTPError(response=response)
+        sleeps: list[float] = []
+        attempts = 0
+
+        def action() -> None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise error
+
+        RetryExecutor(logging.getLogger("test.retry_after"), RetryPolicy(max_attempts=2), sleep=sleeps.append).call("read", action)
+        self.assertEqual(sleeps, [13])
+
+
+class PlaylistAndResumeTests(unittest.TestCase):
+    def _state(self) -> TransferState:
+        return TransferState.create("transfer", LibrarySnapshot(account=AccountProfile("source", "source")))
+
+    def test_server_prefix_is_authoritative_when_checkpoint_is_ahead_or_behind(self) -> None:
+        expected = [{"kind": "track", "id": value} for value in ("a", "b", "c")]
+        destination = SimpleNamespace(playlist_media_order=lambda _: expected[:2])
+        self.assertEqual(TransferService._reconcile_playlist_position(destination, "d", expected, 3), 2)
+        self.assertEqual(TransferService._reconcile_playlist_position(destination, "d", expected, 1), 2)
+
+    def test_playlist_order_conflict_is_rejected(self) -> None:
+        expected = [{"kind": "track", "id": value} for value in ("a", "b")]
+        destination = SimpleNamespace(playlist_media_order=lambda _: list(reversed(expected)))
+        with self.assertRaisesRegex(Exception, "playlist_resume_mismatch"):
+            TransferService._reconcile_playlist_position(destination, "d", expected, 2)
+
+    def test_video_is_terminal_and_following_track_continues(self) -> None:
+        class Destination:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, str]] = []
+
+            def playlist_media_order(self, _: str):
+                return []
+
+            def add_playlist_item(self, _: str, kind: str, item_id: str) -> None:
+                if kind == "video":
+                    raise UnsupportedOperationError("playlist_video_add_unsupported")
+                self.calls.append((kind, item_id))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = TransferStateStore(Path(directory) / "state.json")
+            service = TransferService(store, logging.getLogger("test.playlist"))
+            state, report, destination = self._state(), TransferReport("transfer"), Destination()
+            service._transfer_playlist_items(
+                destination, state, report, "source", "dest",
+                {"item_order": [{"kind": "track", "id": "a"}, {"kind": "video", "id": "v"}, {"kind": "track", "id": "b"}]},
+            )
+            self.assertEqual(destination.calls, [("track", "a"), ("track", "b")])
+            self.assertEqual(len(report.unsupported_items), 1)
+            self.assertEqual(state.current_position, 3)
+
+    def test_same_account_transfer_is_blocked_but_restore_is_allowed(self) -> None:
+        class Destination:
+            def profile(self):
+                return AccountProfile("same", "same")
+
+            def favorite_ids(self, _: str):
+                return set()
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = TransferService(TransferStateStore(Path(directory) / "state.json"), logging.getLogger("test.account"))
+            snapshot = LibrarySnapshot(account=AccountProfile("same", "same"))
+            with self.assertRaisesRegex(Exception, "same_source_destination_account"):
+                service.run(Destination(), TransferState.create("transfer", snapshot), TransferOptions(), confirmed=True)
+            # Empty restore reaches normal completion without performing a mutation.
+            service.run(Destination(), TransferState.create("restore", snapshot), TransferOptions(), confirmed=True)
+
+
+class SortingVerificationAndCleanupTests(unittest.TestCase):
+    def test_missing_dates_are_last_in_both_directions_and_artist_uses_name(self) -> None:
+        items = [
+            {"id": "missing", "name": "Zulu"}, {"id": "old", "name": "alpha", "added_at": "2024-01-01"},
+            {"id": "new", "name": "Beta", "added_at": "2025-01-01"},
+        ]
+        self.assertEqual([item["id"] for item in sort_items(items, SortOrder.NEWEST_FIRST)], ["new", "old", "missing"])
+        self.assertEqual([item["id"] for item in sort_items(items, SortOrder.OLDEST_FIRST)], ["old", "new", "missing"])
+        self.assertEqual([item["id"] for item in sort_items(items, SortOrder.ALPHABETICAL)], ["old", "new", "missing"])
+
+    def test_cleanup_verifies_original_targets_not_new_content(self) -> None:
+        class Client:
+            def export_library(self, _=None):
+                return LibrarySnapshot(account=AccountProfile("x", "x"), tracks=[{"id": "new"}])
+
+        verification = CleanupManager(logging.getLogger("test.cleanup")).verify_cleanup(
+            Client(), CleanupScope.TRACKS, [{"category": "tracks", "id": "removed"}]
+        )
+        self.assertEqual(verification.remaining, 0)
+        self.assertEqual(verification.new_counts, {"tracks": 1})
+
+    def test_verification_detects_equal_count_wrong_ids(self) -> None:
+        source = LibrarySnapshot(account=AccountProfile("s", "s"), tracks=[{"id": "a"}, {"id": "b"}])
+        destination = SimpleNamespace(export_library=lambda _=None: LibrarySnapshot(account=AccountProfile("d", "d"), tracks=[{"id": "x"}, {"id": "y"}]))
+        with tempfile.TemporaryDirectory() as directory:
+            report = TransferReport("transfer")
+            service = VerificationService(Path(directory) / "report.json")
+            service.verify_and_write(source, destination, report)
+            data = (Path(directory) / "report.json").read_text(encoding="utf-8")
+            self.assertIn('"missing": 2', data)
+
+    def test_delete_queue_uses_constant_size_journal_for_large_state_transitions(self) -> None:
+        """Guard against accidentally serializing a 50k-item queue per delete."""
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "queue.json"
+            queue = DeleteQueue("delete_tracks", [
+                {"category": "tracks", "id": str(index), "title": "", "artist": "", "is_owned": False,
+                 "status": "pending", "attempts": 0, "reason": ""}
+                for index in range(10_000)
+            ])
+            store = DeleteQueueStore(path)
+            store.save(queue)
+            snapshot_size = path.stat().st_size
+            for item in queue.items[:100]:
+                item["status"] = "completed"
+                store.record(item)
+            self.assertLess(store.journal_path.stat().st_size, snapshot_size // 10)
+            self.assertEqual(sum(item["status"] == "completed" for item in store.load().items), 100)

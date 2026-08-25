@@ -148,7 +148,7 @@ class ReliabilityTests(unittest.TestCase):
 
         executor = RetryExecutor(
             logging.getLogger("test.retry"),
-            RetryPolicy(max_attempts=3, initial_backoff_seconds=1, max_backoff_seconds=8),
+            RetryPolicy(max_attempts=3, initial_backoff_seconds=1, max_backoff_seconds=8, jitter_ratio=0),
             events.append,
             sleeps.append,
         )

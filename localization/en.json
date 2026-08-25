@@ -97,6 +97,7 @@
     "resume_question": "Resume it?",
     "resume_declined": "ℹ️ The previous transfer state was kept for a later resume.",
     "source_incomplete": "⚠️ Transfer was blocked because the source snapshot is incomplete. Create a complete backup or retry the read first."
+    ,"same_account": "⚠️ Source account and destination account are the same. Transfer cannot continue."
   },
   "backup": {
     "creating": "💾 Creating library backup…",

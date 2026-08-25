@@ -181,6 +181,10 @@ class TidalManagerApplication:
         destination = self._authenticate(AccountRole.DESTINATION)
         if destination is None:
             return
+        if source.profile().account_id == destination.profile().account_id:
+            self._console.message("transfer.same_account", style="error")
+            self._logger.warning("event=transfer_blocked_same_account account_id=%s", source.profile().account_id)
+            return
         account = self._account_name(destination)
         action = self._i18n.t(
             "confirmation.resume_action", count=state.source_snapshot.counts()["tracks"]
@@ -425,23 +429,26 @@ class TidalManagerApplication:
             self._console.message("cleanup.dry_run_no_changes", style="success")
             self._logger.info("event=cleanup_dry_run scope=%s total=%d", scope.value, plan.total)
             return
-        if self._prompts.yes_no("cleanup.offer_backup"):
-            self._console.message("backup.creating", style="heading")
-            try:
-                self._display_backup_result(
-                    self._cleanup.create_backup(
-                        client,
-                        self._backups,
-                        progress=lambda category, current, total: self._progress.update(
-                            category, current, total, operation="backup"
-                        ),
-                    )
-                )
-            except Exception as error:
-                self._log_and_display_error(error)
+        # A cleanup plan is destructive.  A complete, newly validated backup
+        # is mandatory; a partial export must never authorize deletion.
+        self._console.message("backup.creating", style="heading")
+        try:
+            backup_result = self._cleanup.create_backup(
+                client,
+                self._backups,
+                progress=lambda category, current, total: self._progress.update(
+                    category, current, total, operation="backup"
+                ),
+            )
+            self._display_backup_result(backup_result)
+            if backup_result.is_partial:
+                self._console.message("cleanup.incomplete", style="error")
                 return
-            finally:
-                self._progress.finish()
+        except Exception as error:
+            self._log_and_display_error(error)
+            return
+        finally:
+            self._progress.finish()
         summary = self._i18n.t("cleanup.target_summary", count=plan.total)
         if not self._prompts.confirm_deletion(self._account_name(client), summary):
             self._console.message("cleanup.cancelled")
@@ -571,6 +578,7 @@ class TidalManagerApplication:
                 state.source_snapshot,
                 destination,
                 report,
+                state,
                 progress=lambda category, current, total: self._progress.update(
                     category, current, total, operation="verification"
                 ),
@@ -584,10 +592,11 @@ class TidalManagerApplication:
         self._console.message(
             "transfer.report_written", path=self._relative_path(self._paths.report)
         )
-        if report.has_retryable_failures():
+        if report.has_warnings():
             self._console.message("transfer.partial", style="warning")
-        else:
+        if not report.has_retryable_failures():
             self._state_store.clear()
+        if not report.has_warnings():
             self._console.message("transfer.completed", style="success")
 
     def _on_cleanup_progress(self, event: CleanupProgress) -> None:
@@ -624,6 +633,7 @@ class TidalManagerApplication:
             verification = self._cleanup.verify_cleanup(
                 client,
                 scope,
+                result.target_items,
                 progress=lambda category, current, total: self._progress.update(
                     category, current, total, operation="verification"
                 ),

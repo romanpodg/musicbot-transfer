@@ -8,6 +8,7 @@ letting provider-specific exceptions leak into the rest of the application.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ class RetryPolicy:
     max_attempts: int = 3
     initial_backoff_seconds: float = 1.0
     max_backoff_seconds: float = 8.0
+    jitter_ratio: float = 0.15
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,8 +95,14 @@ class RetryExecutor:
         """
 
         for attempt in range(1, self._policy.max_attempts + 1):
+            started = time.monotonic()
             try:
-                return action()
+                result = action()
+                self._logger.debug(
+                    "event=api_request_completed operation=%s duration_seconds=%.3f attempt=%d",
+                    operation, time.monotonic() - started, attempt,
+                )
+                return result
             except KeyboardInterrupt:
                 raise
             except Exception as error:
@@ -117,12 +125,13 @@ class RetryExecutor:
                     ) from None
                 delay = self._backoff_seconds(attempt, retry_after)
                 self._logger.warning(
-                    "event=api_request_retry operation=%s attempt=%d max_attempts=%d reason=%s delay_seconds=%.2f",
+                    "event=api_request_retry operation=%s attempt=%d max_attempts=%d reason=%s delay_seconds=%.2f duration_seconds=%.3f",
                     operation,
                     attempt,
                     self._policy.max_attempts,
                     reason,
                     delay,
+                    time.monotonic() - started,
                 )
                 if self._on_retry:
                     self._on_retry(
@@ -139,9 +148,13 @@ class RetryExecutor:
 
     def _backoff_seconds(self, attempt: int, retry_after: float | None) -> float:
         if retry_after is not None and retry_after >= 0:
-            return min(retry_after, self._policy.max_backoff_seconds)
+            # Retry-After is a provider instruction, not an advisory cap.
+            return retry_after
         delay = self._policy.initial_backoff_seconds * (2 ** (attempt - 1))
-        return min(delay, self._policy.max_backoff_seconds)
+        delay = min(delay, self._policy.max_backoff_seconds)
+        if self._policy.jitter_ratio:
+            delay *= random.uniform(1 - self._policy.jitter_ratio, 1 + self._policy.jitter_ratio)
+        return delay
 
 
 def configure_tidal_session(session: Any, policy: RetryPolicy) -> None:

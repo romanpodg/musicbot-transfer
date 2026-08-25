@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -67,9 +69,10 @@ class CleanupProgress:
 
 @dataclass(frozen=True, slots=True)
 class CleanupVerification:
-    """The fresh count remaining after an attempted cleanup."""
+    """Comparison of original targets with a fresh post-cleanup snapshot."""
 
     counts: dict[str, int]
+    new_counts: dict[str, int] = field(default_factory=dict)
 
     @property
     def remaining(self) -> int:
@@ -87,6 +90,7 @@ class CleanupResult:
     completed: int = 0
     total: int = 0
     interrupted: bool = False
+    target_items: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -116,6 +120,10 @@ class DeleteQueue:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DeleteQueue":
         """Validate persisted queue data without accepting arbitrary statuses."""
+
+        version = value.get("format_version", 1)
+        if not isinstance(version, int) or version != 1:
+            raise CleanupStateError("delete_queue_version_unsupported")
 
         raw_items = value.get("items")
         if not isinstance(raw_items, list):
@@ -177,6 +185,7 @@ class DeleteQueueStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.journal_path = path.with_suffix(path.suffix + ".journal")
 
     def exists(self) -> bool:
         """Return whether the durable cleanup queue exists."""
@@ -186,17 +195,50 @@ class DeleteQueueStore:
     def load(self) -> DeleteQueue:
         """Read and validate a cleanup queue."""
 
-        return DeleteQueue.from_dict(read_json(self.path))
+        queue = DeleteQueue.from_dict(read_json(self.path))
+        if not self.journal_path.exists():
+            return queue
+        by_key = {(item["category"], item["id"]): item for item in queue.items}
+        try:
+            with self.journal_path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    event = json.loads(line)
+                    key = (str(event["category"]), str(event["id"]))
+                    item = by_key.get(key)
+                    if item is None or event["status"] not in {"pending", "processing", "completed", "failed"}:
+                        raise CleanupStateError("delete_queue_journal_invalid")
+                    item["status"] = event["status"]
+                    item["attempts"] = max(0, int(event.get("attempts", item["attempts"])))
+                    item["reason"] = str(event.get("reason", ""))
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            raise CleanupStateError("delete_queue_journal_invalid") from None
+        return queue
 
     def save(self, queue: DeleteQueue) -> None:
         """Persist an exact queue after every observable status transition."""
 
         atomic_write_json(self.path, queue.as_dict())
+        self.journal_path.unlink(missing_ok=True)
+
+    def record(self, item: dict[str, Any]) -> None:
+        """Durably append one O(1) status transition between compactions."""
+
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        event = {
+            "category": str(item["category"]), "id": str(item["id"]),
+            "status": str(item["status"]), "attempts": int(item["attempts"]),
+            "reason": str(item.get("reason", "")),
+        }
+        with self.journal_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
 
     def clear(self) -> None:
         """Remove the queue only after all selected deletions succeeded."""
 
         self.path.unlink(missing_ok=True)
+        self.journal_path.unlink(missing_ok=True)
 
 
 class CleanupManager:
@@ -296,7 +338,7 @@ class CleanupManager:
             raise ConfirmationRequired("cleanup_confirmation_required")
         self._require_persistence()
         state, queue = self._load_persisted()
-        queue.reset_interrupted_items()
+        self._reconcile_interrupted_items(client, queue)
         if state.finished and state.failed:
             queue.reset_failed_items()
         state.interrupted = False
@@ -311,6 +353,44 @@ class CleanupManager:
             state.total,
         )
         return self._process(client, queue, state, progress)
+
+    def _reconcile_interrupted_items(self, client: TidalLibraryClient, queue: DeleteQueue) -> None:
+        """Resolve the remote outcome of a delete recorded as in-flight.
+
+        The queue is journaled before a remote deletion.  If the process dies
+        after TIDAL accepted it, a fresh snapshot lets resume mark that target
+        complete instead of issuing a blind second mutation.
+        """
+
+        in_flight = [item for item in queue.items if item["status"] == "processing"]
+        if not in_flight:
+            return
+        exporter = getattr(client, "export_library", None)
+        if not callable(exporter):
+            # Test doubles and legacy integrations cannot reconcile.  Favorite
+            # deletes remain safe to replay, but production clients always
+            # provide export_library.
+            queue.reset_interrupted_items()
+            return
+        snapshot = exporter()
+        if snapshot.incomplete_sections:
+            raise CleanupStateError("delete_resume_reconciliation_incomplete")
+        live_ids = {
+            category: {str(record.get("id", "")) for record in getattr(snapshot, category)}
+            for category in _all_queue_categories()
+        }
+        for item in in_flight:
+            category, item_id = str(item["category"]), str(item["id"])
+            if item_id not in live_ids[category]:
+                item["status"] = "completed"
+                item["reason"] = "reconciled_absent"
+                self._logger.info(
+                    "event=cleanup_resume_reconciled category=%s item_id=%s outcome=already_deleted",
+                    category, item_id,
+                )
+            else:
+                item["status"] = "pending"
+                item["reason"] = ""
 
     def load_resume_state(self) -> DeleteState | None:
         """Return a saved state only when its matching queue is also present."""
@@ -361,9 +441,10 @@ class CleanupManager:
         self,
         client: TidalLibraryClient,
         scope: CleanupScope,
+        original_targets: list[dict[str, str]] | None = None,
         progress: ProgressCallback | None = None,
     ) -> CleanupVerification:
-        """Re-read selected sections and report how many targets remain."""
+        """Verify the original target IDs, not whether the library is empty."""
 
         snapshot = client.export_library(progress)
         sections = _sections_for(scope)
@@ -373,15 +454,36 @@ class CleanupManager:
         incomplete = required.intersection(snapshot.incomplete_sections)
         if incomplete:
             raise IncompleteLibraryError("cleanup_verification_incomplete")
-        counts = {section: len(getattr(snapshot, section)) for section in sections}
+        targets = original_targets or []
+        live_categories = list(sections)
         if "playlists" in sections:
-            counts["folders"] = len(snapshot.folders)
+            live_categories.append("folders")
+        live_ids = {
+            category: {str(item.get("id", "")) for item in getattr(snapshot, category)}
+            for category in live_categories
+        }
+        target_ids: dict[str, set[str]] = {}
+        for item in targets:
+            category, item_id = str(item.get("category", "")), str(item.get("id", ""))
+            if category and item_id:
+                target_ids.setdefault(category, set()).add(item_id)
+        # Backward-compatible caller fallback: target semantics cannot be
+        # reconstructed from a scope alone, so report the fresh count only.
+        counts = {
+            category: len(target_ids.get(category, set()).intersection(live_ids.get(category, set())))
+            if targets else len(live_ids.get(category, set()))
+            for category in live_ids
+        }
+        new_counts = {
+            category: len(live_ids.get(category, set()) - target_ids.get(category, set()))
+            for category in live_ids
+        } if targets else {}
         self._logger.info(
             "event=cleanup_verification_completed scope=%s remaining=%d",
             scope.value,
             sum(counts.values()),
         )
-        return CleanupVerification(counts=counts)
+        return CleanupVerification(counts=counts, new_counts=new_counts)
 
     def _process(
         self,
@@ -390,7 +492,10 @@ class CleanupManager:
         state: DeleteState,
         progress: CleanupProgressCallback | None,
     ) -> CleanupResult:
-        result = CleanupResult(total=state.total)
+        result = CleanupResult(
+            total=state.total,
+            target_items=[{"category": str(item["category"]), "id": str(item["id"])} for item in queue.items],
+        )
         try:
             for position, item in enumerate(queue.items, start=1):
                 if item["status"] in {"completed", "failed"}:
@@ -401,7 +506,7 @@ class CleanupManager:
                 state.current_category = str(item["category"])
                 state.current_item_id = str(item["id"])
                 state.interrupted = False
-                self._persist(queue, state)
+                self._persist(queue, state, item)
                 self._emit_progress(progress, state, item, position)
                 self._logger.info(
                     "event=cleanup_deleting category=%s current=%d total=%d item_id=%s label=%s",
@@ -432,12 +537,12 @@ class CleanupManager:
                         "event=cleanup_failed category=%s item_id=%s reason=%s attempts=%d",
                         item["category"], item["id"], reason, item["attempts"],
                     )
-                self._persist(queue, state)
+                self._persist(queue, state, item)
                 self._emit_progress(progress, state, item, position)
         except KeyboardInterrupt:
             state.interrupted = True
             state.finished = False
-            self._persist(queue, state)
+            self._persist(queue, state, item)
             self._logger.warning(
                 "event=cleanup_interrupted operation=%s completed=%d total=%d",
                 state.operation, state.completed, state.total,
@@ -482,9 +587,14 @@ class CleanupManager:
     def _delete_folder(client: TidalLibraryClient, item: dict[str, Any]) -> None:
         client.delete_folder(str(item["id"]))
 
-    def _persist(self, queue: DeleteQueue, state: DeleteState) -> None:
+    def _persist(
+        self, queue: DeleteQueue, state: DeleteState, item: dict[str, Any] | None = None
+    ) -> None:
         state.refresh(queue.statuses())
-        self._queue_store.save(queue)
+        if item is None:
+            self._queue_store.save(queue)
+        else:
+            self._queue_store.record(item)
         self._state_store.save(state)
 
     @staticmethod

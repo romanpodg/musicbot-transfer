@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .auth import ItemUnavailableError, TidalClientError, TidalLibraryClient
+from .auth import ItemUnavailableError, TidalClientError, TidalLibraryClient, UnsupportedOperationError
 from .models import LibrarySnapshot, TransferReport
 from .sorting import SortOrder, sort_items
 from .state import TransferState, TransferStateStore
@@ -54,6 +54,16 @@ class TransferService:
 
         if not confirmed:
             raise ConfirmationRequired("transfer_confirmation_required")
+        # Restore is intentionally exempt: restoring a backup onto the account
+        # which made it is a legitimate recovery workflow.
+        if state.operation == "transfer":
+            profile = getattr(destination, "profile", None)
+            destination_profile = profile() if callable(profile) else None
+            if (
+                destination_profile is not None
+                and destination_profile.account_id == state.source_snapshot.account.account_id
+            ):
+                raise TidalClientError("same_source_destination_account")
         self._state_store.save(state)
         self._logger.info(
             "event=transfer_started operation=%s tracks=%d",
@@ -91,12 +101,16 @@ class TransferService:
         snapshot = state.source_snapshot
         for category in self._favorite_categories:
             items = sort_items(getattr(snapshot, category), options.sort_order)
+            existing_ids = _existing_favorite_ids(destination, category)
             for index, item in enumerate(items, start=1):
                 item_id = str(item.get("id", ""))
                 if not item_id:
                     self._record_failure(report, state, category, "missing", TidalClientError())
                     continue
-                if state.is_completed(category, item_id):
+                if item_id in existing_ids:
+                    state.mark_terminal(category, item_id, "already_present")
+                    report.add("skipped", category, item_id, "already_present")
+                elif state.is_completed(category, item_id):
                     report.add("skipped", category, item_id, "already_completed")
                 elif state.is_ambiguous(category, item_id):
                     self._record_failure(
@@ -277,10 +291,31 @@ class TransferService:
             state.current_position = current_position
             self._state_store.save(state)
             try:
-                destination.add_playlist_item(destination_playlist_id, media_id)
+                destination.add_playlist_item(destination_playlist_id, item["kind"], media_id)
                 state.current_position = current_position + 1
                 self._state_store.save(state)
                 report.add("successful", "playlist_items", report_id)
+            except UnsupportedOperationError as error:
+                # Video writes are not implemented by tidalapi 0.8.x.  This is
+                # terminal, but must not prevent subsequent track items from
+                # retaining their order.
+                state.mark_terminal("playlist_items", report_id, "unsupported")
+                state.current_position = current_position + 1
+                self._state_store.save(state)
+                report.add("unsupported", "playlist_items", report_id, error.reason)
+                self._logger.warning(
+                    "event=playlist_item_unsupported playlist_id=%s position=%d total=%d kind=%s item_id=%s retry=false",
+                    source_playlist_id, current_position + 1, len(items), item["kind"], media_id,
+                )
+            except ItemUnavailableError as error:
+                state.mark_terminal("playlist_items", report_id, "unavailable")
+                state.current_position = current_position + 1
+                self._state_store.save(state)
+                report.add("unavailable", "playlist_items", report_id, error.reason)
+                self._logger.warning(
+                    "event=playlist_item_unavailable playlist_id=%s position=%d total=%d kind=%s item_id=%s retry=false",
+                    source_playlist_id, current_position + 1, len(items), item["kind"], media_id,
+                )
             except Exception as error:
                 self._record_failure(report, state, "playlist_items", report_id, error)
                 raise
@@ -296,9 +331,13 @@ class TransferService:
 
         actual_items = destination.playlist_media_order(destination_playlist_id)
         actual_count = len(actual_items)
-        if actual_count > len(expected_items) or actual_items != expected_items[:actual_count]:
+        if actual_count > len(expected_items):
+            raise TidalClientError("playlist_resume_destination_longer")
+        if actual_items != expected_items[:actual_count]:
             raise TidalClientError("playlist_resume_mismatch")
-        return max(saved_position, actual_count)
+        # The server is authoritative.  A checkpoint ahead of the server is a
+        # crash window, not permission to skip the missing item.
+        return actual_count
 
     def _record_failure(
         self,
@@ -310,11 +349,19 @@ class TransferService:
     ) -> None:
         """Log only an exception class and write a safe report outcome."""
 
-        status = "unavailable" if isinstance(error, ItemUnavailableError) else "failed"
-        reason = "item_unavailable" if status == "unavailable" else _error_reason(error)
+        if isinstance(error, ItemUnavailableError):
+            status, state_status, reason = "unavailable", "unavailable", "item_unavailable"
+        else:
+            reason = _error_reason(error)
+            retryable = getattr(error, "retryable", reason in {"api_timeout", "network_error", "api_server_error", "rate_limited"})
+            status = "failed" if retryable else "failed_permanent"
+            state_status = "failed_retryable" if retryable else "failed_permanent"
         report.add(status, category, item_id, reason)
         attempts = getattr(error, "attempts", 0)
-        state.mark_failed(category, item_id, max(0, int(attempts) - 1))
+        if state_status == "failed_retryable":
+            state.mark_failed(category, item_id, max(0, int(attempts) - 1))
+        else:
+            state.mark_terminal(category, item_id, state_status)
         self._state_store.save(state)
         self._logger.error(
             "event=transfer_item_failed category=%s item_id=%s reason=%s retry_count=%d",
@@ -323,6 +370,15 @@ class TransferService:
             reason,
             max(0, int(attempts) - 1),
         )
+
+
+def _existing_favorite_ids(destination: TidalLibraryClient, category: str) -> set[str]:
+    """Use a fresh destination view when available; keep test doubles simple."""
+
+    getter = getattr(destination, "favorite_ids", None)
+    if not callable(getter):
+        return set()
+    return {str(item_id) for item_id in getter(category)}
 
 
 def _error_reason(error: Exception) -> str:

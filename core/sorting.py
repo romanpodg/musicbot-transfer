@@ -26,24 +26,42 @@ def sort_items(items: Iterable[dict[str, Any]], order: SortOrder) -> list[dict[s
     result = list(items)
     if order is SortOrder.ORIGINAL:
         return result
-    if order is SortOrder.NEWEST_FIRST:
-        return sorted(result, key=_added_date_key, reverse=True)
-    if order is SortOrder.OLDEST_FIRST:
-        return sorted(result, key=_added_date_key)
+    if order in {SortOrder.NEWEST_FIRST, SortOrder.OLDEST_FIRST}:
+        # Do not use reverse=True on a key containing the missing flag: doing
+        # so reverses that flag too and puts records without a date first.
+        present = [item for item in result if _added_date(item) is not None]
+        missing = [item for item in result if _added_date(item) is None]
+        return sorted(
+            present,
+            key=lambda item: _added_date(item) or "",
+            reverse=order is SortOrder.NEWEST_FIRST,
+        ) + missing
     key_map = {
         SortOrder.ALPHABETICAL: "title",
         SortOrder.ARTIST: "artist",
         SortOrder.ALBUM: "album",
     }
     field = key_map[order]
-    return sorted(result, key=lambda item: _text_key(item.get(field)))
+    return sorted(result, key=lambda item: _text_key(_sort_value(item, field)))
 
 
-def _added_date_key(item: dict[str, Any]) -> tuple[bool, str]:
-    """Put missing dates last while retaining ISO-8601 lexical order."""
+def _added_date(item: dict[str, Any]) -> str | None:
+    """Return the exported favourite date, accepting old backup field names."""
 
-    date = item.get("added_at")
-    return (date is None, str(date or ""))
+    value = item.get("added_at", item.get("user_date_added"))
+    return str(value) if value not in (None, "") else None
+
+
+def _sort_value(item: dict[str, Any], field: str) -> Any:
+    """Read the display field appropriate to every supported library object."""
+
+    if field == "title":
+        return item.get("title", item.get("name"))
+    if field == "artist":
+        return item.get("artist", item.get("artist_name"))
+    if field == "album":
+        return item.get("album", item.get("album_title"))
+    return item.get(field)
 
 
 def _text_key(value: Any) -> tuple[bool, str]:

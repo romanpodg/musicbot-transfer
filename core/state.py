@@ -100,6 +100,7 @@ class TransferState:
     current_position: int = 0
     completed_objects: dict[str, list[str]] = field(default_factory=dict)
     failed_items: dict[str, list[str]] = field(default_factory=dict)
+    item_statuses: dict[str, str] = field(default_factory=dict)
     retry_counts: dict[str, int] = field(default_factory=dict)
     ambiguous_objects: dict[str, list[str]] = field(default_factory=dict)
     destination_playlists: dict[str, str] = field(default_factory=dict)
@@ -121,6 +122,10 @@ class TransferState:
     def from_dict(cls, value: dict[str, Any]) -> TransferState:
         """Load a checkpoint, preserving only supported fields."""
 
+        version = value.get("format_version", 1)
+        if not isinstance(version, int) or version not in {1, 2, 3}:
+            raise ValueError("transfer_state_version_unsupported")
+
         snapshot_value = value.get("source_snapshot")
         if not isinstance(snapshot_value, dict):
             raise ValueError("transfer_snapshot_missing")
@@ -128,6 +133,7 @@ class TransferState:
         if not isinstance(completed, dict):
             raise ValueError("transfer_completed_invalid")
         failed = value.get("failed_items", {})
+        statuses = value.get("item_statuses", {})
         retries = value.get("retry_counts", {})
         ambiguous = value.get("ambiguous_objects", {})
         return cls(
@@ -149,6 +155,16 @@ class TransferState:
                 if isinstance(item_ids, list)
             }
             if isinstance(failed, dict)
+            else {},
+            item_statuses={
+                str(key): str(status)
+                for key, status in statuses.items()
+                if str(status) in {
+                    "pending", "completed", "failed_retryable", "failed_permanent",
+                    "unavailable", "unsupported", "ambiguous", "already_present",
+                }
+            }
+            if isinstance(statuses, dict)
             else {},
             retry_counts={
                 str(key): max(0, int(count))
@@ -172,7 +188,7 @@ class TransferState:
         """Serialize the checkpoint without credentials or raw exceptions."""
 
         return {
-            "format_version": 2,
+            "format_version": 3,
             "operation": self.operation,
             "sort_order": self.sort_order,
             "created_at": self.created_at,
@@ -181,6 +197,7 @@ class TransferState:
             "current_position": self.current_position,
             "completed_objects": self.completed_objects,
             "failed_items": self.failed_items,
+            "item_statuses": self.item_statuses,
             "retry_counts": self.retry_counts,
             "ambiguous_objects": self.ambiguous_objects,
             "destination_playlists": self.destination_playlists,
@@ -202,6 +219,7 @@ class TransferState:
         failed = self.failed_items.get(category, [])
         if item_id in failed:
             failed.remove(item_id)
+        self.item_statuses[f"{category}:{item_id}"] = "completed"
 
     def mark_failed(self, category: str, item_id: str, retry_count: int) -> None:
         """Record a retryable outcome so a later run can audit and retry it."""
@@ -210,6 +228,17 @@ class TransferState:
         if item_id not in entries:
             entries.append(item_id)
         self.retry_counts[f"{category}:{item_id}"] = max(0, retry_count)
+        self.item_statuses[f"{category}:{item_id}"] = "failed_retryable"
+
+    def mark_terminal(self, category: str, item_id: str, status: str) -> None:
+        """Record an outcome which must not be retried automatically."""
+
+        if status not in {"failed_permanent", "unavailable", "unsupported", "already_present"}:
+            raise ValueError("invalid_terminal_status")
+        entries = self.failed_items.get(category, [])
+        if item_id in entries:
+            entries.remove(item_id)
+        self.item_statuses[f"{category}:{item_id}"] = status
 
     def mark_ambiguous(self, category: str, item_id: str) -> None:
         """Block automatic replay of a creation whose remote outcome is unknown."""
@@ -217,6 +246,7 @@ class TransferState:
         entries = self.ambiguous_objects.setdefault(category, [])
         if item_id not in entries:
             entries.append(item_id)
+        self.item_statuses[f"{category}:{item_id}"] = "ambiguous"
 
     def is_ambiguous(self, category: str, item_id: str) -> bool:
         """Return whether automatic replay would risk duplicate remote objects."""
@@ -276,6 +306,10 @@ class DeleteState:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "DeleteState":
         """Load a queue checkpoint while rejecting malformed numeric values."""
+
+        version = value.get("format_version", 1)
+        if not isinstance(version, int) or version != 1:
+            raise ValueError("delete_state_version_unsupported")
 
         total = max(0, int(value.get("total", 0)))
         completed = min(total, max(0, int(value.get("completed", 0))))

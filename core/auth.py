@@ -52,6 +52,10 @@ class ItemUnavailableError(TidalClientError):
     """Raised when an item is no longer available to the destination account."""
 
 
+class UnsupportedOperationError(TidalClientError):
+    """Raised for a known tidalapi capability gap, never retried automatically."""
+
+
 class CredentialStore:
     """Store OAuth credentials in the OS keyring, never in project files."""
 
@@ -391,8 +395,11 @@ class TidalLibraryClient:
             "playlist_favorite", self._favorites().add_playlist, playlist_id, parent_id
         )
 
-    def add_playlist_item(self, playlist_id: str, media_id: str) -> None:
-        """Append one media item, allowing duplicates for exact order restoration."""
+    def add_playlist_item(self, playlist_id: str, kind: str, media_id: str) -> None:
+        """Append one track; tidalapi 0.8.11 exposes only ``trackIds`` here."""
+
+        if kind != "track":
+            raise UnsupportedOperationError("playlist_video_add_unsupported")
 
         playlist = self._playlist_cache.get(playlist_id)
         if playlist is None:
@@ -405,6 +412,24 @@ class TidalLibraryClient:
         )
         if not result:
             raise ItemUnavailableError("playlist_item_not_added")
+
+    def favorite_ids(self, category: str) -> set[str]:
+        """Return a fresh ID set for one favourite category for reconciliation."""
+
+        getters: dict[str, Callable[..., list[Any]]] = {
+            "tracks": self._favorites().tracks,
+            "albums": self._favorites().albums,
+            "artists": self._favorites().artists,
+            "videos": self._favorites().videos,
+            "mixes": self._favorites().mixes,
+        }
+        getter = getters.get(category)
+        if getter is None:
+            raise TidalClientError("favorite_category_unsupported")
+        return {
+            _required_id(item)
+            for item in self._paginate_offset(getter, operation=f"favorite_ids_{category}")
+        }
 
     def playlist_media_order(self, playlist_id: str) -> list[dict[str, str]]:
         """Return a destination playlist's exact media order for safe resumption."""
@@ -465,7 +490,11 @@ class TidalLibraryClient:
 
     def _export_artists(self, progress: ProgressCallback | None) -> list[dict[str, Any]]:
         return [
-            {"id": _required_id(artist), "name": _text_value(artist, "name")}
+            {
+                "id": _required_id(artist),
+                "name": _text_value(artist, "name"),
+                "added_at": _date_value(artist, "user_date_added", "date_added"),
+            }
             for artist in self._paginate(
                 self._favorites().artists, operation="export_artists", progress=progress, category="artists"
             )
@@ -473,7 +502,13 @@ class TidalLibraryClient:
 
     def _export_videos(self, progress: ProgressCallback | None) -> list[dict[str, Any]]:
         return [
-            {"id": _required_id(video), "title": _text_value(video, "name", "title")}
+            {
+                "id": _required_id(video),
+                "title": _text_value(video, "name", "title"),
+                "artist": _artist_name(video),
+                "album": _text_value(getattr(video, "album", None), "name", "title"),
+                "added_at": _date_value(video, "user_date_added", "date_added"),
+            }
             for video in self._paginate(
                 self._favorites().videos, operation="export_videos", progress=progress, category="videos"
             )
@@ -481,7 +516,11 @@ class TidalLibraryClient:
 
     def _export_mixes(self, progress: ProgressCallback | None) -> list[dict[str, Any]]:
         return [
-            {"id": _required_id(mix), "title": _text_value(mix, "title", "name")}
+            {
+                "id": _required_id(mix),
+                "title": _text_value(mix, "title", "name"),
+                "added_at": _date_value(mix, "user_date_added", "date_added"),
+            }
             for mix in self._paginate(
                 self._favorites().mixes, operation="export_mixes", progress=progress, category="mixes"
             )
@@ -493,13 +532,14 @@ class TidalLibraryClient:
         visited: set[str] = set()
 
         def visit(parent_id: str) -> None:
-            for folder in self._paginate(
+            for folder in self._paginate_offset(
                 lambda limit, offset: self._favorites().playlist_folders(
                     limit=limit, offset=offset, parent_folder_id=parent_id
                 ),
                 operation="export_folders",
                 progress=progress,
                 category="folders",
+                unique_ids=True,
             ):
                 folder_id = _required_id(folder)
                 if folder_id in visited:
@@ -600,6 +640,7 @@ class TidalLibraryClient:
             "title": _text_value(album, "name", "title"),
             "artist": _artist_name(album),
             "release_date": _date_value(album, "available_release_date", "release_date"),
+            "added_at": _date_value(album, "user_date_added", "date_added"),
         }
 
     def _paginate(
@@ -611,10 +652,28 @@ class TidalLibraryClient:
         progress: ProgressCallback | None = None,
         category: str | None = None,
     ) -> list[Any]:
-        """Retrieve a paginated tidalapi collection without an arbitrary limit."""
+        """Compatibility wrapper for standard offset-based tidalapi methods."""
+
+        return self._paginate_offset(
+            getter, page_size, operation=operation, progress=progress, category=category
+        )
+
+    def _paginate_offset(
+        self,
+        getter: Callable[..., list[Any]],
+        page_size: int = 50,
+        *,
+        operation: str,
+        progress: ProgressCallback | None = None,
+        category: str | None = None,
+        unique_ids: bool = False,
+    ) -> list[Any]:
+        """Retrieve offset pages with guards against repeated provider pages."""
 
         values: list[Any] = []
         offset = 0
+        previous_page_ids: tuple[str, ...] | None = None
+        emitted_ids: set[str] = set()
         while True:
             page = self._invoke(
                 operation,
@@ -622,7 +681,26 @@ class TidalLibraryClient:
             )
             if not page:
                 return values
-            values.extend(page)
+            page_ids = tuple(_safe_id(value) for value in page)
+            if len(page) == page_size and page_ids == previous_page_ids:
+                self._logger.warning(
+                    "event=pagination_repeated_page operation=%s offset=%d count=%d",
+                    operation, offset, len(page),
+                )
+                return values
+            previous_page_ids = page_ids
+            if unique_ids:
+                fresh_page = [value for value in page if _safe_id(value) not in emitted_ids]
+                if not fresh_page:
+                    self._logger.warning(
+                        "event=pagination_repeated_ids operation=%s offset=%d count=%d",
+                        operation, offset, len(page),
+                    )
+                    return values
+                emitted_ids.update(_safe_id(value) for value in fresh_page)
+                values.extend(fresh_page)
+            else:
+                values.extend(page)
             if progress and category:
                 progress(category, len(values), 0)
             if len(page) < page_size:
@@ -682,6 +760,13 @@ def _required_id(value: Any) -> str:
     if item_id is None or not str(item_id):
         raise TidalClientError("provider_id_missing")
     return str(item_id)
+
+
+def _safe_id(value: Any) -> str:
+    """Return an ID for a pagination guard without masking malformed records."""
+
+    item_id = getattr(value, "id", None)
+    return str(item_id) if item_id is not None else "<missing>"
 
 
 def _text_value(value: Any, *attributes: str) -> str:

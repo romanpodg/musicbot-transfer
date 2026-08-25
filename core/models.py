@@ -126,6 +126,9 @@ class TransferReport:
     successful_items: list[dict[str, str]] = field(default_factory=list)
     failed_items: list[dict[str, str]] = field(default_factory=list)
     unavailable_items: list[dict[str, str]] = field(default_factory=list)
+    unsupported_items: list[dict[str, str]] = field(default_factory=list)
+    permanent_failure_items: list[dict[str, str]] = field(default_factory=list)
+    ambiguous_items: list[dict[str, str]] = field(default_factory=list)
     skipped_items: list[dict[str, str]] = field(default_factory=list)
 
     def add(self, status: str, category: str, item_id: str, reason: str = "") -> None:
@@ -138,6 +141,9 @@ class TransferReport:
             "successful": self.successful_items,
             "failed": self.failed_items,
             "unavailable": self.unavailable_items,
+            "unsupported": self.unsupported_items,
+            "failed_permanent": self.permanent_failure_items,
+            "ambiguous": self.ambiguous_items,
             "skipped": self.skipped_items,
         }
         buckets[status].append(event)
@@ -150,7 +156,18 @@ class TransferReport:
     def has_retryable_failures(self) -> bool:
         """Whether state should remain available for a future retry."""
 
-        return bool(self.failed_items or self.unavailable_items)
+        return bool(self.failed_items or self.ambiguous_items)
+
+    def has_warnings(self) -> bool:
+        """Whether the final outcome contains any non-successful item state."""
+
+        return bool(
+            self.failed_items
+            or self.unavailable_items
+            or self.unsupported_items
+            or self.permanent_failure_items
+            or self.ambiguous_items
+        )
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize the report for JSON output."""
@@ -165,5 +182,8 @@ class TransferReport:
             "successful_items": self.successful_items,
             "failed_items": self.failed_items,
             "unavailable_items": self.unavailable_items,
+            "unsupported_items": self.unsupported_items,
+            "permanent_failure_items": self.permanent_failure_items,
+            "ambiguous_items": self.ambiguous_items,
             "skipped_items": self.skipped_items,
         }

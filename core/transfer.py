@@ -154,7 +154,7 @@ class TransferService:
                 continue
             if state.is_completed("folders", folder_id):
                 report.add("skipped", "folders", folder_id, "already_completed")
-            elif state.is_ambiguous("folders", folder_id):
+            elif state.is_ambiguous("folders", folder_id) or state.status_of("folders", folder_id) == "creating":
                 if self._recover_ambiguous_folder(destination, state, folder):
                     report.add("successful", "folders", folder_id, "reconciled_created")
                 else:
@@ -170,12 +170,18 @@ class TransferService:
                     )
                 else:
                     state.current_category = "folders"
+                    name = str(folder.get("name", ""))
+                    state.mark_create_intent("folders", folder_id, {
+                        "name": name, "parent_id": parent_destination_id,
+                        "baseline_ids": sorted(destination.creation_candidate_ids("folders", name, parent_destination_id)),
+                    })
                     self._state_store.save(state)
                     try:
                         destination_id = destination.create_folder(
-                            str(folder.get("name", "")), parent_destination_id
+                            name, parent_destination_id
                         )
                         state.destination_folders[folder_id] = destination_id
+                        state.mark_created("folders", folder_id, destination_id)
                         state.mark_completed("folders", folder_id)
                         self._state_store.save(state)
                         report.add("successful", "folders", folder_id)
@@ -207,7 +213,7 @@ class TransferService:
                 continue
             if state.is_completed("playlists", playlist_id):
                 report.add("skipped", "playlists", playlist_id, "already_completed")
-            elif state.is_ambiguous("playlists", playlist_id):
+            elif state.is_ambiguous("playlists", playlist_id) or state.status_of("playlists", playlist_id) == "creating":
                 if self._recover_ambiguous_playlist(destination, state, playlist):
                     self._transfer_playlist(destination, state, report, playlist, playlist_id)
                 else:
@@ -251,14 +257,20 @@ class TransferService:
             destination_id = state.destination_playlists.get(playlist_id)
             if destination_id is None:
                 state.current_category = "playlists"
-                self._state_store.save(state)
                 created_playlist = True
+                name = str(playlist.get("name", ""))
+                description = str(playlist.get("description", ""))
+                state.mark_create_intent("playlists", playlist_id, {
+                    "name": name, "description": description, "parent_id": parent_destination_id,
+                    "baseline_ids": sorted(destination.creation_candidate_ids("playlists", name, parent_destination_id, description)),
+                })
+                self._state_store.save(state)
                 destination_id = destination.create_playlist(
-                    str(playlist.get("name", "")),
-                    str(playlist.get("description", "")),
+                    name, description,
                     parent_destination_id,
                 )
                 state.destination_playlists[playlist_id] = destination_id
+                state.mark_created("playlists", playlist_id, destination_id)
                 state.current_playlist = playlist_id
                 state.current_position = 0
                 self._state_store.save(state)
@@ -288,13 +300,15 @@ class TransferService:
         parent = str(folder.get("parent_id") or "root")
         parent = state.destination_folders.get(parent, parent)
         candidates = destination.creation_candidates("folders", str(folder.get("name", "")), parent)
+        intent = state.create_intents.get(f"folders:{folder.get('id')}", {})
+        baseline = {str(value) for value in intent.get("baseline_ids", [])}
+        candidates = [candidate for candidate in candidates if str(candidate.get("id")) not in baseline]
         if len(candidates) != 1:
             self._logger.error("event=folder_creation_conflict source_id=%s candidates=%d", folder.get("id"), len(candidates))
             return False
         source_id = str(folder["id"])
         state.destination_folders[source_id] = str(candidates[0]["id"])
         state.mark_completed("folders", source_id)
-        state.ambiguous_objects.get("folders", []).remove(source_id)
         self._state_store.save(state)
         return True
 
@@ -305,12 +319,14 @@ class TransferService:
         parent = str(playlist.get("folder_id") or "root")
         parent = state.destination_folders.get(parent, parent)
         candidates = destination.creation_candidates("playlists", str(playlist.get("name", "")), parent, str(playlist.get("description", "")))
+        intent = state.create_intents.get(f"playlists:{source_id}", {})
+        baseline = {str(value) for value in intent.get("baseline_ids", [])}
+        candidates = [candidate for candidate in candidates if str(candidate.get("id")) not in baseline]
         if len(candidates) != 1:
             self._logger.error("event=playlist_creation_conflict source_id=%s candidates=%d", source_id, len(candidates))
             return False
         state.destination_playlists[source_id] = str(candidates[0]["id"])
-        state.ambiguous_objects.get("playlists", []).remove(source_id)
-        state.item_statuses[f"playlists:{source_id}"] = "pending"
+        state.mark_pending("playlists", source_id)
         self._state_store.save(state)
         return True
 

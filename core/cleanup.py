@@ -244,12 +244,13 @@ class DeleteQueueStore:
             "status": str(item["status"]), "attempts": int(item["attempts"]),
             "reason": str(item.get("reason", "")),
         }
-        queue.last_applied_seq += 1
-        event["seq"] = queue.last_applied_seq
+        next_seq = queue.last_applied_seq + 1
+        event["seq"] = next_seq
         with self.journal_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        queue.last_applied_seq = next_seq
 
     def clear(self) -> None:
         """Remove the queue only after all selected deletions succeeded."""
@@ -379,7 +380,7 @@ class CleanupManager:
         complete instead of issuing a blind second mutation.
         """
 
-        in_flight = [item for item in queue.items if item["status"] == "processing"]
+        in_flight = [item for item in queue.items if item["status"] in {"processing", "ambiguous"}]
         if not in_flight:
             return
         exporter = getattr(client, "export_library", None)
@@ -547,7 +548,7 @@ class CleanupManager:
                     )
                 except Exception as error:
                     reason = _error_reason(error)
-                    item["status"] = "failed_retryable" if reason in {"api_timeout", "network_error", "api_server_error", "rate_limited"} else "failed_permanent"
+                    item["status"] = "ambiguous" if reason in {"api_timeout", "network_error"} else ("failed_retryable" if reason in {"api_server_error", "rate_limited"} else "failed_permanent")
                     item["reason"] = reason
                     result.failed.append(_result_item(item, reason))
                     self._logger.error(
@@ -577,7 +578,7 @@ class CleanupManager:
         result.failed = [
             _result_item(item, str(item.get("reason", "provider_error")))
             for item in queue.items
-            if item["status"] in {"failed_retryable", "failed_permanent"}
+            if item["status"] in {"failed_retryable", "failed_permanent", "ambiguous"}
         ]
         self._logger.info(
             "event=cleanup_finished operation=%s completed=%d failed=%d total=%d",

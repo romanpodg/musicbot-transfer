@@ -268,7 +268,7 @@ class TidalManagerApplication:
         elif self._state_store.exists():
             try:
                 state = self._state_store.load()
-                completed = sum(len(items) for items in state.completed_objects.values())
+                completed = sum(status == "completed" for status in state.item_statuses.values())
                 total = sum(state.source_snapshot.counts().values())
                 self._console.message(
                     "shutdown.progress_saved", completed=completed, total=total

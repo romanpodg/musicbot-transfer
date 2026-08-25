@@ -149,6 +149,33 @@ class PlaylistAndResumeTests(unittest.TestCase):
             service.run(destination, state, TransferOptions(), confirmed=True)
             self.assertEqual(destination.calls, ["r"])
 
+    def test_status_replay_is_canonical_and_latest_transition_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = TransferStateStore(Path(directory) / "state.json")
+            state = TransferState.create("restore", LibrarySnapshot(account=AccountProfile("s", "s")))
+            state.mark_ambiguous("tracks", "one")
+            store.save(state)
+            self.assertTrue(TransferStateStore(store.path).load().is_ambiguous("tracks", "one"))
+            state.mark_completed("tracks", "one")
+            store.save(state)
+            state.mark_failed("tracks", "one", 1)
+            store.save(state)
+            state.mark_completed("tracks", "one")
+            store.save(state)
+            loaded = TransferStateStore(store.path).load()
+            self.assertTrue(loaded.is_completed("tracks", "one"))
+            self.assertFalse(loaded.is_ambiguous("tracks", "one"))
+
+    def test_create_intent_is_persisted_before_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = TransferStateStore(Path(directory) / "state.json")
+            state = TransferState.create("restore", LibrarySnapshot(account=AccountProfile("s", "s")))
+            state.mark_create_intent("playlists", "p", {"name": "My Music", "parent_id": "root", "baseline_ids": ["old"]})
+            store.save(state)
+            loaded = TransferStateStore(store.path).load()
+            self.assertEqual(loaded.status_of("playlists", "p"), "creating")
+            self.assertEqual(loaded.create_intents["playlists:p"]["baseline_ids"], ["old"])
+
 
 class SortingVerificationAndCleanupTests(unittest.TestCase):
     def test_missing_dates_are_last_in_both_directions_and_artist_uses_name(self) -> None:
@@ -203,6 +230,14 @@ class SortingVerificationAndCleanupTests(unittest.TestCase):
             atomic_write_json(path, {"format": BACKUP_FORMAT, "format_version": BACKUP_VERSION, "status": "complete", "source_account_id": "s", "counts": snapshot.counts(), "checksum_sha256": _checksum(library), "library": library})
             with self.assertRaises(BackupFormatError):
                 BackupService(path).load(path)
+
+    def test_missing_playlist_mapping_is_a_verification_failure(self) -> None:
+        source = LibrarySnapshot(account=AccountProfile("s", "s"), playlists=[{"id": "p", "is_owned": True, "item_order": []}])
+        destination = SimpleNamespace(export_library=lambda _=None: LibrarySnapshot(account=AccountProfile("d", "d")))
+        with tempfile.TemporaryDirectory() as directory:
+            report = TransferReport("transfer")
+            VerificationService(Path(directory) / "r.json").verify_and_write(source, destination, report, TransferState.create("transfer", source))
+            self.assertEqual(report.verification_outcome, "failed")
 
     def test_delete_queue_uses_constant_size_journal_for_large_state_transitions(self) -> None:
         """Guard against accidentally serializing a 50k-item queue per delete."""

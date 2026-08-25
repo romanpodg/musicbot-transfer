@@ -452,6 +452,9 @@ class TidalLibraryClient:
             and (category == "folders" or str(record.get("description", "")) == description)
         ]
 
+    def creation_candidate_ids(self, category: str, name: str, parent_id: str, description: str = "") -> set[str]:
+        return {str(item["id"]) for item in self.creation_candidates(category, name, parent_id, description)}
+
     def playlist_media_order(self, playlist_id: str) -> list[dict[str, str]]:
         """Return a destination playlist's exact media order for safe resumption."""
 

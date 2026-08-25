@@ -123,6 +123,7 @@ class TransferState:
     ambiguous_objects: dict[str, list[str]] = field(default_factory=dict)
     destination_playlists: dict[str, str] = field(default_factory=dict)
     destination_folders: dict[str, str] = field(default_factory=dict)
+    create_intents: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_applied_seq: int = 0
 
     @classmethod
@@ -179,7 +180,7 @@ class TransferState:
                 str(key): str(status)
                 for key, status in statuses.items()
                 if str(status) in {
-                    "pending", "completed", "failed_retryable", "failed_permanent",
+                    "pending", "creating", "completed", "failed_retryable", "failed_permanent",
                     "unavailable", "unsupported", "ambiguous", "already_present",
                 }
             }
@@ -201,11 +202,47 @@ class TransferState:
             else {},
             destination_playlists=_string_mapping(value.get("destination_playlists")),
             destination_folders=_string_mapping(value.get("destination_folders")),
+            create_intents={str(key): dict(intent) for key, intent in value.get("create_intents", {}).items() if isinstance(intent, dict)} if isinstance(value.get("create_intents"), dict) else {},
             last_applied_seq=max(0, int(value.get("last_applied_seq", 0))),
-        )
+        )._migrated()
+
+    def _migrated(self) -> "TransferState":
+        """Migrate legacy derived collections into canonical item statuses."""
+
+        if not self.item_statuses:
+            for category, item_ids in self.completed_objects.items():
+                for item_id in item_ids:
+                    self.item_statuses[f"{category}:{item_id}"] = "completed"
+            for category, item_ids in self.failed_items.items():
+                for item_id in item_ids:
+                    self.item_statuses[f"{category}:{item_id}"] = "failed_retryable"
+            for category, item_ids in self.ambiguous_objects.items():
+                for item_id in item_ids:
+                    self.item_statuses[f"{category}:{item_id}"] = "ambiguous"
+        self.regenerate_derived()
+        return self
+
+    def regenerate_derived(self) -> None:
+        """Maintain legacy serialized views; never use them for decisions."""
+
+        self.completed_objects = {}
+        self.failed_items = {}
+        self.ambiguous_objects = {}
+        for key, status in self.item_statuses.items():
+            if ":" not in key:
+                continue
+            category, item_id = key.split(":", 1)
+            if status == "completed":
+                self.completed_objects.setdefault(category, []).append(item_id)
+            elif status == "failed_retryable":
+                self.failed_items.setdefault(category, []).append(item_id)
+            elif status == "ambiguous":
+                self.ambiguous_objects.setdefault(category, []).append(item_id)
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize the checkpoint without credentials or raw exceptions."""
+
+        self.regenerate_derived()
 
         return {
             "format_version": 4,
@@ -222,6 +259,7 @@ class TransferState:
             "ambiguous_objects": self.ambiguous_objects,
             "destination_playlists": self.destination_playlists,
             "destination_folders": self.destination_folders,
+            "create_intents": self.create_intents,
             "last_applied_seq": self.last_applied_seq,
             "source_snapshot": self.source_snapshot.as_dict(),
         }
@@ -229,7 +267,7 @@ class TransferState:
     def is_completed(self, category: str, item_id: str) -> bool:
         """Return whether a completed item is safe to skip after resumption."""
 
-        return self.status_of(category, item_id) == "completed" or item_id in self.completed_objects.get(category, [])
+        return self.status_of(category, item_id) == "completed"
 
     def status_of(self, category: str, item_id: str) -> str | None:
         """Return the persisted terminal/retry state for one logical object."""
@@ -239,20 +277,11 @@ class TransferState:
     def mark_completed(self, category: str, item_id: str) -> None:
         """Record a completed object exactly once."""
 
-        entries = self.completed_objects.setdefault(category, [])
-        if self.status_of(category, item_id) != "completed":
-            entries.append(item_id)
-        failed = self.failed_items.get(category, [])
-        if item_id in failed:
-            failed.remove(item_id)
         self.item_statuses[f"{category}:{item_id}"] = "completed"
 
     def mark_failed(self, category: str, item_id: str, retry_count: int) -> None:
         """Record a retryable outcome so a later run can audit and retry it."""
 
-        entries = self.failed_items.setdefault(category, [])
-        if self.status_of(category, item_id) != "failed_retryable":
-            entries.append(item_id)
         self.retry_counts[f"{category}:{item_id}"] = max(0, retry_count)
         self.item_statuses[f"{category}:{item_id}"] = "failed_retryable"
 
@@ -261,23 +290,34 @@ class TransferState:
 
         if status not in {"failed_permanent", "unavailable", "unsupported", "already_present"}:
             raise ValueError("invalid_terminal_status")
-        entries = self.failed_items.get(category, [])
-        if item_id in entries:
-            entries.remove(item_id)
         self.item_statuses[f"{category}:{item_id}"] = status
 
     def mark_ambiguous(self, category: str, item_id: str) -> None:
         """Block automatic replay of a creation whose remote outcome is unknown."""
 
-        entries = self.ambiguous_objects.setdefault(category, [])
-        if item_id not in entries:
-            entries.append(item_id)
         self.item_statuses[f"{category}:{item_id}"] = "ambiguous"
 
     def is_ambiguous(self, category: str, item_id: str) -> bool:
         """Return whether automatic replay would risk duplicate remote objects."""
 
-        return item_id in self.ambiguous_objects.get(category, [])
+        return self.status_of(category, item_id) == "ambiguous"
+
+    def mark_pending(self, category: str, item_id: str) -> None:
+        """Resolve an ambiguous intent without treating it as completed."""
+
+        self.item_statuses[f"{category}:{item_id}"] = "pending"
+
+    def mark_create_intent(self, category: str, item_id: str, intent: dict[str, Any]) -> None:
+        """Persist a write-ahead creation intent before the remote mutation."""
+
+        self.create_intents[f"{category}:{item_id}"] = dict(intent, status="creating")
+        self.item_statuses[f"{category}:{item_id}"] = "creating"
+
+    def mark_created(self, category: str, item_id: str, destination_id: str) -> None:
+        intent = self.create_intents.get(f"{category}:{item_id}")
+        if intent is not None:
+            intent["status"] = "created"
+            intent["destination_id"] = destination_id
 
 
 class TransferStateStore:
@@ -292,6 +332,7 @@ class TransferStateStore:
         self._known_retries: dict[str, int] = {}
         self._known_playlists: dict[str, str] = {}
         self._known_folders: dict[str, str] = {}
+        self._known_intents: dict[str, dict[str, Any]] = {}
 
     def exists(self) -> bool:
         """Return whether a resumable checkpoint exists."""
@@ -332,13 +373,14 @@ class TransferStateStore:
             self._remember(state)
             return
         event = self._event_from_state(state)
-        state.last_applied_seq += 1
-        event["seq"] = state.last_applied_seq
+        next_seq = state.last_applied_seq + 1
+        event["seq"] = next_seq
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
         with self.journal_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+        state.last_applied_seq = next_seq
         if state.last_applied_seq % self._COMPACT_AFTER == 0:
             atomic_write_json(self.path, state.as_dict())
             self.journal_path.unlink(missing_ok=True)
@@ -361,6 +403,7 @@ class TransferStateStore:
             "retry_counts": {key: value for key, value in state.retry_counts.items() if self._known_retries.get(key) != value},
             "destination_playlists": {key: value for key, value in state.destination_playlists.items() if self._known_playlists.get(key) != value},
             "destination_folders": {key: value for key, value in state.destination_folders.items() if self._known_folders.get(key) != value},
+            "create_intents": {key: value for key, value in state.create_intents.items() if self._known_intents.get(key) != value},
         }
 
     def _remember(self, state: TransferState) -> None:
@@ -368,6 +411,7 @@ class TransferStateStore:
         self._known_retries = dict(state.retry_counts)
         self._known_playlists = dict(state.destination_playlists)
         self._known_folders = dict(state.destination_folders)
+        self._known_intents = {key: dict(value) for key, value in state.create_intents.items()}
 
     @staticmethod
     def _apply_event(state: TransferState, event: dict[str, Any]) -> None:
@@ -379,18 +423,9 @@ class TransferStateStore:
             state.retry_counts.update({str(key): max(0, int(value)) for key, value in event["retry_counts"].items()})
         state.destination_playlists.update(_string_mapping(event.get("destination_playlists")))
         state.destination_folders.update(_string_mapping(event.get("destination_folders")))
-        for key, status in _string_mapping(event.get("item_statuses")).items():
-            if ":" not in key:
-                continue
-            category, item_id = key.split(":", 1)
-            if status == "completed":
-                entries = state.completed_objects.setdefault(category, [])
-                if item_id not in entries:
-                    entries.append(item_id)
-            elif status == "failed_retryable":
-                entries = state.failed_items.setdefault(category, [])
-                if item_id not in entries:
-                    entries.append(item_id)
+        if isinstance(event.get("create_intents"), dict):
+            state.create_intents.update({str(key): dict(value) for key, value in event["create_intents"].items() if isinstance(value, dict)})
+        state.regenerate_derived()
 
 
 @dataclass(slots=True)
@@ -446,7 +481,7 @@ class DeleteState:
 
         self.total = len(statuses)
         self.completed = sum(status in {"completed", "already_absent"} for status in statuses)
-        self.failed = sum(status in {"failed_retryable", "failed_permanent"} for status in statuses)
+        self.failed = sum(status in {"failed_retryable", "failed_permanent", "ambiguous"} for status in statuses)
         self.remaining = sum(status in {"pending", "processing", "ambiguous"} for status in statuses)
         self.updated_at = utc_now()
 

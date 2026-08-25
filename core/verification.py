@@ -67,7 +67,9 @@ def _outcome(verification: dict[str, object], report: TransferReport) -> str:
     folders = verification.get("folders", {})
     if playlists.get("mismatched", 0) or folders.get("mismatched", 0):
         return "failed"
-    if report.unsupported_items or report.unavailable_items or report.permanent_failure_items:
+    if report.permanent_failure_items:
+        return "completed_with_failures"
+    if report.unsupported_items or report.unavailable_items:
         return "completed_with_expected_limitations"
     return "clean"
 
@@ -108,6 +110,10 @@ def _verify_playlists(
         source_id = str(playlist.get("id", ""))
         destination_id = state.destination_playlists.get(source_id)
         if not destination_id:
+            status = state.status_of("playlists", source_id)
+            if status not in {"unsupported", "unavailable"}:
+                mismatched += 1
+                details.append({"source_id": source_id, "reason": "missing_destination_mapping", "status": status or "pending"})
             continue
         source_items = _item_order(playlist)
         expected, limitations = _expected_remote_order(source_id, source_items, state)
@@ -116,7 +122,7 @@ def _verify_playlists(
         if actual_playlist is None:
             mismatched += 1
             details.append({"source_id": source_id, "destination_id": destination_id, "reason": "missing_playlist", "source_items": len(source_items), "transferable_items": len(expected), **limitations})
-        elif actual == expected:
+        elif actual == expected and _playlist_folder_matches(playlist, actual_playlist, state):
             verified += 1
             item_verified += len(expected)
         else:
@@ -124,7 +130,8 @@ def _verify_playlists(
             item_missing += max(0, len(expected) - len(actual))
             if len(actual) == len(expected):
                 order_mismatches += 1
-            details.append({"source_id": source_id, "destination_id": destination_id, "reason": "sequence_mismatch", "source_items": len(source_items), "transferable_items": len(expected), "expected_count": len(expected), "actual_count": len(actual), **limitations})
+            reason = "folder_mismatch" if actual == expected else "sequence_mismatch"
+            details.append({"source_id": source_id, "destination_id": destination_id, "reason": reason, "source_items": len(source_items), "transferable_items": len(expected), "expected_count": len(expected), "actual_count": len(actual), **limitations})
     return {"verified": verified, "mismatched": mismatched, "items_verified": item_verified, "items_missing": item_missing, "order_mismatches": order_mismatches, "details": details}
 
 
@@ -135,6 +142,8 @@ def _verify_folders(source: LibrarySnapshot, destination: LibrarySnapshot, state
         source_id = str(folder.get("id", ""))
         destination_id = state.destination_folders.get(source_id)
         if not destination_id:
+            if state.status_of("folders", source_id) not in {"unsupported", "unavailable"}:
+                mismatched += 1
             continue
         actual = destination_by_id.get(destination_id)
         expected_parent = str(folder.get("parent_id") or "root")
@@ -151,6 +160,14 @@ def _item_order(playlist: dict[str, object]) -> list[tuple[str, str]]:
     if not isinstance(raw, list):
         return []
     return [(str(item.get("kind", "track")), str(item.get("id", ""))) for item in raw if isinstance(item, dict)]
+
+
+def _playlist_folder_matches(
+    source: dict[str, object], destination: dict[str, object], state: TransferState
+) -> bool:
+    source_folder = str(source.get("folder_id") or "root")
+    expected = state.destination_folders.get(source_folder, "root")
+    return str(destination.get("folder_id") or "root") == expected
 
 
 def _expected_remote_order(

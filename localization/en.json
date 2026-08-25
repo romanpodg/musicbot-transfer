@@ -1,0 +1,213 @@
+{
+  "language_name": "English",
+  "language": {
+    "choose": "🌐 Choose language / Выберите язык"
+  },
+  "app": {
+    "banner": "╔══════════════════════════╗\n║ 🎵 TIDAL Library Manager ║\n╚══════════════════════════╝",
+    "goodbye": "👋 Goodbye!",
+    "interrupted": "⏸ Operation interrupted. A resumable transfer checkpoint has been kept.",
+    "unexpected_error": "⚠️ The operation could not be completed safely. See the local log for a sanitized error record.",
+    "dry_run_enabled": "🧪 DRY RUN MODE",
+    "dry_run_mutation_blocked": "🧪 Dry run is active. TIDAL library changes were not made.",
+    "invalid_arguments": "⚠️ Unsupported command option. Use --dry-run or --diagnostics."
+  },
+  "menu": {
+    "choose": "Choose an action:",
+    "transfer": "1️⃣ Transfer library",
+    "backup": "2️⃣ Create backup",
+    "restore": "3️⃣ Restore backup",
+    "cleanup": "4️⃣ Clean library",
+    "account": "5️⃣ Account information",
+    "settings": "6️⃣ Settings",
+    "exit": "0️⃣ Exit",
+    "settings_choose": "⚙️ Settings",
+    "language": "1️⃣ Change language",
+    "disconnect_source": "2️⃣ Forget source account session",
+    "disconnect_destination": "3️⃣ Forget destination account session",
+    "back": "0️⃣ Back"
+  },
+  "summary": {
+    "account": "👤 Account: {account}",
+    "library": "📚 Library:",
+    "count_line": "{label}: {count}",
+    "source": "SOURCE ACCOUNT",
+    "destination": "DESTINATION ACCOUNT"
+  },
+  "category": {
+    "tracks": "🎵 Tracks",
+    "albums": "💿 Albums",
+    "artists": "👥 Artists",
+    "videos": "🎬 Videos",
+    "mixes": "📻 Mixes and Radio",
+    "folders": "📁 Playlist folders",
+    "playlists": "🎧 Playlists",
+    "playlist_items": "🎼 Playlist items"
+  },
+  "prompt": {
+    "answer": "➜ ",
+    "yes_no": "[Y/N] ➜ ",
+    "option_line": "{number} {label}",
+    "invalid_choice": "⚠️ Please choose one of the listed options.",
+    "invalid_yes_no": "⚠️ Please answer yes or no.",
+    "sort_choose": "↕️ Choose transfer order:",
+    "backup_choose": "🗂 Choose a backup to restore:",
+    "cleanup_choose": "🗑 Library cleanup"
+  },
+  "input": {
+    "yes": "y,yes",
+    "no": "n,no"
+  },
+  "sort": {
+    "newest": "1️⃣ Added date — newest first",
+    "oldest": "2️⃣ Added date — oldest first",
+    "alphabetical": "3️⃣ Alphabetical",
+    "artist": "4️⃣ Artist",
+    "album": "5️⃣ Album",
+    "original": "6️⃣ Original TIDAL order"
+  },
+  "auth": {
+    "open_url": "🔐 Open this TIDAL authorization link in your browser, approve access, then return here:\n{url}",
+    "session_not_saved": "ℹ️ The OAuth session will not be saved because a secure OS keyring is unavailable."
+  },
+  "confirmation": {
+    "warning_title": "⚠️ WARNING",
+    "danger_title": "🚨 DANGER",
+    "account": "Account: {account}",
+    "action": "Action: {action}",
+    "mutates_account": "This will modify your TIDAL account.",
+    "continue": "Continue?",
+    "deleting": "You are deleting: {summary}",
+    "irreversible": "This action cannot be undone.",
+    "type_phrase": "Type {phrase} to continue.",
+    "delete_phrase": "DELETE",
+    "transfer_action": "Transfer {count} tracks and related library items",
+    "restore_action": "Restore {count} tracks and related library items",
+    "resume_action": "Resume the previous transfer with {count} source tracks",
+    "resume_cleanup_action": "Resume cleanup of {count} selected library objects"
+  },
+  "transfer": {
+    "start": "Start transfer?",
+    "cancelled": "ℹ️ Transfer cancelled. No TIDAL data was changed.",
+    "completed": "✅ Transfer processing finished.",
+    "partial": "⚠️ Transfer finished with failures or unavailable items. Resume state was kept.",
+    "report_written": "📄 Verification report saved: {path}",
+    "state_invalid": "⚠️ The saved transfer state is invalid and cannot be resumed safely.",
+    "resume_detected": "⏯ Previous {operation} detected.",
+    "resume_question": "Resume it?",
+    "resume_declined": "ℹ️ The previous transfer state was kept for a later resume.",
+    "source_incomplete": "⚠️ Transfer was blocked because the source snapshot is incomplete. Create a complete backup or retry the read first."
+  },
+  "backup": {
+    "creating": "💾 Creating library backup…",
+    "completed": "✅ Backup saved: {path}",
+    "partial": "⚠️ Backup saved, but these sections are incomplete: {sections}",
+    "none": "ℹ️ No backups are available.",
+    "invalid": "⚠️ The selected backup cannot be read safely."
+  },
+  "restore": {
+    "summary": "Backup source account: {account}",
+    "cancelled": "ℹ️ Restore cancelled. No TIDAL data was changed."
+  },
+  "cleanup": {
+    "full": "1️⃣ Full library cleanup",
+    "tracks": "2️⃣ Favorite tracks only",
+    "albums": "3️⃣ Albums only",
+    "artists": "4️⃣ Artists only",
+    "playlists": "5️⃣ Playlists only",
+    "videos": "6️⃣ Videos only",
+    "mixes": "7️⃣ Mixes and Radio only",
+    "cancel": "0️⃣ Cancel",
+    "offer_backup": "Create a backup before deletion?",
+    "cancelled": "ℹ️ Cleanup cancelled. No TIDAL data was changed.",
+    "preparing": "🔎 Reviewing current library targets…",
+    "incomplete": "⚠️ Cleanup was blocked because the selected targets could not be read completely.",
+    "completed": "✅ Cleanup finished: {successful} succeeded, {failed} failed.",
+    "target_summary": "{count} selected library objects",
+    "deleting_started": "🗑 Removing selected library objects…",
+    "dry_run_would_delete": "Would delete:",
+    "dry_run_no_changes": "No TIDAL library changes were made.",
+    "resume_detected": "⚠️ Previous cleanup interrupted.",
+    "resume_progress": "Completed: {completed}/{total}",
+    "resume_question": "Continue cleanup?",
+    "resume_declined": "ℹ️ Cleanup state was kept so you can continue later.",
+    "state_invalid": "⚠️ The saved cleanup queue is invalid and cannot be resumed safely.",
+    "verify_remaining": "🔎 Verification complete. Remaining selected objects: {count}",
+    "verification_unavailable": "⚠️ Cleanup completed, but verification could not safely read every selected section."
+  },
+  "account": {
+    "unknown": "Unknown account",
+    "loading": "🔐 Connecting to TIDAL…",
+    "information": "👤 Account information",
+    "library_incomplete": "⚠️ Some library sections could not be read completely: {sections}"
+  },
+  "settings": {
+    "language_saved": "✅ Language preference saved.",
+    "source_forgotten": "✅ Source account session forgotten.",
+    "destination_forgotten": "✅ Destination account session forgotten."
+  },
+  "progress": {
+    "line": "{label}: [{bar}] {current}/{total}",
+    "scanning": "{label}: scanning… {current}",
+    "current": "Current: {item}",
+    "errors": "Errors: {errors}",
+    "item_unit": "item",
+    "not_available": "not available",
+    "postfix": "Current: {item} | Errors: {errors}",
+    "description": "{operation} {label}",
+    "operation": {
+      "transfer": "Transferring",
+      "backup": "Backing up",
+      "cleanup": "Removing",
+      "verification": "Verifying"
+    }
+  },
+  "retry": {
+    "attempt": "Attempt {attempt}/{total}",
+    "retrying": "⚠️ {reason}. Retrying in {seconds} seconds…",
+    "reason": {
+      "api_timeout": "Connection timeout",
+      "network_error": "Network connection failed",
+      "rate_limited": "TIDAL rate limit reached",
+      "api_server_error": "TIDAL service error",
+      "provider_error": "TIDAL request failed",
+      "item_unavailable": "Item is unavailable"
+    }
+  },
+  "shutdown": {
+    "stopping": "⚠️ Stopping safely…",
+    "saving_state": "Saving state…",
+    "progress_saved": "Progress saved: {completed}/{total}",
+    "continue_later": "You can continue later."
+  },
+  "diagnostics": {
+    "heading": "System check:",
+    "line": "{label}: {status}{detail}",
+    "label": {
+      "python": "Python",
+      "tidalapi": "tidalapi",
+      "config": "Config",
+      "backup": "Backup",
+      "logs": "Logs",
+      "api": "API"
+    },
+    "status": {
+      "ok": "OK",
+      "error": "ERROR",
+      "found": "Found",
+      "missing": "Not found",
+      "available": "Available",
+      "unavailable": "Unavailable"
+    }
+  },
+  "operation": {
+    "transfer": "transfer",
+    "restore": "restore"
+  },
+  "errors": {
+    "tidalapi_missing": "⚠️ TIDAL integration is unavailable. Install the project requirements and try again.",
+    "authentication_failed": "⚠️ TIDAL authentication was not completed. No library changes were made.",
+    "confirmation_required": "⚠️ No change was made because confirmation was not provided.",
+    "operation_failed": "⚠️ The operation could not be completed safely. See the sanitized local log for details."
+  }
+}

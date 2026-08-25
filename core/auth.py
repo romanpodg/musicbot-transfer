@@ -56,6 +56,10 @@ class UnsupportedOperationError(TidalClientError):
     """Raised for a known tidalapi capability gap, never retried automatically."""
 
 
+class PaginationIntegrityError(TidalClientError):
+    """Raised when pagination cannot prove a complete, non-duplicated result."""
+
+
 class CredentialStore:
     """Store OAuth credentials in the OS keyring, never in project files."""
 
@@ -431,6 +435,23 @@ class TidalLibraryClient:
             for item in self._paginate_offset(getter, operation=f"favorite_ids_{category}")
         }
 
+    def creation_candidates(
+        self, category: str, name: str, parent_id: str, description: str = ""
+    ) -> list[dict[str, Any]]:
+        """Find conservative create-recovery candidates from a fresh snapshot."""
+
+        snapshot = self.export_library()
+        if snapshot.incomplete_sections:
+            raise TidalClientError("creation_reconciliation_incomplete")
+        records = snapshot.folders if category == "folders" else snapshot.playlists
+        parent_field = "parent_id" if category == "folders" else "folder_id"
+        return [
+            record for record in records
+            if str(record.get("name", "")) == name
+            and str(record.get(parent_field) or "root") == parent_id
+            and (category == "folders" or str(record.get("description", "")) == description)
+        ]
+
     def playlist_media_order(self, playlist_id: str) -> list[dict[str, str]]:
         """Return a destination playlist's exact media order for safe resumption."""
 
@@ -687,7 +708,7 @@ class TidalLibraryClient:
                     "event=pagination_repeated_page operation=%s offset=%d count=%d",
                     operation, offset, len(page),
                 )
-                return values
+                raise PaginationIntegrityError("pagination_repeated_page")
             previous_page_ids = page_ids
             if unique_ids:
                 fresh_page = [value for value in page if _safe_id(value) not in emitted_ids]
@@ -696,7 +717,7 @@ class TidalLibraryClient:
                         "event=pagination_repeated_ids operation=%s offset=%d count=%d",
                         operation, offset, len(page),
                     )
-                    return values
+                    raise PaginationIntegrityError("pagination_repeated_ids")
                 emitted_ids.update(_safe_id(value) for value in fresh_page)
                 values.extend(fresh_page)
             else:

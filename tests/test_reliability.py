@@ -85,7 +85,7 @@ class ReliabilityTests(unittest.TestCase):
             state = DeleteStateStore(root / "delete_state.json").load()
             self.assertEqual((state.total, state.completed, state.failed, state.remaining), (2, 1, 1, 0))
             queue = DeleteQueueStore(root / "delete_queue.json").load()
-            self.assertEqual([item["status"] for item in queue.items], ["completed", "failed"])
+            self.assertEqual([item["status"] for item in queue.items], ["completed", "failed_retryable"])
 
             second_client = FakeCleanupClient()
             second = manager.resume(second_client, confirmed=True)

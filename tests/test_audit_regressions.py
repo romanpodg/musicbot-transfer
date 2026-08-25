@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from core.auth import TidalLibraryClient, UnsupportedOperationError
+from core.auth import PaginationIntegrityError, TidalLibraryClient, UnsupportedOperationError
 from core.cleanup import CleanupManager, CleanupScope, DeleteQueue, DeleteQueueStore
 from core.models import AccountProfile, LibrarySnapshot, TransferReport
 from core.sorting import SortOrder, sort_items
@@ -17,6 +17,8 @@ from core.transfer import TransferOptions, TransferService
 from core.verification import VerificationService
 from core.retry import RetryExecutor, RetryPolicy
 import requests
+from core.backup import BACKUP_FORMAT, BACKUP_VERSION, BackupFormatError, BackupService, _checksum
+from core.state import atomic_write_json
 
 
 class PaginationTests(unittest.TestCase):
@@ -38,10 +40,8 @@ class PaginationTests(unittest.TestCase):
 
     def test_repeated_full_folder_page_is_stopped_without_duplicates(self) -> None:
         page = [SimpleNamespace(id=str(index)) for index in range(50)]
-        result = self._client()._paginate_offset(
-            lambda **_: page, operation="folders", unique_ids=True
-        )
-        self.assertEqual(len(result), 50)
+        with self.assertRaises(PaginationIntegrityError):
+            self._client()._paginate_offset(lambda **_: page, operation="folders", unique_ids=True)
 
     def test_rate_limit_retry_after_is_not_shortened(self) -> None:
         response = SimpleNamespace(status_code=429, headers={"Retry-After": "13"})
@@ -66,14 +66,14 @@ class PlaylistAndResumeTests(unittest.TestCase):
     def test_server_prefix_is_authoritative_when_checkpoint_is_ahead_or_behind(self) -> None:
         expected = [{"kind": "track", "id": value} for value in ("a", "b", "c")]
         destination = SimpleNamespace(playlist_media_order=lambda _: expected[:2])
-        self.assertEqual(TransferService._reconcile_playlist_position(destination, "d", expected, 3), 2)
-        self.assertEqual(TransferService._reconcile_playlist_position(destination, "d", expected, 1), 2)
+        self.assertEqual(TransferService._reconcile_playlist_position(destination, "d", "s", expected, 3), 2)
+        self.assertEqual(TransferService._reconcile_playlist_position(destination, "d", "s", expected, 1), 2)
 
     def test_playlist_order_conflict_is_rejected(self) -> None:
         expected = [{"kind": "track", "id": value} for value in ("a", "b")]
         destination = SimpleNamespace(playlist_media_order=lambda _: list(reversed(expected)))
         with self.assertRaisesRegex(Exception, "playlist_resume_mismatch"):
-            TransferService._reconcile_playlist_position(destination, "d", expected, 2)
+            TransferService._reconcile_playlist_position(destination, "d", "s", expected, 2)
 
     def test_video_is_terminal_and_following_track_continues(self) -> None:
         class Destination:
@@ -116,6 +116,39 @@ class PlaylistAndResumeTests(unittest.TestCase):
             # Empty restore reaches normal completion without performing a mutation.
             service.run(Destination(), TransferState.create("restore", snapshot), TransferOptions(), confirmed=True)
 
+    def test_resume_reconciles_source_positions_across_terminal_video_gap(self) -> None:
+        state = self._state()
+        state.mark_completed("playlist_items", "p:0")
+        state.mark_terminal("playlist_items", "p:1", "unsupported")
+        destination = SimpleNamespace(playlist_media_order=lambda _: [
+            {"kind": "track", "id": "A"}, {"kind": "track", "id": "B"}
+        ])
+        position = TransferService._reconcile_playlist_position(
+            destination, "d", "p",
+            [{"kind": "track", "id": "A"}, {"kind": "video", "id": "V"}, {"kind": "track", "id": "B"}, {"kind": "track", "id": "C"}],
+            2, state,
+        )
+        self.assertEqual(position, 3)
+        self.assertEqual(state.status_of("playlist_items", "p:2"), "completed")
+
+    def test_terminal_favorites_do_not_retry_but_retryable_does(self) -> None:
+        class Destination:
+            def __init__(self) -> None:
+                self.calls: list[str] = []
+            def favorite_ids(self, _: str): return set()
+            def add_favorite(self, _, item_id: str): self.calls.append(item_id)
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = TransferService(TransferStateStore(Path(directory) / "state.json"), logging.getLogger("test.terminal"))
+            state = TransferState.create("restore", LibrarySnapshot(account=AccountProfile("s", "s"), tracks=[{"id": value} for value in ("u", "p", "x", "r")]))
+            state.mark_terminal("tracks", "u", "unavailable")
+            state.mark_terminal("tracks", "p", "failed_permanent")
+            state.mark_terminal("tracks", "x", "already_present")
+            state.mark_failed("tracks", "r", 1)
+            destination = Destination()
+            service.run(destination, state, TransferOptions(), confirmed=True)
+            self.assertEqual(destination.calls, ["r"])
+
 
 class SortingVerificationAndCleanupTests(unittest.TestCase):
     def test_missing_dates_are_last_in_both_directions_and_artist_uses_name(self) -> None:
@@ -148,6 +181,29 @@ class SortingVerificationAndCleanupTests(unittest.TestCase):
             data = (Path(directory) / "report.json").read_text(encoding="utf-8")
             self.assertIn('"missing": 2', data)
 
+    def test_transfer_journal_replays_small_events_without_rewriting_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = TransferStateStore(Path(directory) / "transfer.json")
+            snapshot = LibrarySnapshot(account=AccountProfile("s", "s"), tracks=[{"id": str(index)} for index in range(10_000)])
+            state = TransferState.create("restore", snapshot)
+            store.save(state)
+            base_size = store.path.stat().st_size
+            for index in range(100):
+                state.mark_completed("tracks", str(index))
+                store.save(state)
+            self.assertEqual(store.path.stat().st_size, base_size)
+            self.assertLess(store.journal_path.stat().st_size, base_size // 4)
+            self.assertTrue(TransferStateStore(store.path).load().is_completed("tracks", "99"))
+
+    def test_backup_rejects_inconsistent_complete_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "backup.json"
+            snapshot = LibrarySnapshot(account=AccountProfile("s", "s"), incomplete_sections=["tracks"])
+            library = snapshot.as_dict()
+            atomic_write_json(path, {"format": BACKUP_FORMAT, "format_version": BACKUP_VERSION, "status": "complete", "source_account_id": "s", "counts": snapshot.counts(), "checksum_sha256": _checksum(library), "library": library})
+            with self.assertRaises(BackupFormatError):
+                BackupService(path).load(path)
+
     def test_delete_queue_uses_constant_size_journal_for_large_state_transitions(self) -> None:
         """Guard against accidentally serializing a 50k-item queue per delete."""
 
@@ -163,6 +219,6 @@ class SortingVerificationAndCleanupTests(unittest.TestCase):
             snapshot_size = path.stat().st_size
             for item in queue.items[:100]:
                 item["status"] = "completed"
-                store.record(item)
+                store.record(queue, item)
             self.assertLess(store.journal_path.stat().st_size, snapshot_size // 10)
             self.assertEqual(sum(item["status"] == "completed" for item in store.load().items), 100)

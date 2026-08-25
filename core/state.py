@@ -40,6 +40,7 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
+        _sync_parent_directory(path.parent)
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -57,6 +58,23 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("json_object_expected")
     return value
+
+
+def _sync_parent_directory(path: Path) -> None:
+    """Best-effort POSIX rename durability; Windows does not support this."""
+
+    if os.name == "nt" or not hasattr(os, "O_DIRECTORY"):
+        return
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        # Replacement itself succeeded; directory fsync is an optional
+        # durability upgrade and must not break Windows or network shares.
+        return
 
 
 @dataclass(slots=True)
@@ -105,6 +123,7 @@ class TransferState:
     ambiguous_objects: dict[str, list[str]] = field(default_factory=dict)
     destination_playlists: dict[str, str] = field(default_factory=dict)
     destination_folders: dict[str, str] = field(default_factory=dict)
+    last_applied_seq: int = 0
 
     @classmethod
     def create(
@@ -123,7 +142,7 @@ class TransferState:
         """Load a checkpoint, preserving only supported fields."""
 
         version = value.get("format_version", 1)
-        if not isinstance(version, int) or version not in {1, 2, 3}:
+        if not isinstance(version, int) or version not in {1, 2, 3, 4}:
             raise ValueError("transfer_state_version_unsupported")
 
         snapshot_value = value.get("source_snapshot")
@@ -182,13 +201,14 @@ class TransferState:
             else {},
             destination_playlists=_string_mapping(value.get("destination_playlists")),
             destination_folders=_string_mapping(value.get("destination_folders")),
+            last_applied_seq=max(0, int(value.get("last_applied_seq", 0))),
         )
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize the checkpoint without credentials or raw exceptions."""
 
         return {
-            "format_version": 3,
+            "format_version": 4,
             "operation": self.operation,
             "sort_order": self.sort_order,
             "created_at": self.created_at,
@@ -202,19 +222,25 @@ class TransferState:
             "ambiguous_objects": self.ambiguous_objects,
             "destination_playlists": self.destination_playlists,
             "destination_folders": self.destination_folders,
+            "last_applied_seq": self.last_applied_seq,
             "source_snapshot": self.source_snapshot.as_dict(),
         }
 
     def is_completed(self, category: str, item_id: str) -> bool:
         """Return whether a completed item is safe to skip after resumption."""
 
-        return item_id in self.completed_objects.get(category, [])
+        return self.status_of(category, item_id) == "completed" or item_id in self.completed_objects.get(category, [])
+
+    def status_of(self, category: str, item_id: str) -> str | None:
+        """Return the persisted terminal/retry state for one logical object."""
+
+        return self.item_statuses.get(f"{category}:{item_id}")
 
     def mark_completed(self, category: str, item_id: str) -> None:
         """Record a completed object exactly once."""
 
         entries = self.completed_objects.setdefault(category, [])
-        if item_id not in entries:
+        if self.status_of(category, item_id) != "completed":
             entries.append(item_id)
         failed = self.failed_items.get(category, [])
         if item_id in failed:
@@ -225,7 +251,7 @@ class TransferState:
         """Record a retryable outcome so a later run can audit and retry it."""
 
         entries = self.failed_items.setdefault(category, [])
-        if item_id not in entries:
+        if self.status_of(category, item_id) != "failed_retryable":
             entries.append(item_id)
         self.retry_counts[f"{category}:{item_id}"] = max(0, retry_count)
         self.item_statuses[f"{category}:{item_id}"] = "failed_retryable"
@@ -255,10 +281,17 @@ class TransferState:
 
 
 class TransferStateStore:
-    """Persist transfer checkpoints atomically."""
+    """Persist a static transfer snapshot plus small durable state events."""
+
+    _COMPACT_AFTER = 500
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.journal_path = path.with_suffix(path.suffix + ".journal")
+        self._known_statuses: dict[str, str] = {}
+        self._known_retries: dict[str, int] = {}
+        self._known_playlists: dict[str, str] = {}
+        self._known_folders: dict[str, str] = {}
 
     def exists(self) -> bool:
         """Return whether a resumable checkpoint exists."""
@@ -268,17 +301,96 @@ class TransferStateStore:
     def load(self) -> TransferState:
         """Load a previously persisted transfer checkpoint."""
 
-        return TransferState.from_dict(read_json(self.path))
+        state = TransferState.from_dict(read_json(self.path))
+        if not self.journal_path.exists():
+            self._remember(state)
+            return state
+        with self.journal_path.open("r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        for index, line in enumerate(lines):
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                if index == len(lines) - 1 and not line.endswith("\n"):
+                    break
+                raise ValueError("transfer_journal_invalid") from None
+            seq = event.get("seq")
+            if not isinstance(seq, int) or seq <= state.last_applied_seq:
+                continue
+            if seq != state.last_applied_seq + 1:
+                raise ValueError("transfer_journal_sequence_invalid")
+            self._apply_event(state, event)
+            state.last_applied_seq = seq
+        self._remember(state)
+        return state
 
     def save(self, state: TransferState) -> None:
-        """Durably save a checkpoint after each successful mutation."""
+        """Append a small fsynced mutation event and periodically compact."""
 
-        atomic_write_json(self.path, state.as_dict())
+        if not self.path.exists():
+            atomic_write_json(self.path, state.as_dict())
+            self._remember(state)
+            return
+        event = self._event_from_state(state)
+        state.last_applied_seq += 1
+        event["seq"] = state.last_applied_seq
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.journal_path.open("a", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        if state.last_applied_seq % self._COMPACT_AFTER == 0:
+            atomic_write_json(self.path, state.as_dict())
+            self.journal_path.unlink(missing_ok=True)
+        self._remember(state)
 
     def clear(self) -> None:
         """Remove a checkpoint only after a fully successful operation."""
 
         self.path.unlink(missing_ok=True)
+        self.journal_path.unlink(missing_ok=True)
+
+    def _event_from_state(self, state: TransferState) -> dict[str, Any]:
+        """Use per-object statuses as the canonical replayable transfer state."""
+
+        return {
+            "current_category": state.current_category,
+            "current_playlist": state.current_playlist,
+            "current_position": state.current_position,
+            "item_statuses": {key: value for key, value in state.item_statuses.items() if self._known_statuses.get(key) != value},
+            "retry_counts": {key: value for key, value in state.retry_counts.items() if self._known_retries.get(key) != value},
+            "destination_playlists": {key: value for key, value in state.destination_playlists.items() if self._known_playlists.get(key) != value},
+            "destination_folders": {key: value for key, value in state.destination_folders.items() if self._known_folders.get(key) != value},
+        }
+
+    def _remember(self, state: TransferState) -> None:
+        self._known_statuses = dict(state.item_statuses)
+        self._known_retries = dict(state.retry_counts)
+        self._known_playlists = dict(state.destination_playlists)
+        self._known_folders = dict(state.destination_folders)
+
+    @staticmethod
+    def _apply_event(state: TransferState, event: dict[str, Any]) -> None:
+        state.current_category = _optional_string(event.get("current_category"))
+        state.current_playlist = _optional_string(event.get("current_playlist"))
+        state.current_position = max(0, int(event.get("current_position", 0)))
+        state.item_statuses.update(_string_mapping(event.get("item_statuses")))
+        if isinstance(event.get("retry_counts"), dict):
+            state.retry_counts.update({str(key): max(0, int(value)) for key, value in event["retry_counts"].items()})
+        state.destination_playlists.update(_string_mapping(event.get("destination_playlists")))
+        state.destination_folders.update(_string_mapping(event.get("destination_folders")))
+        for key, status in _string_mapping(event.get("item_statuses")).items():
+            if ":" not in key:
+                continue
+            category, item_id = key.split(":", 1)
+            if status == "completed":
+                entries = state.completed_objects.setdefault(category, [])
+                if item_id not in entries:
+                    entries.append(item_id)
+            elif status == "failed_retryable":
+                entries = state.failed_items.setdefault(category, [])
+                if item_id not in entries:
+                    entries.append(item_id)
 
 
 @dataclass(slots=True)
@@ -333,9 +445,9 @@ class DeleteState:
         """Synchronize aggregate counters with the authoritative queue statuses."""
 
         self.total = len(statuses)
-        self.completed = statuses.count("completed")
-        self.failed = statuses.count("failed")
-        self.remaining = sum(status in {"pending", "processing"} for status in statuses)
+        self.completed = sum(status in {"completed", "already_absent"} for status in statuses)
+        self.failed = sum(status in {"failed_retryable", "failed_permanent"} for status in statuses)
+        self.remaining = sum(status in {"pending", "processing", "ambiguous"} for status in statuses)
         self.updated_at = utc_now()
 
     def as_dict(self) -> dict[str, Any]:

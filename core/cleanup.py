@@ -99,6 +99,7 @@ class DeleteQueue:
 
     operation: str
     items: list[dict[str, Any]]
+    last_applied_seq: int = 0
 
     @classmethod
     def from_plan(cls, plan: CleanupPlan) -> "DeleteQueue":
@@ -122,7 +123,7 @@ class DeleteQueue:
         """Validate persisted queue data without accepting arbitrary statuses."""
 
         version = value.get("format_version", 1)
-        if not isinstance(version, int) or version != 1:
+        if not isinstance(version, int) or version not in {1, 2}:
             raise CleanupStateError("delete_queue_version_unsupported")
 
         raw_items = value.get("items")
@@ -133,7 +134,7 @@ class DeleteQueue:
             if not isinstance(raw, dict):
                 raise CleanupStateError("delete_queue_item_invalid")
             status = str(raw.get("status", "pending"))
-            if status not in {"pending", "processing", "completed", "failed"}:
+            if status not in {"pending", "processing", "completed", "already_absent", "failed_retryable", "failed_permanent", "ambiguous"}:
                 raise CleanupStateError("delete_queue_status_invalid")
             item_id = str(raw.get("id", ""))
             category = str(raw.get("category", ""))
@@ -151,12 +152,12 @@ class DeleteQueue:
                     "reason": str(raw.get("reason", "")),
                 }
             )
-        return cls(operation=str(value.get("operation", "delete")), items=items)
+        return cls(operation=str(value.get("operation", "delete")), items=items, last_applied_seq=max(0, int(value.get("last_applied_seq", 0))))
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize safe library metadata and no provider credentials."""
 
-        return {"format_version": 1, "operation": self.operation, "items": self.items}
+        return {"format_version": 2, "operation": self.operation, "last_applied_seq": self.last_applied_seq, "items": self.items}
 
     def reset_interrupted_items(self) -> None:
         """Return an unacknowledged in-flight request to the pending queue."""
@@ -170,7 +171,7 @@ class DeleteQueue:
         """Allow a user-approved resume to retry bounded API failures."""
 
         for item in self.items:
-            if item["status"] == "failed":
+            if item["status"] == "failed_retryable":
                 item["status"] = "pending"
                 item["reason"] = ""
 
@@ -201,16 +202,30 @@ class DeleteQueueStore:
         by_key = {(item["category"], item["id"]): item for item in queue.items}
         try:
             with self.journal_path.open("r", encoding="utf-8") as handle:
-                for line in handle:
+                lines = handle.readlines()
+                for index, line in enumerate(lines):
                     event = json.loads(line)
+                    seq = event.get("seq")
+                    if not isinstance(seq, int):
+                        raise CleanupStateError("delete_queue_journal_invalid")
+                    if seq <= queue.last_applied_seq:
+                        continue
+                    if seq != queue.last_applied_seq + 1:
+                        raise CleanupStateError("delete_queue_journal_sequence_invalid")
                     key = (str(event["category"]), str(event["id"]))
                     item = by_key.get(key)
-                    if item is None or event["status"] not in {"pending", "processing", "completed", "failed"}:
+                    if item is None or event["status"] not in {"pending", "processing", "completed", "already_absent", "failed_retryable", "failed_permanent", "ambiguous"}:
                         raise CleanupStateError("delete_queue_journal_invalid")
                     item["status"] = event["status"]
                     item["attempts"] = max(0, int(event.get("attempts", item["attempts"])))
                     item["reason"] = str(event.get("reason", ""))
-        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    queue.last_applied_seq = seq
+        except json.JSONDecodeError:
+            # A power-loss can truncate the final un-terminated append only.
+            if index == len(lines) - 1 and not line.endswith("\n"):
+                return queue
+            raise CleanupStateError("delete_queue_journal_invalid") from None
+        except (OSError, KeyError, TypeError, ValueError):
             raise CleanupStateError("delete_queue_journal_invalid") from None
         return queue
 
@@ -220,7 +235,7 @@ class DeleteQueueStore:
         atomic_write_json(self.path, queue.as_dict())
         self.journal_path.unlink(missing_ok=True)
 
-    def record(self, item: dict[str, Any]) -> None:
+    def record(self, queue: DeleteQueue, item: dict[str, Any]) -> None:
         """Durably append one O(1) status transition between compactions."""
 
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,6 +244,8 @@ class DeleteQueueStore:
             "status": str(item["status"]), "attempts": int(item["attempts"]),
             "reason": str(item.get("reason", "")),
         }
+        queue.last_applied_seq += 1
+        event["seq"] = queue.last_applied_seq
         with self.journal_path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
             handle.flush()
@@ -498,7 +515,7 @@ class CleanupManager:
         )
         try:
             for position, item in enumerate(queue.items, start=1):
-                if item["status"] in {"completed", "failed"}:
+                if item["status"] in {"completed", "already_absent", "failed_permanent"}:
                     continue
                 item["status"] = "processing"
                 item["attempts"] = int(item["attempts"]) + 1
@@ -521,7 +538,7 @@ class CleanupManager:
                         item["category"], item["id"], _safe_log_value(_label(item)),
                     )
                 except ItemUnavailableError:
-                    item["status"] = "completed"
+                    item["status"] = "already_absent"
                     item["reason"] = "already_absent"
                     result.successful.append(_result_item(item, "already_absent"))
                     self._logger.info(
@@ -530,7 +547,7 @@ class CleanupManager:
                     )
                 except Exception as error:
                     reason = _error_reason(error)
-                    item["status"] = "failed"
+                    item["status"] = "failed_retryable" if reason in {"api_timeout", "network_error", "api_server_error", "rate_limited"} else "failed_permanent"
                     item["reason"] = reason
                     result.failed.append(_result_item(item, reason))
                     self._logger.error(
@@ -560,7 +577,7 @@ class CleanupManager:
         result.failed = [
             _result_item(item, str(item.get("reason", "provider_error")))
             for item in queue.items
-            if item["status"] == "failed"
+            if item["status"] in {"failed_retryable", "failed_permanent"}
         ]
         self._logger.info(
             "event=cleanup_finished operation=%s completed=%d failed=%d total=%d",
@@ -594,7 +611,7 @@ class CleanupManager:
         if item is None:
             self._queue_store.save(queue)
         else:
-            self._queue_store.record(item)
+            self._queue_store.record(queue, item)
         self._state_store.save(state)
 
     @staticmethod

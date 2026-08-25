@@ -129,6 +129,7 @@ class TransferReport:
     unsupported_items: list[dict[str, str]] = field(default_factory=list)
     permanent_failure_items: list[dict[str, str]] = field(default_factory=list)
     ambiguous_items: list[dict[str, str]] = field(default_factory=list)
+    verification_outcome: str | None = None
     skipped_items: list[dict[str, str]] = field(default_factory=list)
 
     def add(self, status: str, category: str, item_id: str, reason: str = "") -> None:
@@ -185,5 +186,6 @@ class TransferReport:
             "unsupported_items": self.unsupported_items,
             "permanent_failure_items": self.permanent_failure_items,
             "ambiguous_items": self.ambiguous_items,
+            "verification_outcome": self.verification_outcome,
             "skipped_items": self.skipped_items,
         }

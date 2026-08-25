@@ -107,7 +107,12 @@ class TransferService:
                 if not item_id:
                     self._record_failure(report, state, category, "missing", TidalClientError())
                     continue
-                if item_id in existing_ids:
+                persisted_status = state.status_of(category, item_id)
+                if persisted_status in {"unavailable", "unsupported", "failed_permanent"}:
+                    report.add(persisted_status if persisted_status != "failed_permanent" else "failed_permanent", category, item_id, "previous_terminal_outcome")
+                elif persisted_status in {"already_present", "completed"}:
+                    report.add("skipped", category, item_id, persisted_status)
+                elif item_id in existing_ids:
                     state.mark_terminal(category, item_id, "already_present")
                     report.add("skipped", category, item_id, "already_present")
                 elif state.is_completed(category, item_id):
@@ -150,9 +155,10 @@ class TransferService:
             if state.is_completed("folders", folder_id):
                 report.add("skipped", "folders", folder_id, "already_completed")
             elif state.is_ambiguous("folders", folder_id):
-                self._record_failure(
-                    report, state, "folders", folder_id, TidalClientError("ambiguous_remote_outcome")
-                )
+                if self._recover_ambiguous_folder(destination, state, folder):
+                    report.add("successful", "folders", folder_id, "reconciled_created")
+                else:
+                    report.add("ambiguous", "folders", folder_id, "creation_conflict")
             else:
                 parent_source_id = str(folder.get("parent_id") or "root")
                 parent_destination_id = state.destination_folders.get(parent_source_id)
@@ -179,7 +185,10 @@ class TransferService:
                     except Exception as error:
                         if _unknown_creation_outcome(error):
                             state.mark_ambiguous("folders", folder_id)
-                        self._record_failure(report, state, "folders", folder_id, error)
+                            self._state_store.save(state)
+                            report.add("ambiguous", "folders", folder_id, "ambiguous_remote_outcome")
+                        else:
+                            self._record_failure(report, state, "folders", folder_id, error)
             if progress:
                 progress("folders", index, len(folders))
 
@@ -199,9 +208,10 @@ class TransferService:
             if state.is_completed("playlists", playlist_id):
                 report.add("skipped", "playlists", playlist_id, "already_completed")
             elif state.is_ambiguous("playlists", playlist_id):
-                self._record_failure(
-                    report, state, "playlists", playlist_id, TidalClientError("ambiguous_remote_outcome")
-                )
+                if self._recover_ambiguous_playlist(destination, state, playlist):
+                    self._transfer_playlist(destination, state, report, playlist, playlist_id)
+                else:
+                    report.add("ambiguous", "playlists", playlist_id, "creation_conflict")
             else:
                 self._transfer_playlist(destination, state, report, playlist, playlist_id)
             if progress:
@@ -228,6 +238,9 @@ class TransferService:
                 state.current_category = "playlists"
                 self._state_store.save(state)
                 destination.favorite_playlist(playlist_id, parent_destination_id)
+                # Followed playlists retain their TIDAL UUID; persist that
+                # identity so verification does not silently skip them.
+                state.destination_playlists[playlist_id] = playlist_id
                 state.mark_completed("playlists", playlist_id)
                 self._state_store.save(state)
                 report.add("successful", "playlists", playlist_id)
@@ -263,7 +276,43 @@ class TransferService:
         except Exception as error:
             if created_playlist and _unknown_creation_outcome(error):
                 state.mark_ambiguous("playlists", playlist_id)
-            self._record_failure(report, state, "playlists", playlist_id, error)
+            if state.is_ambiguous("playlists", playlist_id):
+                self._state_store.save(state)
+                report.add("ambiguous", "playlists", playlist_id, "ambiguous_remote_outcome")
+            else:
+                self._record_failure(report, state, "playlists", playlist_id, error)
+
+    def _recover_ambiguous_folder(
+        self, destination: TidalLibraryClient, state: TransferState, folder: dict[str, Any]
+    ) -> bool:
+        parent = str(folder.get("parent_id") or "root")
+        parent = state.destination_folders.get(parent, parent)
+        candidates = destination.creation_candidates("folders", str(folder.get("name", "")), parent)
+        if len(candidates) != 1:
+            self._logger.error("event=folder_creation_conflict source_id=%s candidates=%d", folder.get("id"), len(candidates))
+            return False
+        source_id = str(folder["id"])
+        state.destination_folders[source_id] = str(candidates[0]["id"])
+        state.mark_completed("folders", source_id)
+        state.ambiguous_objects.get("folders", []).remove(source_id)
+        self._state_store.save(state)
+        return True
+
+    def _recover_ambiguous_playlist(
+        self, destination: TidalLibraryClient, state: TransferState, playlist: dict[str, Any]
+    ) -> bool:
+        source_id = str(playlist["id"])
+        parent = str(playlist.get("folder_id") or "root")
+        parent = state.destination_folders.get(parent, parent)
+        candidates = destination.creation_candidates("playlists", str(playlist.get("name", "")), parent, str(playlist.get("description", "")))
+        if len(candidates) != 1:
+            self._logger.error("event=playlist_creation_conflict source_id=%s candidates=%d", source_id, len(candidates))
+            return False
+        state.destination_playlists[source_id] = str(candidates[0]["id"])
+        state.ambiguous_objects.get("playlists", []).remove(source_id)
+        state.item_statuses[f"playlists:{source_id}"] = "pending"
+        self._state_store.save(state)
+        return True
 
     def _transfer_playlist_items(
         self,
@@ -279,7 +328,7 @@ class TransferService:
             state.current_position if state.current_playlist == source_playlist_id else 0
         )
         position = self._reconcile_playlist_position(
-            destination, destination_playlist_id, items, saved_position
+            destination, destination_playlist_id, source_playlist_id, items, saved_position, state
         )
         state.current_playlist = source_playlist_id
         state.current_position = position
@@ -324,20 +373,43 @@ class TransferService:
     def _reconcile_playlist_position(
         destination: TidalLibraryClient,
         destination_playlist_id: str,
+        source_playlist_id: str,
         expected_items: list[dict[str, str]],
         saved_position: int,
+        state: TransferState | None = None,
     ) -> int:
-        """Reconcile a crash between remote item creation and local checkpointing."""
+        """Reconcile remote indices to source positions, including skipped media."""
 
         actual_items = destination.playlist_media_order(destination_playlist_id)
-        actual_count = len(actual_items)
-        if actual_count > len(expected_items):
+        remote_position = 0
+        source_position = 0
+        terminal = {"unsupported", "unavailable", "failed_permanent"}
+        while source_position < len(expected_items):
+            report_id = f"{source_playlist_id}:{source_position}"
+            status = state.status_of("playlist_items", report_id) if state else None
+            if status in terminal:
+                source_position += 1
+                continue
+            if remote_position == len(actual_items):
+                # Advance over any terminal source positions after the last
+                # remote item; the returned value is always a source index.
+                while source_position < len(expected_items):
+                    next_status = state.status_of("playlist_items", f"{source_playlist_id}:{source_position}") if state else None
+                    if next_status not in terminal:
+                        break
+                    source_position += 1
+                return source_position
+            if actual_items[remote_position] != expected_items[source_position]:
+                raise TidalClientError("playlist_resume_mismatch")
+            # A remote item proves completion even if the last local checkpoint
+            # was lost after the mutation response.
+            if state and status != "completed":
+                state.mark_completed("playlist_items", report_id)
+            remote_position += 1
+            source_position += 1
+        if remote_position != len(actual_items):
             raise TidalClientError("playlist_resume_destination_longer")
-        if actual_items != expected_items[:actual_count]:
-            raise TidalClientError("playlist_resume_mismatch")
-        # The server is authoritative.  A checkpoint ahead of the server is a
-        # crash window, not permission to skip the missing item.
-        return actual_count
+        return source_position
 
     def _record_failure(
         self,

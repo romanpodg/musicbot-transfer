@@ -90,10 +90,14 @@ class BackupService:
             if version == BACKUP_VERSION:
                 if value.get("status") not in {"complete", "incomplete"}:
                     raise BackupFormatError("backup_completion_invalid")
+                if value.get("status") == "complete" and snapshot.incomplete_sections:
+                    raise BackupFormatError("backup_completion_inconsistent")
                 if value.get("checksum_sha256") != _checksum(library):
                     raise BackupFormatError("backup_checksum_invalid")
                 if value.get("source_account_id") != snapshot.account.account_id:
                     raise BackupFormatError("backup_account_mismatch")
+                if value.get("counts") != snapshot.counts():
+                    raise BackupFormatError("backup_counts_mismatch")
             self._logger.info("event=backup_loaded path=%s", path.name)
             return snapshot
         except (OSError, ValueError, TypeError) as error:

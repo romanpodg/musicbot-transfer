@@ -46,10 +46,30 @@ class VerificationService:
         if state is not None:
             verification["playlists"] = _verify_playlists(source, destination_snapshot, state)
             verification["folders"] = _verify_folders(source, destination_snapshot, state)
+        outcome = _outcome(verification, report)
+        verification["outcome"] = outcome
+        report.verification_outcome = outcome
         payload["verification"] = verification
         atomic_write_json(self.report_path, payload)
         self._logger.info("event=verification_completed path=%s", self.report_path.name)
         return report
+
+
+def _outcome(verification: dict[str, object], report: TransferReport) -> str:
+    """Classify verification so state removal cannot ignore a mismatch."""
+
+    if verification["source_incomplete_sections"] or verification["destination_incomplete_sections"]:
+        return "inconclusive"
+    favorites = verification["favorites"]
+    if any(values["missing"] for values in favorites.values()):
+        return "failed"
+    playlists = verification.get("playlists", {})
+    folders = verification.get("folders", {})
+    if playlists.get("mismatched", 0) or folders.get("mismatched", 0):
+        return "failed"
+    if report.unsupported_items or report.unavailable_items or report.permanent_failure_items:
+        return "completed_with_expected_limitations"
+    return "clean"
 
 
 def _verify_favorites(
@@ -89,12 +109,13 @@ def _verify_playlists(
         destination_id = state.destination_playlists.get(source_id)
         if not destination_id:
             continue
-        expected = _item_order(playlist)
+        source_items = _item_order(playlist)
+        expected, limitations = _expected_remote_order(source_id, source_items, state)
         actual_playlist = destination_by_id.get(destination_id)
         actual = _item_order(actual_playlist or {})
         if actual_playlist is None:
             mismatched += 1
-            details.append({"source_id": source_id, "destination_id": destination_id, "reason": "missing_playlist"})
+            details.append({"source_id": source_id, "destination_id": destination_id, "reason": "missing_playlist", "source_items": len(source_items), "transferable_items": len(expected), **limitations})
         elif actual == expected:
             verified += 1
             item_verified += len(expected)
@@ -103,7 +124,7 @@ def _verify_playlists(
             item_missing += max(0, len(expected) - len(actual))
             if len(actual) == len(expected):
                 order_mismatches += 1
-            details.append({"source_id": source_id, "destination_id": destination_id, "reason": "sequence_mismatch", "expected_count": len(expected), "actual_count": len(actual)})
+            details.append({"source_id": source_id, "destination_id": destination_id, "reason": "sequence_mismatch", "source_items": len(source_items), "transferable_items": len(expected), "expected_count": len(expected), "actual_count": len(actual), **limitations})
     return {"verified": verified, "mismatched": mismatched, "items_verified": item_verified, "items_missing": item_missing, "order_mismatches": order_mismatches, "details": details}
 
 
@@ -130,3 +151,23 @@ def _item_order(playlist: dict[str, object]) -> list[tuple[str, str]]:
     if not isinstance(raw, list):
         return []
     return [(str(item.get("kind", "track")), str(item.get("id", ""))) for item in raw if isinstance(item, dict)]
+
+
+def _expected_remote_order(
+    source_id: str, source_items: list[tuple[str, str]], state: TransferState
+) -> tuple[list[tuple[str, str]], dict[str, int]]:
+    """Exclude only positions actually recorded as terminal limitations."""
+
+    expected: list[tuple[str, str]] = []
+    limitations = {"unsupported": 0, "unavailable": 0, "permanent_failures": 0}
+    for position, item in enumerate(source_items):
+        status = state.status_of("playlist_items", f"{source_id}:{position}")
+        if status == "unsupported":
+            limitations["unsupported"] += 1
+        elif status == "unavailable":
+            limitations["unavailable"] += 1
+        elif status == "failed_permanent":
+            limitations["permanent_failures"] += 1
+        else:
+            expected.append(item)
+    return expected, limitations

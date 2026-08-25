@@ -181,9 +181,15 @@ class TidalManagerApplication:
         destination = self._authenticate(AccountRole.DESTINATION)
         if destination is None:
             return
-        if source.profile().account_id == destination.profile().account_id:
+        if (
+            state.operation == "transfer"
+            and state.source_snapshot.account.account_id == destination.profile().account_id
+        ):
             self._console.message("transfer.same_account", style="error")
-            self._logger.warning("event=transfer_blocked_same_account account_id=%s", source.profile().account_id)
+            self._logger.warning(
+                "event=transfer_resume_blocked_same_account account_id=%s",
+                state.source_snapshot.account.account_id,
+            )
             return
         account = self._account_name(destination)
         action = self._i18n.t(
@@ -287,14 +293,18 @@ class TidalManagerApplication:
         source = self._authenticate(AccountRole.SOURCE)
         if source is None:
             return
+        destination = self._authenticate(AccountRole.DESTINATION)
+        if destination is None:
+            return
+        if source.profile().account_id == destination.profile().account_id:
+            self._console.message("transfer.same_account", style="error")
+            self._logger.warning("event=transfer_blocked_same_account account_id=%s", source.profile().account_id)
+            return
         source_snapshot = self._export_snapshot(source)
         if source_snapshot is None:
             return
         if source_snapshot.incomplete_sections:
             self._console.message("transfer.source_incomplete", style="warning")
-            return
-        destination = self._authenticate(AccountRole.DESTINATION)
-        if destination is None:
             return
         self._console.message("summary.source", style="heading")
         self._console.library_summary(self._account_name(source), source_snapshot.counts())
@@ -594,7 +604,10 @@ class TidalManagerApplication:
         )
         if report.has_warnings():
             self._console.message("transfer.partial", style="warning")
-        if not report.has_retryable_failures():
+        if (
+            not report.has_retryable_failures()
+            and report.verification_outcome in {"clean", "completed_with_expected_limitations"}
+        ):
             self._state_store.clear()
         if not report.has_warnings():
             self._console.message("transfer.completed", style="success")

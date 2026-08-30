@@ -539,8 +539,6 @@ def validate_plan_write_positions(items: list[TransferItem]) -> None:
         TransferConfigurationError: If any playlist container has invalid,
             duplicate, non-contiguous, or missing write positions for executable entries.
     """
-    migrate_legacy_write_positions(items)
-
     by_container: dict[str, list[TransferItem]] = {}
     for item in items:
         if item.entity_type is not EntityType.PLAYLIST_ITEM:

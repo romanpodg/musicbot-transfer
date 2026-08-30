@@ -38,6 +38,7 @@ from music_transfer.core.enums import (
 from music_transfer.core.errors import (
     TemporaryPlatformError,
     TransferConfigurationError,
+    UnsupportedCapabilityError,
 )
 from music_transfer.core.transfer import TransferVerifier
 from music_transfer.core.transfer.planner import (
@@ -839,6 +840,466 @@ class PlaylistRecoveryTests(unittest.TestCase):
         # Ensure destination was not touched
         self.assertEqual(len(destination.write_calls), 0)
 
+    # -------------------------------------------------------------------------
+    # Test 16: Later playlist item is not written when previous planned slot failed
+    # -------------------------------------------------------------------------
+    def test_later_playlist_item_is_not_written_when_previous_planned_slot_failed(self) -> None:
+        """Test 16: Later playlist item is not written when previous planned slot failed.
+
+        Plan:
+            A -> 0
+            B -> 1
+            C -> 2
+        Execution:
+            A succeeds
+            B fails
+            C reached -> predecessor missing -> C not written, len(actual) remains 1
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        tracks = [
+            track("A", identifier="a"),
+            track("B", identifier="b"),
+            track("C", identifier="c"),
+        ]
+        source = FakePlatformAdapter(
+            display_name="source", playlists=[playlist("Pl1", tracks)]
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        self.service.analyze(job, source, destination)
+
+        # Make B fail when attempting to write
+        orig_add = destination.add_playlist_item
+
+        def fail_on_b(playlist_id: str, track_id: str) -> None:
+            if track_id == "b":
+                destination._record("add_playlist_item", playlist_id, track_id)
+                raise TemporaryPlatformError("write_failed_for_b")
+            orig_add(playlist_id, track_id)
+
+        destination.add_playlist_item = fail_on_b  # type: ignore[method-assign]
+
+        self.service.execute(job, destination, confirmed=True)
+
+        # Destination must only contain A
+        self.assertEqual(destination.playlist_item_ids("dst-pl1"), ["a"])
+
+        items = self.service.items.list_for_job(job.id)
+        item_a = next(it for it in items if it.source_id == "a")
+        item_b = next(it for it in items if it.source_id == "b")
+        item_c = next(it for it in items if it.source_id == "c")
+
+        self.assertEqual(item_a.status, ItemStatus.TRANSFERRED)
+        self.assertEqual(item_a.write_position, 0)
+
+        self.assertEqual(item_b.status, ItemStatus.FAILED)
+        self.assertEqual(item_b.write_position, 1)
+
+        # C must not be executed or appended
+        self.assertEqual(item_c.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(item_c.write_position, 2)
+        self.assertIn(item_c.last_error, ("playlist_predecessor_missing", "playlist_sequence_blocked"))
+
+        # Explicitly verify add_playlist_item mutation calls: A was called, B was called (and failed), C was never called
+        mutation_calls = [args for name, args in destination.write_calls if name == "add_playlist_item"]
+        self.assertIn(("dst-pl1", "a"), mutation_calls)
+        self.assertIn(("dst-pl1", "b"), mutation_calls)
+        self.assertNotIn(("dst-pl1", "c"), mutation_calls)
+
+    # -------------------------------------------------------------------------
+    # Test 17: Timeout with equal length but invalid prefix is not confirmed absent
+    # -------------------------------------------------------------------------
+    def test_timeout_equal_length_with_invalid_prefix_is_not_confirmed_absent(self) -> None:
+        """Test 17: Timeout with equal length but invalid prefix is not confirmed absent.
+
+        Expected: [A, B]
+        B.write_position = 1
+        Timeout occurs during B's write.
+        Actual: [X] (len is 1, matching B's write_position, but actual != expected[:1]).
+        Must NOT be classified as confirmed absent or retried.
+        Must become AMBIGUOUS with playlist_resume_mismatch.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        tracks = [track("A", identifier="a"), track("B", identifier="b")]
+        source = FakePlatformAdapter(
+            display_name="source", playlists=[playlist("Pl1", tracks)]
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        self.service.analyze(job, source, destination)
+
+        # Container and item A are transferred
+        items = self.service.items.list_for_job(job.id)
+        container_item = next(it for it in items if it.entity_type is EntityType.PLAYLIST)
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+        self.service.items.update(container_item)
+
+        item_a = next(it for it in items if it.source_id == "a")
+        item_a.status = ItemStatus.TRANSFERRED
+        item_a.destination_id = "a"
+        item_a.container_destination_id = "dst-pl1"
+        item_a.write_position = 0
+        self.service.items.update(item_a)
+
+        item_b = next(it for it in items if it.source_id == "b")
+        item_b.status = ItemStatus.MATCHED
+        item_b.destination_id = "b"
+        item_b.container_destination_id = "dst-pl1"
+        item_b.write_position = 1
+        self.service.items.update(item_b)
+
+        # Destination starts with [a]
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[PlaylistItem(position=1, track=track("A", identifier="a"))],
+            )
+        )
+
+        b_attempts = 0
+
+        def timeout_on_b(playlist_id: str, track_id: str) -> None:
+            nonlocal b_attempts
+            b_attempts += 1
+            # Corrupt destination to [x] to simulate diverged remote state upon timeout
+            for p in destination.playlists:
+                if p.source_id == playlist_id:
+                    p.tracks = [PlaylistItem(position=1, track=track("X", identifier="x"))]
+            raise TemporaryPlatformError("network_timeout_on_b")
+
+        destination.add_playlist_item = timeout_on_b  # type: ignore[method-assign]
+
+        self.service.execute(job, destination, confirmed=True)
+
+        item_b_reloaded = next(it for it in self.service.items.list_for_job(job.id) if it.source_id == "b")
+        self.assertEqual(item_b_reloaded.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(item_b_reloaded.last_error, "playlist_resume_mismatch")
+        self.assertEqual(item_b_reloaded.last_failure_kind, "ambiguous")
+        # Ensure B was attempted at most once (never retried blindly)
+        self.assertEqual(b_attempts, 1)
+        # Destination unchanged
+        self.assertEqual(destination.playlist_item_ids("dst-pl1"), ["x"])
+
+    # -------------------------------------------------------------------------
+    # Test 18: Unverifiable playlist commit is not retried blindly
+    # -------------------------------------------------------------------------
+    def test_unverifiable_playlist_commit_is_not_retried_blindly(self) -> None:
+        """Test 18: Unverifiable playlist commit is not retried blindly.
+
+        Destination raises UnsupportedCapabilityError on playlist_item_ids.
+        When add_playlist_item raises TemporaryPlatformError or AmbiguousOperationError,
+        executor must NOT blindly retry, but mark item as AMBIGUOUS with
+        playlist_commit_unverifiable and stop. Total attempts must remain 1.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        tracks = [track("A", identifier="a")]
+        source = FakePlatformAdapter(
+            display_name="source", playlists=[playlist("Pl1", tracks)]
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        self.service.analyze(job, source, destination)
+
+        mutation_calls = 0
+
+        def timeout_mutation(playlist_id: str, track_id: str) -> None:
+            nonlocal mutation_calls
+            mutation_calls += 1
+            raise TemporaryPlatformError("timeout_after_possible_commit")
+
+        def no_inspection(playlist_id: str) -> list[str]:
+            raise UnsupportedCapabilityError("playlist_inspection_not_supported")
+
+        destination.add_playlist_item = timeout_mutation  # type: ignore[method-assign]
+        destination.playlist_item_ids = no_inspection  # type: ignore[method-assign]
+
+        self.service.execute(job, destination, confirmed=True)
+
+        items = self.service.items.list_for_job(job.id)
+        item_a = next(it for it in items if it.source_id == "a")
+
+        self.assertEqual(item_a.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(item_a.last_error, "playlist_commit_unverifiable")
+        self.assertEqual(item_a.last_failure_kind, "ambiguous")
+        # Must have been attempted exactly once
+        self.assertEqual(mutation_calls, 1)
+
+    # -------------------------------------------------------------------------
+    # Test 19: Playlist retry job requires replanning before execution
+    # -------------------------------------------------------------------------
+    def test_playlist_retry_job_requires_replanning_before_execution(self) -> None:
+        """Test 19: Playlist retry job requires replanning before execution.
+
+        Original:
+            A=0 -> transferred
+            B=1 -> failed
+            C=2 -> failed
+        Retry job clones B and C with write_position=None.
+        Executing retry job directly without re-planning must fail before destination mutation.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        tracks = [
+            track("A", identifier="a"),
+            track("B", identifier="b"),
+            track("C", identifier="c"),
+        ]
+        source = FakePlatformAdapter(
+            display_name="source", playlists=[playlist("Pl1", tracks)]
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        self.service.analyze(job, source, destination)
+
+        # Simulate execution where A succeeded, B and C failed
+        items = self.service.items.list_for_job(job.id)
+        container_item = next(it for it in items if it.entity_type is EntityType.PLAYLIST)
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+        self.service.items.update(container_item)
+
+        item_a = next(it for it in items if it.source_id == "a")
+        item_a.status = ItemStatus.TRANSFERRED
+        self.service.items.update(item_a)
+
+        item_b = next(it for it in items if it.source_id == "b")
+        item_b.status = ItemStatus.FAILED
+        self.service.items.update(item_b)
+
+        item_c = next(it for it in items if it.source_id == "c")
+        item_c.status = ItemStatus.FAILED
+        self.service.items.update(item_c)
+
+        job.status = JobStatus.FAILED
+        self.service.jobs.update(job)
+
+        # Create retry job
+        retry_job = self.service.create_retry_job(job)
+        assert retry_job is not None
+        retry_items = self.service.items.list_for_job(retry_job.id)
+        self.assertEqual(len(retry_items), 2)
+        # Verify write_position was cleared for cloned playlist items
+        for r_item in retry_items:
+            self.assertIsNone(r_item.write_position)
+
+        # Executing retry job directly without re-planning must fail validation
+        retry_job.status = JobStatus.WAITING_CONFIRMATION
+        self.service.jobs.update(retry_job)
+        retry_destination = FakePlatformAdapter(display_name="retry_dest")
+        with self.assertRaises(TransferConfigurationError) as ctx:
+            self.service.execute(retry_job, retry_destination, confirmed=True)
+
+        self.assertIn("missing_write_position", str(ctx.exception))
+        # Zero writes attempted on destination
+        self.assertEqual(len(retry_destination.write_calls), 0)
+
+    # -------------------------------------------------------------------------
+    # Test 20: Retry cloning does not silently renumber playlist positions
+    # -------------------------------------------------------------------------
+    def test_retry_cloning_does_not_silently_renumber_playlist_positions(self) -> None:
+        """Test 20: Retry cloning does not silently renumber playlist positions.
+
+        Ensures create_retry_job preserves original_position, does not invent
+        renumbered write positions [0, 1] for [B(original=1), C(original=2)],
+        and sets write_position to None.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        tracks = [
+            track("A", identifier="a"),
+            track("B", identifier="b"),
+            track("C", identifier="c"),
+        ]
+        source = FakePlatformAdapter(
+            display_name="source", playlists=[playlist("Pl1", tracks)]
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        self.service.analyze(job, source, destination)
+
+        items = self.service.items.list_for_job(job.id)
+        item_b = next(it for it in items if it.source_id == "b")
+        item_b.status = ItemStatus.FAILED
+        self.service.items.update(item_b)
+
+        item_c = next(it for it in items if it.source_id == "c")
+        item_c.status = ItemStatus.FAILED
+        self.service.items.update(item_c)
+
+        job.status = JobStatus.FAILED
+        self.service.jobs.update(job)
+
+        retry_job = self.service.create_retry_job(job)
+        assert retry_job is not None
+        retry_items = self.service.items.list_for_job(retry_job.id)
+
+        retry_b = next(it for it in retry_items if it.source_id == "b")
+        retry_c = next(it for it in retry_items if it.source_id == "c")
+
+        # original_position preserved
+        self.assertEqual(retry_b.original_position, 1)
+        self.assertEqual(retry_c.original_position, 2)
+
+        # write_position not silently renumbered to 0 and 1
+        self.assertIsNone(retry_b.write_position)
+        self.assertIsNone(retry_c.write_position)
+
+    # -------------------------------------------------------------------------
+    # Test 21: Playlist sequence failure blocks later items in same playlist
+    # -------------------------------------------------------------------------
+    def test_playlist_sequence_failure_blocks_later_items_in_same_playlist(self) -> None:
+        """Test 21: Playlist sequence failure blocks later items in same playlist.
+
+        When an item in a playlist encounters a failure, subsequent items in the
+        same playlist are blocked from execution (zero write calls) and marked
+        AMBIGUOUS with playlist_sequence_blocked.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        tracks = [
+            track("A", identifier="a"),
+            track("B", identifier="b"),
+            track("C", identifier="c"),
+            track("D", identifier="d"),
+        ]
+        source = FakePlatformAdapter(
+            display_name="source", playlists=[playlist("Pl1", tracks)]
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        self.service.analyze(job, source, destination)
+
+        orig_add = destination.add_playlist_item
+
+        def fail_on_b(playlist_id: str, track_id: str) -> None:
+            if track_id == "b":
+                destination._record("add_playlist_item", playlist_id, track_id)
+                raise TemporaryPlatformError("failed_b")
+            orig_add(playlist_id, track_id)
+
+        destination.add_playlist_item = fail_on_b  # type: ignore[method-assign]
+
+        self.service.execute(job, destination, confirmed=True)
+
+        items = self.service.items.list_for_job(job.id)
+        item_a = next(it for it in items if it.source_id == "a")
+        item_b = next(it for it in items if it.source_id == "b")
+        item_c = next(it for it in items if it.source_id == "c")
+        item_d = next(it for it in items if it.source_id == "d")
+
+        self.assertEqual(item_a.status, ItemStatus.TRANSFERRED)
+        self.assertEqual(item_b.status, ItemStatus.FAILED)
+        self.assertEqual(item_c.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(item_c.last_error, "playlist_sequence_blocked")
+        self.assertEqual(item_d.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(item_d.last_error, "playlist_sequence_blocked")
+
+        # Only A was written
+        self.assertEqual(destination.playlist_item_ids("dst-pl1"), ["a"])
+        # add_playlist_item called only for A and B
+        add_calls = [args[1] for name, args in destination.write_calls if name == "add_playlist_item"]
+        self.assertEqual(add_calls, ["a", "b"])
+
+    # -------------------------------------------------------------------------
+    # Test 22: Playlist sequence failure does not block unrelated playlist
+    # -------------------------------------------------------------------------
+    def test_playlist_sequence_failure_does_not_block_unrelated_playlist(self) -> None:
+        """Test 22: Playlist sequence failure does not block unrelated playlist.
+
+        Failure in Playlist 1 blocks later items in Playlist 1, but items in
+        Playlist 2 continue executing and succeed.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        pl1_tracks = [track("A1", identifier="a1"), track("A2", identifier="a2")]
+        pl2_tracks = [track("B1", identifier="b1"), track("B2", identifier="b2")]
+
+        source = FakePlatformAdapter(
+            display_name="source",
+            playlists=[playlist("Pl1", pl1_tracks), playlist("Pl2", pl2_tracks)],
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        self.service.analyze(job, source, destination)
+
+        orig_add = destination.add_playlist_item
+
+        def fail_on_a1(playlist_id: str, track_id: str) -> None:
+            if track_id == "a1":
+                raise TemporaryPlatformError("failed_a1")
+            orig_add(playlist_id, track_id)
+
+        destination.add_playlist_item = fail_on_a1  # type: ignore[method-assign]
+
+        self.service.execute(job, destination, confirmed=True)
+
+        items = self.service.items.list_for_job(job.id)
+        item_a1 = next(it for it in items if it.source_id == "a1")
+        item_a2 = next(it for it in items if it.source_id == "a2")
+        item_b1 = next(it for it in items if it.source_id == "b1")
+        item_b2 = next(it for it in items if it.source_id == "b2")
+
+        # Pl1 was blocked after A1 failed
+        self.assertEqual(item_a1.status, ItemStatus.FAILED)
+        self.assertEqual(item_a2.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(item_a2.last_error, "playlist_sequence_blocked")
+        self.assertEqual(destination.playlist_item_ids("dst-pl1"), [])
+
+        # Pl2 succeeded completely
+        self.assertEqual(item_b1.status, ItemStatus.TRANSFERRED)
+        self.assertEqual(item_b2.status, ItemStatus.TRANSFERRED)
+        self.assertEqual(destination.playlist_item_ids("dst-pl2"), ["b1", "b2"])
+
+    # -------------------------------------------------------------------------
+    # Test 23: Runtime failed items retain original write position
+    # -------------------------------------------------------------------------
+    def test_runtime_failed_items_retain_original_write_position(self) -> None:
+        """Test 23: Runtime failed items retain original write position.
+
+        Once assigned during planning, write_position is not cleared or mutated
+        when an item transitions from MATCHED to FAILED or AMBIGUOUS.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        tracks = [track("A", identifier="a"), track("B", identifier="b")]
+        source = FakePlatformAdapter(
+            display_name="source", playlists=[playlist("Pl1", tracks)]
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        self.service.analyze(job, source, destination)
+
+        items = self.service.items.list_for_job(job.id)
+        item_a = next(it for it in items if it.source_id == "a")
+        item_b = next(it for it in items if it.source_id == "b")
+
+        self.assertEqual(item_a.write_position, 0)
+        self.assertEqual(item_b.write_position, 1)
+
+        def fail_all(playlist_id: str, track_id: str) -> None:
+            raise TemporaryPlatformError("write_error")
+
+        destination.add_playlist_item = fail_all  # type: ignore[method-assign]
+
+        self.service.execute(job, destination, confirmed=True)
+
+        items_after = self.service.items.list_for_job(job.id)
+        item_a_after = next(it for it in items_after if it.source_id == "a")
+        item_b_after = next(it for it in items_after if it.source_id == "b")
+
+        self.assertEqual(item_a_after.status, ItemStatus.FAILED)
+        self.assertEqual(item_a_after.write_position, 0)
+
+        self.assertEqual(item_b_after.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(item_b_after.write_position, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+

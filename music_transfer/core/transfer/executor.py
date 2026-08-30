@@ -198,6 +198,7 @@ class TransferExecutor:
         outcome = ExecutionResult()
         ordered = self._write_order(job, plan_items)
         total = len(ordered)
+        blocked_containers: set[str] = set()
         for _, item in enumerate(ordered, start=1):
             if self._cancellation.is_cancelled or job.cancellation_requested:
                 outcome.cancelled = True
@@ -222,6 +223,24 @@ class TransferExecutor:
                 outcome.processed += 1
                 self._emit(progress, job, "importing", total, outcome, item)
                 continue
+
+            c_keys = self._item_container_keys(item)
+            if c_keys and any(k in blocked_containers for k in c_keys):
+                self._logger.warning(
+                    "event=playlist_sequence_blocked job_id=%s playlist_id=%s item_id=%s write_position=%s recovery_decision=playlist_blocked",
+                    job.id,
+                    c_keys[0],
+                    item.id,
+                    item.write_position,
+                )
+                item.last_failure_kind = "ambiguous"
+                item.mark(ItemStatus.AMBIGUOUS, error="playlist_sequence_blocked")
+                self._items.update(item)
+                outcome.failed += 1
+                outcome.processed += 1
+                self._emit(progress, job, "importing", total, outcome, item)
+                continue
+
             try:
                 self._execute_item(job, item, ordered)
             except (AuthenticationError, AuthorizationError) as error:
@@ -241,6 +260,11 @@ class TransferExecutor:
                     outcome.abort_reason,
                 )
                 break
+
+            if c_keys and item.status in (ItemStatus.FAILED, ItemStatus.AMBIGUOUS):
+                for k in c_keys:
+                    blocked_containers.add(k)
+
             outcome.processed += 1
             if item.status is ItemStatus.TRANSFERRED:
                 outcome.succeeded += 1
@@ -400,29 +424,52 @@ class TransferExecutor:
             try:
                 actual = list(self._destination.playlist_item_ids(container_id))
             except UnsupportedCapabilityError:
-                raise error from None
-            except Exception:
-                # If checking destination state also errors, mark ambiguous and raise AmbiguousOperationError
-                item.mark(ItemStatus.AMBIGUOUS, error="playlist_state_inconclusive")
-                raise AmbiguousOperationError("playlist_state_inconclusive") from error
-
-            if (
-                item.write_position is not None
-                and len(actual) > item.write_position
-                and actual[item.write_position] == item.destination_id
-            ):
-                # The mutation actually committed remotely despite timeout/error!
-                item.mark(ItemStatus.TRANSFERRED)
+                item.last_failure_kind = "ambiguous"
+                item.mark(ItemStatus.AMBIGUOUS, error="playlist_commit_unverifiable")
                 self._items.update(item)
-                return
-            elif item.write_position is not None and len(actual) == item.write_position:
-                # Confirmed absence: remote state did not receive the item.
-                # Re-raise the original error so standard retry/failure policies handle it.
-                raise error
-            else:
-                # Inconclusive or diverged: fail safely without blind duplicates.
+                raise AmbiguousOperationError("playlist_commit_unverifiable") from error
+            except Exception as inspect_err:
+                # If checking destination state also errors, mark ambiguous and raise AmbiguousOperationError
+                item.last_failure_kind = "ambiguous"
                 item.mark(ItemStatus.AMBIGUOUS, error="playlist_state_inconclusive")
-                raise AmbiguousOperationError("playlist_state_inconclusive") from error
+                self._items.update(item)
+                raise AmbiguousOperationError("playlist_state_inconclusive") from inspect_err
+
+            expected = [
+                entry.destination_id
+                for entry in self._siblings(all_items, item.container_source_id)
+                if entry.write_position is not None and entry.destination_id
+            ]
+
+            if item.write_position is not None:
+                # Validate the prefix before accepting absence or presence
+                if actual[: item.write_position] != expected[: item.write_position]:
+                    item.last_failure_kind = "ambiguous"
+                    item.mark(ItemStatus.AMBIGUOUS, error="playlist_resume_mismatch")
+                    self._items.update(item)
+                    raise AmbiguousOperationError("playlist_resume_mismatch") from error
+
+                if (
+                    len(actual) > item.write_position
+                    and actual[item.write_position] == item.destination_id
+                ):
+                    # The mutation actually committed remotely despite timeout/error!
+                    item.mark(ItemStatus.TRANSFERRED)
+                    self._items.update(item)
+                    return
+                elif (
+                    len(actual) == item.write_position
+                    and actual == expected[: item.write_position]
+                ):
+                    # Confirmed absence: remote state did not receive the item.
+                    # Re-raise the original error so standard retry/failure policies handle it.
+                    raise error
+
+            # Inconclusive or diverged: fail safely without blind duplicates.
+            item.last_failure_kind = "ambiguous"
+            item.mark(ItemStatus.AMBIGUOUS, error="playlist_state_inconclusive")
+            self._items.update(item)
+            raise AmbiguousOperationError("playlist_state_inconclusive") from error
 
     # -- resume helpers ----------------------------------------------------
 
@@ -444,15 +491,33 @@ class TransferExecutor:
         except UnsupportedCapabilityError:
             return
         except Exception as error:
+            item.last_failure_kind = "ambiguous"
             item.mark(ItemStatus.AMBIGUOUS, error="playlist_state_inconclusive")
+            self._items.update(item)
             raise AmbiguousOperationError("playlist_state_inconclusive") from error
+
         expected = [
             entry.destination_id
             for entry in self._siblings(all_items, item.container_source_id)
             if entry.write_position is not None and entry.destination_id
         ]
+
+        if len(actual) < item.write_position:
+            self._logger.warning(
+                "event=playlist_predecessor_missing item_id=%s write_position=%d actual_len=%d",
+                item.id,
+                item.write_position,
+                len(actual),
+            )
+            item.last_failure_kind = "ambiguous"
+            item.mark(ItemStatus.AMBIGUOUS, error="playlist_predecessor_missing")
+            self._items.update(item)
+            raise AmbiguousOperationError("playlist_predecessor_missing")
+
         if len(actual) > len(expected) or actual != expected[: len(actual)]:
+            item.last_failure_kind = "ambiguous"
             item.mark(ItemStatus.AMBIGUOUS, error="playlist_resume_mismatch")
+            self._items.update(item)
             raise AmbiguousOperationError("playlist_resume_mismatch")
         if len(actual) > item.write_position and actual[item.write_position] == item.destination_id:
             # The write landed before the checkpoint was saved.
@@ -504,6 +569,21 @@ class TransferExecutor:
             ):
                 return entry.destination_id
         return None
+
+    @staticmethod
+    def _item_container_keys(item: TransferItem) -> list[str]:
+        """Return container identification keys for playlist items."""
+        if (
+            item.entity_type is not EntityType.PLAYLIST_ITEM
+            and item.operation is not TransferOperation.ADD_PLAYLIST_ITEM
+        ):
+            return []
+        keys: list[str] = []
+        if item.container_source_id:
+            keys.append(f"src:{item.container_source_id}")
+        if item.container_destination_id:
+            keys.append(f"dst:{item.container_destination_id}")
+        return keys
 
     # -- bookkeeping -------------------------------------------------------
 

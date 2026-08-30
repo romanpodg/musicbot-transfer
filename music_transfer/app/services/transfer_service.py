@@ -26,7 +26,14 @@ from ...core.domain import (
     TransferReport,
     TransferSettings,
 )
-from ...core.enums import ContentType, ItemStatus, JobStatus, Platform
+from ...core.enums import (
+    ContentType,
+    EntityType,
+    ItemStatus,
+    JobStatus,
+    Platform,
+    TransferOperation,
+)
 from ...core.errors import ConfirmationRequired, TransferConfigurationError
 from ...core.matching import MatchingPolicy, TrackMatcher
 from ...core.ports import MusicPlatformAdapter, TransferItemRepository, TransferJobRepository
@@ -371,7 +378,12 @@ class TransferService:
                 operation=item.operation,
             )
             clone.destination_id = item.destination_id
-            clone.write_position = item.write_position
+            # Playlist items cannot execute stale write positions without explicit re-planning.
+            # Clear write_position so the retry job requires re-planning before execution.
+            if item.entity_type is EntityType.PLAYLIST_ITEM or item.operation is TransferOperation.ADD_PLAYLIST_ITEM:
+                clone.write_position = None
+            else:
+                clone.write_position = item.write_position
             clone.match_method = item.match_method
             clone.match_score = item.match_score
             clone.container_destination_id = item.container_destination_id

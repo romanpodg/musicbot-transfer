@@ -1,0 +1,370 @@
+{
+  "language_name": "Русский",
+  "language": {
+    "choose": "🌐 Выберите язык / Choose language"
+  },
+  "app": {
+    "banner": "╔══════════════════════════╗\n║ 🎵 TIDAL Library Manager ║\n╚══════════════════════════╝",
+    "goodbye": "👋 До свидания!",
+    "interrupted": "⏸ Операция прервана. Состояние передачи сохранено для продолжения.",
+    "unexpected_error": "⚠️ Операцию не удалось безопасно завершить. Проверьте локальный журнал с очищенной записью ошибки.",
+    "dry_run_enabled": "🧪 РЕЖИМ ПРОВЕРКИ",
+    "dry_run_mutation_blocked": "🧪 Режим проверки активен. Изменения в библиотеку TIDAL не внесены.",
+    "invalid_arguments": "⚠️ Неподдерживаемый параметр. Используйте --dry-run или --diagnostics."
+  },
+  "menu": {
+    "choose": "Выберите действие:",
+    "transfer": "1️⃣ Перенести библиотеку",
+    "backup": "2️⃣ Создать резервную копию",
+    "restore": "3️⃣ Восстановить из копии",
+    "cleanup": "4️⃣ Очистить библиотеку",
+    "account": "5️⃣ Информация об аккаунте",
+    "settings": "6️⃣ Настройки",
+    "exit": "0️⃣ Выход",
+    "settings_choose": "⚙️ Настройки",
+    "language": "1️⃣ Изменить язык",
+    "disconnect_source": "2️⃣ Забыть сессию исходного аккаунта",
+    "disconnect_destination": "3️⃣ Забыть сессию целевого аккаунта",
+    "back": "0️⃣ Назад"
+  },
+  "summary": {
+    "account": "👤 Аккаунт: {account}",
+    "library": "📚 Библиотека:",
+    "count_line": "{label}: {count}",
+    "source": "ИСХОДНЫЙ АККАУНТ",
+    "destination": "ЦЕЛЕВОЙ АККАУНТ"
+  },
+  "category": {
+    "tracks": "🎵 Треки",
+    "albums": "💿 Альбомы",
+    "artists": "👥 Исполнители",
+    "videos": "🎬 Видео",
+    "mixes": "📻 Миксы и радио",
+    "folders": "📁 Папки плейлистов",
+    "playlists": "🎧 Плейлисты",
+    "playlist_items": "🎼 Элементы плейлиста"
+  },
+  "prompt": {
+    "answer": "➜ ",
+    "yes_no": "[Д/Н] ➜ ",
+    "option_line": "{number} {label}",
+    "invalid_choice": "⚠️ Выберите один из указанных вариантов.",
+    "invalid_yes_no": "⚠️ Ответьте да или нет.",
+    "sort_choose": "↕️ Выберите порядок переноса:",
+    "backup_choose": "🗂 Выберите копию для восстановления:",
+    "cleanup_choose": "🗑 Очистка библиотеки"
+  },
+  "input": {
+    "yes": "д,да,y,yes",
+    "no": "н,нет,n,no"
+  },
+  "sort": {
+    "newest": "1️⃣ По дате добавления — сначала новые",
+    "oldest": "2️⃣ По дате добавления — сначала старые",
+    "alphabetical": "3️⃣ По алфавиту",
+    "artist": "4️⃣ По исполнителю",
+    "album": "5️⃣ По альбому",
+    "original": "6️⃣ Исходный порядок TIDAL"
+  },
+  "auth": {
+    "open_url": "🔐 Откройте эту ссылку авторизации TIDAL в браузере, подтвердите доступ и вернитесь сюда:\n{url}",
+    "session_not_saved": "ℹ️ OAuth-сессия не будет сохранена, так как безопасное системное хранилище недоступно."
+  },
+  "confirmation": {
+    "warning_title": "⚠️ ПРЕДУПРЕЖДЕНИЕ",
+    "danger_title": "🚨 ОПАСНО",
+    "account": "Аккаунт: {account}",
+    "action": "Действие: {action}",
+    "mutates_account": "Это изменит вашу библиотеку TIDAL.",
+    "continue": "Продолжить?",
+    "deleting": "Будут удалены: {summary}",
+    "irreversible": "Это действие нельзя отменить.",
+    "type_phrase": "Введите {phrase}, чтобы продолжить.",
+    "delete_phrase": "DELETE",
+    "transfer_action": "Перенести {count} треков и связанные объекты библиотеки",
+    "restore_action": "Восстановить {count} треков и связанные объекты библиотеки",
+    "resume_action": "Продолжить предыдущую передачу с {count} исходными треками",
+    "resume_cleanup_action": "Продолжить очистку {count} выбранных объектов библиотеки"
+  },
+  "transfer": {
+    "start": "Начать перенос?",
+    "cancelled": "ℹ️ Перенос отменён. Данные TIDAL не изменены.",
+    "completed": "✅ Обработка переноса завершена.",
+    "partial": "⚠️ Перенос завершён с ошибками или недоступными объектами. Состояние сохранено.",
+    "report_written": "📄 Отчёт проверки сохранён: {path}",
+    "state_invalid": "⚠️ Сохранённое состояние переноса недопустимо, продолжение небезопасно.",
+    "resume_detected": "⏯ Обнаружена предыдущая операция: {operation}.",
+    "resume_question": "Продолжить её?",
+    "resume_declined": "ℹ️ Предыдущее состояние сохранено для продолжения позже.",
+    "source_incomplete": "⚠️ Перенос заблокирован: исходный снимок библиотеки неполный. Создайте полную копию или повторите чтение."
+  },
+  "backup": {
+    "creating": "💾 Создание резервной копии библиотеки…",
+    "completed": "✅ Копия сохранена: {path}",
+    "partial": "⚠️ Копия сохранена, но эти разделы неполны: {sections}",
+    "none": "ℹ️ Резервные копии не найдены.",
+    "invalid": "⚠️ Выбранную копию нельзя безопасно прочитать."
+  },
+  "restore": {
+    "summary": "Исходный аккаунт в копии: {account}",
+    "cancelled": "ℹ️ Восстановление отменено. Данные TIDAL не изменены."
+  },
+  "cleanup": {
+    "full": "1️⃣ Полная очистка библиотеки",
+    "tracks": "2️⃣ Только любимые треки",
+    "albums": "3️⃣ Только альбомы",
+    "artists": "4️⃣ Только исполнители",
+    "playlists": "5️⃣ Только плейлисты",
+    "videos": "6️⃣ Только видео",
+    "mixes": "7️⃣ Только миксы и радио",
+    "cancel": "0️⃣ Отмена",
+    "offer_backup": "Создать резервную копию перед удалением?",
+    "cancelled": "ℹ️ Очистка отменена. Данные TIDAL не изменены.",
+    "preparing": "🔎 Проверка текущих объектов библиотеки…",
+    "incomplete": "⚠️ Очистка заблокирована: выбранные объекты не удалось полностью прочитать.",
+    "completed": "✅ Очистка завершена: успешно {successful}, ошибок {failed}.",
+    "target_summary": "выбранных объектов библиотеки: {count}",
+    "deleting_started": "🗑 Удаление выбранных объектов библиотеки…",
+    "dry_run_would_delete": "Будут удалены:",
+    "dry_run_no_changes": "Изменения в библиотеку TIDAL не внесены.",
+    "resume_detected": "⚠️ Предыдущая очистка была прервана.",
+    "resume_progress": "Выполнено: {completed}/{total}",
+    "resume_question": "Продолжить очистку?",
+    "resume_declined": "ℹ️ Состояние очистки сохранено, её можно продолжить позже.",
+    "state_invalid": "⚠️ Сохранённая очередь очистки недопустима, безопасное продолжение невозможно.",
+    "verify_remaining": "🔎 Проверка завершена. Осталось выбранных объектов: {count}",
+    "verification_unavailable": "⚠️ Очистка завершена, но проверка не смогла безопасно прочитать все выбранные разделы."
+  },
+  "account": {
+    "unknown": "Неизвестный аккаунт",
+    "loading": "🔐 Подключение к TIDAL…",
+    "information": "👤 Информация об аккаунте",
+    "library_incomplete": "⚠️ Некоторые разделы библиотеки не удалось прочитать полностью: {sections}"
+  },
+  "settings": {
+    "language_saved": "✅ Настройка языка сохранена.",
+    "source_forgotten": "✅ Сессия исходного аккаунта удалена.",
+    "destination_forgotten": "✅ Сессия целевого аккаунта удалена."
+  },
+  "progress": {
+    "line": "{label}: [{bar}] {current}/{total}",
+    "scanning": "{label}: чтение… {current}",
+    "current": "Сейчас: {item}",
+    "errors": "Ошибок: {errors}",
+    "item_unit": "объект",
+    "not_available": "нет данных",
+    "postfix": "Сейчас: {item} | Ошибок: {errors}",
+    "description": "{operation} {label}",
+    "operation": {
+      "transfer": "Перенос",
+      "backup": "Копирование",
+      "cleanup": "Удаление",
+      "verification": "Проверка"
+    }
+  },
+  "retry": {
+    "attempt": "Попытка {attempt}/{total}",
+    "retrying": "⚠️ {reason}. Повтор через {seconds} сек…",
+    "reason": {
+      "api_timeout": "Тайм-аут соединения",
+      "network_error": "Сетевая ошибка",
+      "rate_limited": "Достигнут лимит запросов TIDAL",
+      "api_server_error": "Ошибка сервиса TIDAL",
+      "provider_error": "Ошибка запроса TIDAL",
+      "item_unavailable": "Объект недоступен"
+    }
+  },
+  "shutdown": {
+    "stopping": "⚠️ Безопасная остановка…",
+    "saving_state": "Сохранение состояния…",
+    "progress_saved": "Прогресс сохранён: {completed}/{total}",
+    "continue_later": "Вы сможете продолжить позже."
+  },
+  "diagnostics": {
+    "heading": "Проверка системы:",
+    "line": "{label}: {status}{detail}",
+    "label": {
+      "adapters": "Адаптеры",
+      "api": "API",
+      "backup": "Резервная копия",
+      "config": "Конфигурация",
+      "keyring": "Хранилище ключей",
+      "logs": "Журналы",
+      "python": "Python",
+      "state": "Состояние",
+      "tidalapi": "tidalapi"
+    },
+    "status": {
+      "ok": "OK",
+      "error": "ОШИБКА",
+      "found": "Найдена",
+      "missing": "Не найдена",
+      "available": "Доступен",
+      "unavailable": "Недоступен"
+    }
+  },
+  "operation": {
+    "transfer": "перенос",
+    "restore": "восстановление"
+  },
+  "errors": {
+    "account_id_missing": "⚠️ Внутренняя ошибка: у записи аккаунта нет идентификатора.",
+    "account_missing": "⚠️ Сервис не вернул аккаунт для этой сессии.",
+    "account_platform_id_missing": "⚠️ Внутренняя ошибка: у записи аккаунта нет идентификатора платформы.",
+    "album_source_id_missing": "⚠️ Внутренняя ошибка: у альбома нет идентификатора в источнике.",
+    "ambiguous_operation": "⚠️ Результат операции неизвестен. Она записана для сверки, а не повторяется вслепую.",
+    "artist_source_id_missing": "⚠️ Внутренняя ошибка: у исполнителя нет идентификатора в источнике.",
+    "authentication_failed": "⚠️ Ошибка авторизации. Ничего не изменено.",
+    "authorization_error": "⚠️ Сервис отказал в доступе к этому действию.",
+    "authorization_failed": "⚠️ У аккаунта нет прав на это действие.",
+    "capability_unknown": "⚠️ Внутренняя ошибка: неизвестная возможность {capability}.",
+    "capability_unsupported": "⚠️ Платформа не поддерживает запрошенную операцию ({capability}).",
+    "cleanup_confirmation_required": "⚠️ Удаление не выполнено, так как подтверждение не получено.",
+    "confirmation_required": "⚠️ Изменения не внесены, так как подтверждение не получено.",
+    "destination_identifier_missing": "⚠️ Объект не удалось сопоставить на целевом сервисе, поэтому он не записан.",
+    "favorite_category_unsupported": "⚠️ Этот раздел библиотеки не поддерживается сервисом.",
+    "favorites_unavailable": "⚠️ Сервис не смог вернуть этот список избранного.",
+    "folder_creation_failed": "⚠️ Не удалось создать папку.",
+    "invalid_state_transition": "⚠️ Недопустимая смена состояния задачи: {current} → {target}.",
+    "item_unavailable": "⚠️ Объект недоступен для этого аккаунта или региона.",
+    "job_already_finished": "⚠️ Эта задача уже завершена, продолжение невозможно.",
+    "job_not_ready_for_execution": "⚠️ Задача не готова к выполнению. Сначала постройте план.",
+    "not_found": "⚠️ Объект не найден на целевом сервисе.",
+    "oauth_login_failed": "⚠️ Вход не завершён. Подключите аккаунт заново.",
+    "oauth_url_missing": "⚠️ Сервис не вернул ссылку для входа. Повторите попытку.",
+    "operation_failed": "⚠️ Операцию не удалось безопасно завершить. Подробности смотрите в очищенном локальном журнале.",
+    "pagination_max_items_exceeded": "⚠️ Библиотека больше заданного лимита чтения.",
+    "pagination_max_pages_exceeded": "⚠️ Сервис продолжал возвращать страницы сверх заданного лимита. Чтение остановлено.",
+    "pagination_repeated_page": "⚠️ Сервис вернул ту же страницу дважды. Чтение остановлено, чтобы избежать бесконечного цикла.",
+    "partial_export": "⚠️ Некоторые разделы библиотеки не удалось прочитать полностью: {sections}",
+    "permanent_platform_error": "⚠️ Сервис отклонил запрос. Автоматический повтор не выполняется.",
+    "persistence_error": "⚠️ Локальное состояние не удалось безопасно записать. Ничего не изменено.",
+    "platform_not_implemented": "⚠️ Эта платформа пока не реализована.",
+    "platform_not_registered": "⚠️ Для этой платформы не зарегистрирован адаптер.",
+    "playlist_creation_failed": "⚠️ Не удалось создать плейлист.",
+    "playlist_creation_unconfirmed": "⚠️ Плейлист, возможно, создан, но сервис это не подтвердил. Операция записана для сверки.",
+    "playlist_deletion_failed": "⚠️ Не удалось удалить плейлист.",
+    "playlist_item_not_added": "⚠️ Не удалось добавить трек в плейлист.",
+    "playlist_resume_mismatch": "⚠️ Плейлист на целевом сервисе не совпадает с планом. Объект оставлен для сверки.",
+    "playlist_source_id_missing": "⚠️ Внутренняя ошибка: у плейлиста нет идентификатора в источнике.",
+    "provider_id_missing": "⚠️ В ответе сервиса отсутствует идентификатор. Ничего не изменено.",
+    "provider_mutation_failed": "⚠️ Сервис не завершил запись.",
+    "provider_mutation_rejected": "⚠️ Сервис отклонил запись.",
+    "rate_limited": "⚠️ Достигнут лимит запросов сервиса. Повторите позже.",
+    "rate_limited_write_unconfirmed": "⚠️ Достигнут лимит запросов, результат неизвестен. Операция записана для сверки, а не повторяется вслепую.",
+    "read_only_adapter_write_blocked": "⚠️ Внутренняя ошибка: попытка записи при разрешённом только чтении ({capability}).",
+    "same_account_transfer": "⚠️ Исходный и целевой аккаунты совпадают. Нечего переносить.",
+    "session_expired": "⚠️ Сохранённая сессия истекла. Подключите аккаунт заново.",
+    "session_initialization_failed": "⚠️ Не удалось начать сессию. Подключите аккаунт заново.",
+    "session_not_valid": "⚠️ Сохранённая сессия больше недействительна. Подключите аккаунт заново.",
+    "snapshot_account_missing": "⚠️ Внутренняя ошибка: снимок библиотеки пришёл без аккаунта.",
+    "temporary_platform_error": "⚠️ Сервис временно недоступен. Операцию можно продолжить.",
+    "tidalapi_missing": "⚠️ Интеграция TIDAL недоступна. Установите зависимости проекта и повторите попытку.",
+    "track_source_id_missing": "⚠️ Внутренняя ошибка: у трека нет идентификатора в источнике.",
+    "transfer_confirmation_required": "⚠️ Изменения не внесены, так как подтверждение не получено.",
+    "unavailable": "⚠️ Объект недоступен для этого аккаунта или региона.",
+    "unknown": "⚠️ Код ошибки: {code}",
+    "unsupported_capability": "⚠️ Платформа не поддерживает запрошенную операцию ({capability})."
+  },
+  "platform": {
+    "tidal": "TIDAL",
+    "spotify": "Spotify",
+    "apple_music": "Apple Music",
+    "deezer": "Deezer",
+    "youtube_music": "YouTube Music"
+  },
+  "accounts": {
+    "heading": "Подключённые аккаунты",
+    "connected": "Подключён",
+    "not_connected": "Не подключён",
+    "account_line": "{platform}\n{status}\n{name}",
+    "not_implemented": "Пока не реализовано",
+    "disconnected": "✅ Сессия {platform} удалена.",
+    "reconnect_hint": "Подключите {platform} в настройках аккаунта."
+  },
+  "plan": {
+    "heading": "📋 План переноса (только чтение, ничего не изменено)",
+    "route": "{source} ➜ {destination}",
+    "total_items": "Объектов: {count}",
+    "matched": "Сопоставлено: {count}",
+    "unmatched": "Не найдено на целевом аккаунте: {count}",
+    "already_exists": "Уже есть на целевом аккаунте: {count}",
+    "ambiguous": "Требует проверки: {count}",
+    "content_line": "{label}: {count}",
+    "warning_line": "⚠️ {warning}",
+    "confirm": "Выполнить этот план?",
+    "cancelled": "ℹ️ План не выполнен. Изменения не внесены."
+  },
+  "job": {
+    "status": {
+      "created": "Создано",
+      "authenticating": "Авторизация",
+      "exporting": "Чтение исходной библиотеки",
+      "normalizing": "Нормализация метаданных",
+      "matching": "Сопоставление треков",
+      "planning": "Построение плана",
+      "waiting_confirmation": "Ожидание подтверждения",
+      "importing": "Запись в целевой аккаунт",
+      "verifying": "Проверка результата",
+      "completed": "Завершено",
+      "failed": "Ошибка",
+      "cancelled": "Отменено",
+      "paused": "Пауза"
+    },
+    "status_line": "Статус: {status}",
+    "job_line": "Задача {job_id}: {status}",
+    "progress_line": "{status}: {current}/{total}"
+  },
+  "item": {
+    "status": {
+      "pending": "Ожидает",
+      "matched": "Сопоставлено",
+      "transferred": "Перенесено",
+      "already_exists": "Уже было",
+      "not_found": "Не найдено на целевом аккаунте",
+      "ambiguous": "Неоднозначно — проверьте целевой аккаунт",
+      "unavailable": "Недоступно в регионе",
+      "skipped": "Пропущено",
+      "failed": "Ошибка"
+    }
+  },
+  "matching": {
+    "method": {
+      "isrc": "ISRC",
+      "direct_id": "Тот же идентификатор платформы",
+      "exact_metadata": "Точное совпадение метаданных",
+      "normalized_metadata": "Нормализованные метаданные",
+      "fuzzy_metadata": "Нечёткое совпадение",
+      "none": "Совпадений нет"
+    },
+    "score_line": "Совпадение: {method} ({score:.2f})",
+    "warning_explicit_to_clean": "На целевом аккаунте только версия без цензуры.",
+    "warning_version_mismatch": "На целевом аккаунте другая версия (remaster/live/remix).",
+    "warning_duration_mismatch": "Длительность отличается более чем на 15 секунд."
+  },
+  "verification": {
+    "heading": "🔎 Проверка",
+    "ok": "✅ Целевой аккаунт соответствует плану (идентификаторы и порядок).",
+    "missing": "Отсутствует на целевом аккаунте: {count}",
+    "unexpected": "Лишнее на целевом аккаунте: {count}",
+    "order_mismatches": "Различия в порядке: {count}",
+    "unverifiable": "⚠️ Целевой аккаунт не отдаёт раздел {section}; проверка пропущена.",
+    "report_written": "📄 Отчёт проверки сохранён: {path}"
+  },
+  "report": {
+    "heading": "📊 Отчёт о переносе",
+    "transferred": "Перенесено: {count}",
+    "already_existed": "Уже было: {count}",
+    "failed": "Ошибок: {count}",
+    "not_found": "Не найдено: {count}",
+    "unavailable": "Недоступно: {count}",
+    "ambiguous": "Неоднозначно: {count}",
+    "skipped": "Пропущено: {count}",
+    "duration": "Длительность: {seconds:.1f} с"
+  },
+  "resume": {
+    "pending": "Осталось объектов из предыдущего запуска: {count}.",
+    "nothing_pending": "Продолжать нечего.",
+    "retry_created": "Создана задача повтора с {count} объектами."
+  }
+}

@@ -1,0 +1,45 @@
+"""Ports (interfaces) that the core depends on.
+
+Adapters implement ``platform``; infrastructure implements ``repositories``.
+The core never imports the implementations.
+"""
+
+from __future__ import annotations
+
+from .platform import (
+    AsyncPlatformAdapter,
+    DestinationState,
+    LibraryMaintenanceAdapter,
+    MusicPlatformAdapter,
+    PlatformCapabilities,
+    ReadOnlyAdapter,
+    operation_kind,
+    to_async,
+)
+from .queue import InlineQueue, JobQueue, QueueMessage
+from .repositories import (
+    AccountRepository,
+    TransferItemRepository,
+    TransferJobRepository,
+    TransferPlanRepository,
+    UnitOfWork,
+)
+
+__all__ = [
+    "AccountRepository",
+    "AsyncPlatformAdapter",
+    "DestinationState",
+    "InlineQueue",
+    "JobQueue",
+    "LibraryMaintenanceAdapter",
+    "MusicPlatformAdapter",
+    "PlatformCapabilities",
+    "QueueMessage",
+    "ReadOnlyAdapter",
+    "TransferItemRepository",
+    "TransferJobRepository",
+    "TransferPlanRepository",
+    "UnitOfWork",
+    "operation_kind",
+    "to_async",
+]

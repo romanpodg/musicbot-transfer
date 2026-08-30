@@ -1,94 +1,176 @@
-# TIDAL Library Manager
+# music-transfer
 
-A safety-first, multilingual Python CLI for backing up, transferring, restoring, verifying, and cleaning a TIDAL library.
+A platform-independent music library transfer core. **TIDAL is the first real
+adapter**; Spotify, Apple Music, Deezer, YouTube Music, and a Telegram
+interface are designed for but deliberately not implemented.
 
-It uses [`tidalapi`](https://tidalapi.netlify.app/) for browser/device OAuth and library operations. No passwords are requested, saved, logged, or placed in project files.
-
-## Requirements
-
-- Python 3.12 or later
-- A TIDAL account that can authorize the required library actions
-- A terminal that supports Unicode for the full emoji experience
-
-## Installation
-
-From the `tidal_manager` directory:
-
-```powershell
-py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python main.py
+```
+python -m music_transfer --help
 ```
 
-On first launch, choose English or Russian. The selection is saved in `config.json`.
+---
 
-If this project was already installed before the reliability update, run the
-requirements command again to install `tqdm` for the live progress display.
+## Status
 
-## Diagnostics and dry runs
+| | |
+|---|---|
+| Tests | **164 passing** (149 new + 15 legacy) |
+| Python | 3.11+ (developed on 3.13) |
+| Adapters | TIDAL |
 
-Run a local, credential-free readiness check before authorizing an account:
+### What is implemented
 
-```powershell
-python main.py --diagnostics
+- Universal domain models — `Track`, `Album`, `Artist`, `Playlist`,
+  `PlaylistItem`, `LibrarySnapshot`.
+- `MusicPlatformAdapter` contract with read / mutating / destructive
+  classification and a `PlatformCapabilities` declaration.
+- A platform registry — the **only** place a platform name selects a class.
+- Table-driven job (13 states) and item (9 states) state machines.
+- Export → normalize → match → plan → confirm → execute → verify → report.
+- Matching: ISRC → portable id → exact → normalized → fuzzy, with explicit-vs-clean
+  and version penalties, and near-tie downgrade to ambiguous.
+- Read-only planning enforced at runtime.
+- Per-item checkpointing, idempotent writes, cooperative cancellation.
+- Verification that compares membership **and** order, duplicate-aware.
+- Item-level resume and retry — no cursor, no repeated confirmed writes.
+- JSON persistence (atomic, `0600`), keyring-only credentials, structured
+  redacted logging, en/ru localization.
+- A working CLI.
+
+### What is planned (a seam exists, nothing is implemented)
+
+- **Telegram interface** — `interfaces/`, DTOs, i18n, and the cancellation token
+  are already shaped for it; no handler exists yet.
+- **Spotify / Apple Music / Deezer / YouTube Music** — enum members and
+  capability declarations only. Asking for one raises
+  `UnsupportedCapabilityError`; nothing returns a fake success.
+- **PostgreSQL** — the repository ports are in place; the schema is sketched in
+  [docs/roadmap.md](docs/roadmap.md#5-postgresql-schema-planned).
+- **Queue-backed workers** — `JobQueue` is declared; no Redis/Celery/Dramatiq.
+
+### What is experimental
+
+- `tidal_manager/` — the original project, preserved **byte-for-byte** and
+  still passing its own 15 tests. Superseded; do not build on it.
+- `InlineQueue` and `NullUnitOfWork` — real in-process implementations, correct
+  for the CLI, not substitutes for a broker or a database.
+
+---
+
+## Quick start
+
+```bash
+python -m venv .venv
+.venv/Scripts/python.exe -m pip install -e .          # Windows
+# source .venv/bin/activate && pip install -e .        # macOS / Linux
+
+python -m music_transfer diagnostics     # environment and adapter checks
+python -m music_transfer accounts        # connected accounts
+python -m music_transfer capabilities tidal
+python -m music_transfer plan      --source tidal --destination tidal
+python -m music_transfer transfer  <job-id>
+python -m music_transfer resume    <job-id>
+python -m music_transfer retry     <job-id>
 ```
 
-It checks the Python version, installed `tidalapi` client, configuration,
-backup presence, writable log path, and local API client availability. It does
-not contact TIDAL or attempt OAuth.
+Configuration is optional; copy `.env.example` to `.env` to change defaults.
+There is no password or token field anywhere in it — credentials live in the
+OS keyring.
 
-To estimate a cleanup without creating a queue or changing a TIDAL library:
+### Running the tests
 
-```powershell
-python main.py --dry-run
+```bash
+python -m unittest discover -s tests -t .
 ```
 
-Choose **Clean library** and a scope. The CLI reads the selected sections and
-prints the exact objects that would be removed. Transfer, restore, and cleanup
-mutations are blocked while this mode is active.
+`-t .` matters: without it unittest treats `tests` as the top-level directory
+and the `tests.support` import fails.
 
-## Example usage
+---
 
-1. Select **Create backup** and authorize the source account in the browser link shown by the CLI. The backup is written atomically to `data/backups/tidal_backup.json`.
-2. Select **Transfer library**, authorize the source and destination accounts independently, choose an order, inspect the account summary, and approve the destination warning.
-3. If a transfer is interrupted, start the application again and accept the resume prompt. The retained `data/state/transfer_state.json` contains library metadata and progress only—never OAuth tokens.
-4. Select **Clean library** only after reviewing its exact count. The CLI offers a backup first, asks for an explicit yes/no decision, and then requires the exact `DELETE` phrase before it makes a deletion.
-5. Cleanup writes an exact deletion queue before the first request. The terminal shows the current item, item count, errors, elapsed time, and bounded retry notices. Pressing `Ctrl+C` saves the queue and checkpoint safely; start the application again to continue.
+## Why the architecture looks like this
 
-## Safety and data handling
-
-- OAuth tokens are stored only in the operating-system keyring when a usable keyring backend is available. If it is unavailable, the session is not persisted and the next run asks for OAuth again.
-- `config.json`, backups, reports, logs, and transfer state do not contain passwords or OAuth credentials.
-- Every remote mutation is confirmation-gated in both the UI and service layer. This includes transfer, restore, created playlists/folders, favorite additions, and cleanup.
-- Every upstream request receives a 20-second timeout. Transient network, timeout, rate-limit, and 5xx failures are retried up to three times with exponential backoff. A playlist/folder creation or playlist-item add with an unknown response is not blindly repeated, because that could create a duplicate; its checkpoint remains for safe reconciliation or review.
-- Backups contain only library metadata: favorite tracks, albums, artists, videos, mixes/radio, playlist folders, playlist metadata, and playlist media order.
-- A backup or source snapshot that has an unreadable section is marked partial. Transfer and cleanup are blocked rather than treating a partial view as complete.
-- Logs record event types and exception classes only; a redaction filter removes token-shaped data.
-
-## Files produced at runtime
-
-| File | Purpose |
-| --- | --- |
-| `data/backups/tidal_backup.json` | Versioned complete library backup when every section is readable |
-| `data/state/transfer_state.json` | Atomic, credential-free transfer/restore checkpoint |
-| `data/state/delete_state.json` | Atomic cleanup progress checkpoint (`completed`, `failed`, and `remaining`) |
-| `data/state/delete_queue.json` | Exact deletion order and per-item `pending` / `processing` / `completed` / `failed` status |
-| `data/reports/transfer_report.json` | Successful, failed, unavailable, skipped, and count comparison report |
-| `data/logs/tidal_manager.log` | Rotated, sanitized authentication, transfer, cleanup, retry, error, and recovery events |
-
-## Upstream capability notes
-
-The project targets the maintained `tidalapi` 0.8 API. Its device/browser OAuth flow is used directly, and its supported favorites, mixes, playlist folders, and playlist APIs are called through `core/auth.py`. Availability can still vary by country, subscription, ownership, and TIDAL API behavior. Such items are recorded as unavailable or failed in the report; no raw provider response is exposed in the CLI or log.
-
-Run deterministic checks without a TIDAL account:
-
-```powershell
-python -m unittest discover -s tests -v
-python -m compileall -q .
+```
+interfaces  →  app  →  core
+platforms   →  core.ports
+infrastructure → core.ports
 ```
 
-The automated tests use fakes only; no real TIDAL account or library mutation
-is needed. A real account smoke test remains optional and should begin with a
-small, disposable playlist or the dry-run cleanup mode.
+Dependencies point inward. `core/` imports nothing but the standard library:
+no platform SDK, no Telegram, no database driver. A new music service is one
+new package under `platforms/` plus one registry line — no core change.
+
+The engine asks **what a platform can do**, never **which platform it is**:
+
+```python
+if not adapter.capabilities.supports_playlist_duplicates:
+    plan.warnings.append(f"destination_deduplicates_playlists:{playlist.source_id}")
+```
+
+---
+
+## Two bugs this refactor fixed
+
+**1. Pagination stopped early.** The original code treated a short page as the
+end of the data:
+
+```python
+if len(page) < page_size:      # a 49-item page at page_size=100 ends the fetch
+    return values
+offset += len(page)            # and the offset drifts when a page is short
+```
+
+Now: terminate only on an **empty** page, advance the offset by the **requested**
+page size, detect a repeated page, and bound the work with typed errors. Pinned
+by `100 + 49 + 100 = 249`.
+
+**2. Transfer state was a cursor.** A crash at item 900 of 1 000 risked losing
+or repeating work. State is now recorded **per item**, checkpointed after every
+write, so resume is driven by durable status rather than a position counter.
+
+---
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Layers, dependency rules, invariants, validation |
+| [docs/platform-adapters.md](docs/platform-adapters.md) | The adapter contract, capabilities, how to add a platform |
+| [docs/transfer-lifecycle.md](docs/transfer-lifecycle.md) | State machines, matching, execution, resume, verification |
+| [docs/roadmap.md](docs/roadmap.md) | Status by area, Telegram, workers, PostgreSQL schema |
+
+---
+
+## Repository layout
+
+```
+music_transfer/
+├── core/             domain, ports, matching, transfer engine  (stdlib only)
+│   ├── domain/       universal models
+│   ├── ports/        MusicPlatformAdapter, repositories, queue
+│   ├── matching/     normalization → scoring → matcher
+│   └── transfer/     lifecycle · planner · executor · verifier · recovery
+├── platforms/
+│   ├── registry.py   platform → factory (the only name-based dispatch)
+│   └── tidal/        client, mapper, auth, pagination, adapter
+├── app/              application services + UI-facing DTOs
+├── infrastructure/   JSON persistence, keyring, logging, HTTP
+├── interfaces/cli/   argparse CLI, console rendering, prompts
+└── locales/          en · ru (292 keys each)
+
+tests/                unit/ (149) · legacy/ (15)
+tidal_manager/        the original project, preserved as-is
+docs/                 architecture · platform-adapters · transfer-lifecycle · roadmap
+```
+
+---
+
+## Safety rules the code enforces
+
+- Planning cannot write — `ReadOnlyAdapter` blocks it at runtime.
+- Destructive operations are separately classified and never called by a transfer.
+- A timeout is **not** "not applied": unknown outcomes become `AMBIGUOUS` and are
+  resolved by re-reading the destination, never retried blindly.
+- Unimplemented platforms raise; they never return `True`.
+- No token, password, or session blob is ever logged (`SecretRedactionFilter`).
+- One untranslated SDK exception fails one item, not the whole library.

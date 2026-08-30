@@ -1,0 +1,58 @@
+"""The transfer engine: planning, execution, verification, and recovery.
+
+The engine is platform-agnostic.  It reads capabilities from an adapter and
+never branches on a platform name.
+"""
+
+from __future__ import annotations
+
+from .executor import (
+    CancellationToken,
+    ExecutionOutcome,
+    TransferExecutor,
+    build_report,
+    status_after_execution,
+)
+from .lifecycle import (
+    TERMINAL_STATUSES,
+    TRANSITIONS,
+    can_transition,
+    is_terminal,
+    resume_target,
+    transition,
+)
+from .ordering import (
+    apply_logical_order,
+    restore_positions,
+    sort_key_for_date_added,
+    sort_key_for_text,
+    to_write_order,
+)
+from .planner import CONTENT_SPECS, PlannerResult, TransferPlanner
+from .recovery import RecoveryService
+from .verifier import TransferVerifier, compare_sequences
+
+__all__ = [
+    "CONTENT_SPECS",
+    "TERMINAL_STATUSES",
+    "TRANSITIONS",
+    "CancellationToken",
+    "ExecutionOutcome",
+    "PlannerResult",
+    "RecoveryService",
+    "TransferExecutor",
+    "TransferPlanner",
+    "TransferVerifier",
+    "apply_logical_order",
+    "build_report",
+    "can_transition",
+    "compare_sequences",
+    "is_terminal",
+    "restore_positions",
+    "resume_target",
+    "sort_key_for_date_added",
+    "sort_key_for_text",
+    "status_after_execution",
+    "to_write_order",
+    "transition",
+]

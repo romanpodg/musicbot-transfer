@@ -1,0 +1,545 @@
+"""Transfer execution: item-level writes with resume, idempotency, and cancellation.
+
+Design rules encoded here:
+
+* **Resume is item-level** (Invariant E).  Terminal items are never replayed;
+  the engine reads statuses from the repository rather than trusting a single
+  position counter.
+* **Ambiguous outcomes are never auto-replayed** (Invariant F).  A timeout is
+  not proof that a write failed, so an ambiguous result is recorded and left
+  for reconciliation via destination state.
+* **Cancellation is cooperative.**  The executor finishes the current item,
+  persists it, and stops.  Already transferred content is never rolled back
+  automatically.
+* **Failure meanings stay explicit.**  ``NOT_FOUND``, ``UNAVAILABLE``,
+  ``AMBIGUOUS``, and ``FAILED`` are distinct so a retry job can select exactly
+  the items worth retrying.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+
+from ..domain import (
+    Playlist,
+    TransferItem,
+    TransferJob,
+    TransferProgress,
+    TransferReport,
+)
+from ..enums import EntityType, ItemStatus, JobStatus, Platform
+from ..errors import (
+    AmbiguousOperationError,
+    AuthenticationError,
+    AuthorizationError,
+    MusicTransferError,
+    UnsupportedCapabilityError,
+    classify_error,
+)
+from ..ports import MusicPlatformAdapter, TransferItemRepository
+
+_LOGGER = logging.getLogger("music_transfer.executor")
+
+ProgressCallback = Callable[[TransferProgress], None]
+
+
+class CancellationToken:
+    """Cooperative cancellation flag shared with the driving interface.
+
+    A UI (CLI ``Ctrl+C``, a future Telegram "Cancel" button) sets this.  The
+    executor checks it between items, so stopping happens at a safe boundary
+    instead of killing a request mid-flight.
+    """
+
+    __slots__ = ("_cancelled",)
+
+    def __init__(self) -> None:
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Request cancellation."""
+
+        self._cancelled = True
+
+    @property
+    def is_cancelled(self) -> bool:
+        """Return whether cancellation was requested."""
+
+        return self._cancelled
+
+
+#: How each failure kind maps onto a durable item status.
+_FAILURE_STATUS: dict[str, ItemStatus] = {
+    "ambiguous": ItemStatus.AMBIGUOUS,
+    "unavailable": ItemStatus.UNAVAILABLE,
+    "not_found": ItemStatus.NOT_FOUND,
+    "authentication": ItemStatus.FAILED,
+    "temporary": ItemStatus.FAILED,
+    "permanent": ItemStatus.FAILED,
+}
+
+
+@dataclass(slots=True)
+class ExecutionOutcome:
+    """What one execution run achieved."""
+
+    processed: int = 0
+    succeeded: int = 0
+    skipped: int = 0
+    failed: int = 0
+    cancelled: bool = False
+    aborted_error: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize to JSON-compatible values."""
+
+        return {
+            "processed": self.processed,
+            "succeeded": self.succeeded,
+            "skipped": self.skipped,
+            "failed": self.failed,
+            "cancelled": self.cancelled,
+            "aborted_error": self.aborted_error,
+        }
+
+
+class TransferExecutor:
+    """Write planned items to a destination, checkpointing after every item."""
+
+    def __init__(
+        self,
+        destination: MusicPlatformAdapter,
+        items: TransferItemRepository,
+        *,
+        logger: logging.Logger | None = None,
+        cancellation_token: CancellationToken | None = None,
+    ) -> None:
+        self._destination = destination
+        self._items = items
+        self._logger = logger or _LOGGER
+        self._cancellation = cancellation_token or CancellationToken()
+
+    @property
+    def cancellation_token(self) -> CancellationToken:
+        """Return the token a caller can use to stop the run."""
+
+        return self._cancellation
+
+    def execute(
+        self,
+        job: TransferJob,
+        plan_items: list[TransferItem],
+        *,
+        progress: ProgressCallback | None = None,
+    ) -> ExecutionOutcome:
+        """Execute planned items in order.
+
+        Args:
+            job: The job being executed (counters are updated in place).
+            plan_items: Items in the order they should be written.
+            progress: Optional progress sink.
+
+        Returns:
+            An :class:`ExecutionOutcome`.  Item statuses are already persisted.
+        """
+
+        outcome = ExecutionOutcome()
+        ordered = self._write_order(job, plan_items)
+        total = len(ordered)
+        for index, item in enumerate(ordered, start=1):
+            if self._cancellation.is_cancelled or job.cancellation_requested:
+                outcome.cancelled = True
+                self._logger.warning(
+                    "event=execution_cancelled job_id=%s processed=%d", job.id, outcome.processed
+                )
+                break
+            if item.is_terminal():
+                outcome.skipped += 1
+                outcome.processed += 1
+                self._emit(progress, job, "importing", total, outcome, item)
+                continue
+            if self._attempts_exhausted(job, item):
+                outcome.skipped += 1
+                outcome.processed += 1
+                self._emit(progress, job, "importing", total, outcome, item)
+                continue
+            try:
+                self._execute_item(job, item, ordered)
+            except (AuthenticationError, AuthorizationError) as error:
+                # Losing the session makes every remaining item meaningless.
+                self._record_failure(item, error)
+                self._items.update(item)
+                outcome.failed += 1
+                outcome.processed += 1
+                outcome.aborted_error = getattr(error, "code", "authentication_error")
+                self._logger.error(
+                    "event=execution_aborted job_id=%s reason=%s", job.id, outcome.aborted_error
+                )
+                break
+            outcome.processed += 1
+            if item.status is ItemStatus.TRANSFERRED:
+                outcome.succeeded += 1
+            elif item.status is ItemStatus.SKIPPED or item.status is ItemStatus.ALREADY_EXISTS:
+                outcome.skipped += 1
+            elif item.status is not ItemStatus.MATCHED:
+                outcome.failed += 1
+            self._emit(progress, job, "importing", total, outcome, item)
+        job.processed_items = outcome.processed
+        job.successful_items = outcome.succeeded
+        job.failed_items = outcome.failed
+        job.skipped_items = outcome.skipped
+        job.touch()
+        return outcome
+
+    # -- item execution ----------------------------------------------------
+
+    def _execute_item(
+        self, job: TransferJob, item: TransferItem, all_items: list[TransferItem]
+    ) -> None:
+        """Write one item and persist the result.
+
+        Args:
+            job: The owning job.
+            item: The item to write.
+            all_items: Every planned item, used to propagate a newly created
+                playlist identifier to its entries.
+        """
+
+        if job.settings.dry_run:
+            item.mark(ItemStatus.SKIPPED, error="dry_run")
+            self._items.update(item)
+            return
+        item.register_attempt()
+        try:
+            if item.entity_type is EntityType.TRACK:
+                self._write_track(item)
+            elif item.entity_type is EntityType.ALBUM:
+                self._write_album(item)
+            elif item.entity_type is EntityType.ARTIST:
+                self._write_artist(item)
+            elif item.entity_type is EntityType.PLAYLIST:
+                self._write_playlist(job, item, all_items)
+            elif item.entity_type is EntityType.PLAYLIST_ITEM:
+                self._write_playlist_item(item, all_items)
+            else:
+                item.mark(ItemStatus.SKIPPED, error="entity_type_not_executable")
+                self._items.update(item)
+                return
+        except MusicTransferError as error:
+            self._record_failure(item, error)
+            self._items.update(item)
+            self._logger.error(
+                "event=item_failed job_id=%s item_id=%s entity=%s source_id=%s reason=%s attempt=%d",
+                job.id,
+                item.id,
+                item.entity_type.value,
+                item.source_id,
+                getattr(error, "code", "unknown"),
+                item.attempt_count,
+            )
+            return
+        except Exception as error:  # noqa: BLE001 - one bad item must not abort a library
+            # An exception the adapter did not translate (an SDK bug, an
+            # unexpected payload) is classified here, recorded as a durable
+            # item failure, and chained into the log.  It is never swallowed:
+            # the item stays FAILED and retryable, and the job continues.
+            self._record_unexpected_failure(item, error)
+            self._items.update(item)
+            self._logger.error(
+                "event=item_failed job_id=%s item_id=%s entity=%s source_id=%s reason=%s attempt=%d",
+                job.id,
+                item.id,
+                item.entity_type.value,
+                item.source_id,
+                type(error).__name__,
+                item.attempt_count,
+                exc_info=error,
+            )
+            return
+        item.last_failure_kind = None
+        item.last_error = None
+        item.mark(ItemStatus.TRANSFERRED)
+        self._items.update(item)
+        self._logger.info(
+            "event=item_transferred job_id=%s item_id=%s entity=%s source_id=%s destination_id=%s",
+            job.id,
+            item.id,
+            item.entity_type.value,
+            item.source_id,
+            item.destination_id or "",
+        )
+
+    def _write_track(self, item: TransferItem) -> None:
+        if not item.destination_id:
+            raise _not_found(item)
+        self._destination.save_track(item.destination_id)
+
+    def _write_album(self, item: TransferItem) -> None:
+        if not item.destination_id:
+            raise _not_found(item)
+        self._destination.save_album(item.destination_id)
+
+    def _write_artist(self, item: TransferItem) -> None:
+        if not item.destination_id:
+            raise _not_found(item)
+        self._destination.follow_artist(item.destination_id)
+
+    def _write_playlist(
+        self, job: TransferJob, item: TransferItem, all_items: list[TransferItem]
+    ) -> None:
+        """Create a destination playlist exactly once, then record its id.
+
+        The identifier is written onto the item *and* onto every child entry so
+        that a resume can find it without re-creating the playlist.
+        """
+
+        if item.destination_id:
+            self._propagate_container(all_items, item.source_id, item.destination_id)
+            return
+        playlist = Playlist(
+            source_platform=job.source_platform,
+            source_id=item.source_id,
+            name=str(item.source_metadata.get("name", "")),
+            description=item.source_metadata.get("description") or "",
+        )
+        created_id = self._destination.create_playlist(playlist)
+        if not created_id:
+            raise AmbiguousOperationError("playlist_creation_unconfirmed")
+        item.destination_id = created_id
+        item.match_score = 1.0
+        self._propagate_container(all_items, item.source_id, created_id)
+        self._logger.info(
+            "event=playlist_created job_id=%s source_id=%s destination_id=%s",
+            job.id,
+            item.source_id,
+            created_id,
+        )
+
+    def _write_playlist_item(self, item: TransferItem, all_items: list[TransferItem]) -> None:
+        """Append one playlist entry, reconciling first when the API allows it."""
+
+        container_id = item.container_destination_id or self._find_container(all_items, item)
+        if not container_id:
+            raise _not_found(item)
+        if not item.destination_id:
+            raise _not_found(item)
+        self._reconcile(item, all_items, container_id)
+        if item.status is ItemStatus.TRANSFERRED:
+            return
+        self._destination.add_playlist_item(container_id, item.destination_id)
+
+    # -- resume helpers ----------------------------------------------------
+
+    def _reconcile(
+        self, item: TransferItem, all_items: list[TransferItem], container_id: str
+    ) -> None:
+        """Skip an entry the destination already contains after a crash.
+
+        Reads the destination's exact media sequence and compares it against
+        the planned prefix.  A mismatch means the destination content is not
+        what this plan expects, so the item is marked ambiguous rather than
+        blindly appended (which would corrupt ordering).
+        """
+
+        try:
+            actual = list(self._destination.playlist_item_ids(container_id))
+        except UnsupportedCapabilityError:
+            return
+        expected = [
+            entry.destination_id
+            for entry in self._siblings(all_items, item.container_source_id)
+            if entry.destination_id
+        ]
+        if len(actual) > len(expected) or actual != expected[: len(actual)]:
+            item.mark(ItemStatus.AMBIGUOUS, error="playlist_resume_mismatch")
+            raise AmbiguousOperationError("playlist_resume_mismatch")
+        if len(actual) > item.original_position:
+            # The write landed before the checkpoint was saved.
+            item.mark(ItemStatus.TRANSFERRED)
+            self._items.update(item)
+
+    @staticmethod
+    def _siblings(all_items: list[TransferItem], container_source_id: str | None) -> list[TransferItem]:
+        """Return the planned entries of one playlist, in source order."""
+
+        if container_source_id is None:
+            return []
+        siblings = [
+            entry
+            for entry in all_items
+            if entry.entity_type is EntityType.PLAYLIST_ITEM
+            and entry.container_source_id == container_source_id
+        ]
+        return sorted(siblings, key=lambda entry: entry.original_position)
+
+    @staticmethod
+    def _propagate_container(
+        all_items: list[TransferItem], container_source_id: str, destination_id: str
+    ) -> None:
+        """Record a newly created container id on all of its entries."""
+
+        for entry in all_items:
+            if (
+                entry.entity_type is EntityType.PLAYLIST_ITEM
+                and entry.container_source_id == container_source_id
+            ):
+                entry.container_destination_id = destination_id
+
+    @staticmethod
+    def _find_container(all_items: list[TransferItem], item: TransferItem) -> str | None:
+        """Return the destination container id recorded by the playlist item."""
+
+        for entry in all_items:
+            if (
+                entry.entity_type is EntityType.PLAYLIST
+                and entry.source_id == item.container_source_id
+                and entry.destination_id
+            ):
+                return entry.destination_id
+        return None
+
+    # -- bookkeeping -------------------------------------------------------
+
+    def _write_order(self, job: TransferJob, items: list[TransferItem]) -> list[TransferItem]:
+        """Return items in write order.
+
+        Playlists are grouped so a container is always created before its
+        entries, and entries stay in source position order.
+
+        Playlist *entries* are deliberately excluded from the leading group:
+        ``PLAYLIST_ITEM`` is a distinct entity type from ``PLAYLIST``, so a
+        naive "everything that is not a playlist" filter would place the
+        entries first and they would be written into a container that does not
+        exist yet.
+        """
+
+        from .ordering import restore_positions
+
+        playlists = [item for item in items if item.entity_type is EntityType.PLAYLIST]
+        others = [
+            item
+            for item in items
+            if item.entity_type not in (EntityType.PLAYLIST, EntityType.PLAYLIST_ITEM)
+        ]
+        grouped: list[TransferItem] = list(others)
+        for playlist in playlists:
+            grouped.append(playlist)
+            grouped.extend(
+                restore_positions(
+                    [
+                        entry
+                        for entry in items
+                        if entry.entity_type is EntityType.PLAYLIST_ITEM
+                        and entry.container_source_id == playlist.source_id
+                    ],
+                    position=lambda entry: entry.original_position,
+                )
+            )
+        return grouped
+
+    @staticmethod
+    def _attempts_exhausted(job: TransferJob, item: TransferItem) -> bool:
+        """Return whether an item has already used all of its attempts."""
+
+        return (
+            item.status is ItemStatus.FAILED
+            and item.attempt_count >= job.settings.max_item_attempts
+        )
+
+    @staticmethod
+    def _record_failure(item: TransferItem, error: Exception) -> None:
+        """Translate an exception into a durable item status."""
+
+        kind = classify_error(error)
+        status = _FAILURE_STATUS.get(kind, ItemStatus.FAILED)
+        code = getattr(error, "code", None) or type(error).__name__
+        item.last_failure_kind = kind
+        item.mark(status, error=str(code))
+
+    @staticmethod
+    def _record_unexpected_failure(item: TransferItem, error: Exception) -> None:
+        """Record an unclassified exception without losing its meaning.
+
+        The failure kind is derived from the exception type where possible, so a
+        network error raised by an SDK still becomes a retryable failure rather
+        than a permanent one.  The exception type is kept in ``last_error`` so
+        the log and the report stay diagnosable.
+        """
+
+        kind = classify_error(error)
+        item.last_failure_kind = kind
+        item.mark(
+            _FAILURE_STATUS.get(kind, ItemStatus.FAILED),
+            error=f"unexpected:{type(error).__name__}",
+        )
+
+    def _emit(
+        self,
+        progress: ProgressCallback | None,
+        job: TransferJob,
+        phase: str,
+        total: int,
+        outcome: ExecutionOutcome,
+        item: TransferItem | None,
+    ) -> None:
+        """Publish a progress snapshot, if anyone is listening."""
+
+        if progress is None:
+            return
+        progress(
+            TransferProgress(
+                job_id=job.id,
+                phase=phase,
+                total=total,
+                processed=outcome.processed,
+                succeeded=outcome.succeeded,
+                skipped=outcome.skipped,
+                failed=outcome.failed,
+                current_item=_item_label(item),
+            )
+        )
+
+
+def _item_label(item: TransferItem | None) -> str | None:
+    """Return a short display label for a transfer item."""
+
+    if item is None:
+        return None
+    title = item.source_metadata.get("title")
+    return str(title) if title else item.source_id
+
+
+def _not_found(item: TransferItem) -> MusicTransferError:
+    """Return the error used when an item has no destination identifier."""
+
+    from ..errors import NotFoundError
+
+    return NotFoundError("destination_identifier_missing")
+
+
+def build_report(
+    job: TransferJob, items: list[TransferItem], outcome: ExecutionOutcome
+) -> TransferReport:
+    """Build a report from durable item state, not from transient counters."""
+
+    report = TransferReport.from_items(job.id, items, operation="transfer")
+    if outcome.cancelled:
+        report.warnings.append("cancelled")
+    if outcome.aborted_error:
+        report.warnings.append(f"aborted:{outcome.aborted_error}")
+    return report
+
+
+def status_after_execution(job: TransferJob, outcome: ExecutionOutcome) -> JobStatus:
+    """Decide which job status follows an execution run."""
+
+    if outcome.cancelled:
+        return JobStatus.CANCELLED
+    if outcome.aborted_error:
+        return JobStatus.FAILED
+    if outcome.failed:
+        return JobStatus.VERIFYING
+    return JobStatus.VERIFYING

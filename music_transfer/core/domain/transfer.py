@@ -281,6 +281,7 @@ class TransferItem:
     source_id: str
     destination_platform: Platform
     original_position: int = 0
+    write_position: int | None = None
     destination_id: str | None = None
     container_source_id: str | None = None
     container_destination_id: str | None = None
@@ -305,6 +306,7 @@ class TransferItem:
         destination_platform: Platform,
         *,
         original_position: int = 0,
+        write_position: int | None = None,
         container_source_id: str | None = None,
         source_metadata: dict[str, Any] | None = None,
         operation: TransferOperation = TransferOperation.NONE,
@@ -319,6 +321,7 @@ class TransferItem:
             source_id=source_id,
             destination_platform=destination_platform,
             original_position=original_position,
+            write_position=write_position,
             container_source_id=container_source_id,
             source_metadata=dict(source_metadata or {}),
             operation=operation,
@@ -330,11 +333,15 @@ class TransferItem:
         self.updated_at = utc_now()
 
     def mark(self, status: ItemStatus, *, error: str | None = None) -> None:
-        """Set a status, clear or record the error, and refresh the timestamp."""
+        """Advance the lifecycle status of this item.
+
+        Every transition stamps the timestamp and clears any previous error
+        unless a new one was provided.
+        """
 
         self.status = status
         self.last_error = error
-        self.touch()
+        self.updated_at = utc_now()
 
     def register_attempt(self) -> None:
         """Increment the attempt counter before a write is attempted."""
@@ -350,29 +357,23 @@ class TransferItem:
         return self.status in TERMINAL_ITEM_STATUSES
 
     def is_executable(self) -> bool:
-        """Central authoritative rule determining if an item can be executed.
+        """Return whether this item is eligible for destination write execution.
 
-        Separates item status from operation. An item cannot execute merely
-        because it is not terminal. Unresolved items, terminal items, or items
-        with TransferOperation.NONE are not executable.
+        Central safety gate: items that failed resolution (NOT_FOUND, AMBIGUOUS,
+        UNAVAILABLE) or are already satisfied or skipped must never reach
+        destination mutation methods.
         """
 
-        if self.is_terminal():
+        if self.status not in (ItemStatus.PENDING, ItemStatus.MATCHED):
             return False
 
-        if self.status in {ItemStatus.AMBIGUOUS, ItemStatus.NOT_FOUND, ItemStatus.UNAVAILABLE}:
-            return False
-
-        if self.operation is TransferOperation.NONE:
-            return False
-
-        if self.operation in {
+        if self.operation in (
             TransferOperation.SAVE_TRACK,
             TransferOperation.SAVE_ALBUM,
             TransferOperation.FOLLOW_ARTIST,
             TransferOperation.ADD_PLAYLIST_ITEM,
-        }:
-            return self.status is ItemStatus.MATCHED and bool(self.destination_id)
+        ):
+            return bool(self.destination_id)
 
         if self.operation is TransferOperation.CREATE_PLAYLIST:
             # Creation requires playlist name metadata and must not have already landed (destination_id)
@@ -397,6 +398,7 @@ class TransferItem:
             "container_source_id": self.container_source_id,
             "container_destination_id": self.container_destination_id,
             "original_position": self.original_position,
+            "write_position": self.write_position,
             "source_metadata": dict(self.source_metadata),
             "match_method": str(self.match_method),
             "match_score": self.match_score,
@@ -436,6 +438,9 @@ class TransferItem:
                 EntityType.PLAYLIST_ITEM: TransferOperation.ADD_PLAYLIST_ITEM,
             }.get(entity_type, TransferOperation.NONE)
 
+        raw_write_position = value.get("write_position")
+        write_position = int(raw_write_position) if raw_write_position is not None else None
+
         return cls(
             id=str(value.get("id", "")),
             job_id=str(value.get("job_id", "")),
@@ -447,6 +452,7 @@ class TransferItem:
             container_source_id=value.get("container_source_id"),
             container_destination_id=value.get("container_destination_id"),
             original_position=int(value.get("original_position", 0)),
+            write_position=write_position,
             source_metadata=dict(value.get("source_metadata") or {}),
             match_method=method,
             match_score=float(value.get("match_score", 0.0) or 0.0),

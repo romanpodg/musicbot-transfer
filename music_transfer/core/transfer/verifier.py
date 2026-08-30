@@ -119,11 +119,21 @@ class TransferVerifier:
 
         results: dict[str, VerificationResult] = {}
         playlists: dict[str, list[str]] = {}
-        for item in items:
-            if item.entity_type is not EntityType.PLAYLIST_ITEM:
-                continue
-            if item.status is not ItemStatus.TRANSFERRED or not item.destination_id:
-                continue
+        playlist_items = [
+            item
+            for item in items
+            if item.entity_type is EntityType.PLAYLIST_ITEM
+            and item.status is ItemStatus.TRANSFERRED
+            and item.destination_id
+        ]
+        # Sort by write_position (or original_position if write_position is None)
+        playlist_items.sort(
+            key=lambda item: (
+                item.write_position is None,
+                item.write_position if item.write_position is not None else item.original_position,
+            )
+        )
+        for item in playlist_items:
             container = item.container_destination_id or ""
             bucket = playlists.setdefault(container, [])
             bucket.append(item.destination_id)

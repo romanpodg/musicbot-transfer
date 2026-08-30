@@ -37,6 +37,7 @@ from ..errors import (
     AuthenticationError,
     AuthorizationError,
     MusicTransferError,
+    TemporaryPlatformError,
     UnsupportedCapabilityError,
     classify_error,
 )
@@ -189,6 +190,10 @@ class TransferExecutor:
         Returns:
             An :class:`ExecutionOutcome`.  Item statuses are already persisted.
         """
+
+        from .planner import validate_plan_write_positions
+
+        validate_plan_write_positions(plan_items)
 
         outcome = ExecutionResult()
         ordered = self._write_order(job, plan_items)
@@ -389,7 +394,35 @@ class TransferExecutor:
         self._reconcile(item, all_items, container_id)
         if item.status is ItemStatus.TRANSFERRED:
             return
-        self._destination.add_playlist_item(container_id, item.destination_id)
+        try:
+            self._destination.add_playlist_item(container_id, item.destination_id)
+        except (AmbiguousOperationError, TemporaryPlatformError) as error:
+            try:
+                actual = list(self._destination.playlist_item_ids(container_id))
+            except UnsupportedCapabilityError:
+                raise error from None
+            except Exception:
+                # If checking destination state also errors, mark ambiguous and raise AmbiguousOperationError
+                item.mark(ItemStatus.AMBIGUOUS, error="playlist_state_inconclusive")
+                raise AmbiguousOperationError("playlist_state_inconclusive") from error
+
+            if (
+                item.write_position is not None
+                and len(actual) > item.write_position
+                and actual[item.write_position] == item.destination_id
+            ):
+                # The mutation actually committed remotely despite timeout/error!
+                item.mark(ItemStatus.TRANSFERRED)
+                self._items.update(item)
+                return
+            elif item.write_position is not None and len(actual) == item.write_position:
+                # Confirmed absence: remote state did not receive the item.
+                # Re-raise the original error so standard retry/failure policies handle it.
+                raise error
+            else:
+                # Inconclusive or diverged: fail safely without blind duplicates.
+                item.mark(ItemStatus.AMBIGUOUS, error="playlist_state_inconclusive")
+                raise AmbiguousOperationError("playlist_state_inconclusive") from error
 
     # -- resume helpers ----------------------------------------------------
 
@@ -404,26 +437,31 @@ class TransferExecutor:
         blindly appended (which would corrupt ordering).
         """
 
+        if item.write_position is None:
+            return
         try:
             actual = list(self._destination.playlist_item_ids(container_id))
         except UnsupportedCapabilityError:
             return
+        except Exception as error:
+            item.mark(ItemStatus.AMBIGUOUS, error="playlist_state_inconclusive")
+            raise AmbiguousOperationError("playlist_state_inconclusive") from error
         expected = [
             entry.destination_id
             for entry in self._siblings(all_items, item.container_source_id)
-            if entry.destination_id
+            if entry.write_position is not None and entry.destination_id
         ]
         if len(actual) > len(expected) or actual != expected[: len(actual)]:
             item.mark(ItemStatus.AMBIGUOUS, error="playlist_resume_mismatch")
             raise AmbiguousOperationError("playlist_resume_mismatch")
-        if len(actual) > item.original_position:
+        if len(actual) > item.write_position and actual[item.write_position] == item.destination_id:
             # The write landed before the checkpoint was saved.
             item.mark(ItemStatus.TRANSFERRED)
             self._items.update(item)
 
     @staticmethod
     def _siblings(all_items: list[TransferItem], container_source_id: str | None) -> list[TransferItem]:
-        """Return the planned entries of one playlist, in source order."""
+        """Return the planned entries of one playlist, in write order."""
 
         if container_source_id is None:
             return []
@@ -433,7 +471,13 @@ class TransferExecutor:
             if entry.entity_type is EntityType.PLAYLIST_ITEM
             and entry.container_source_id == container_source_id
         ]
-        return sorted(siblings, key=lambda entry: entry.original_position)
+        return sorted(
+            siblings,
+            key=lambda entry: (
+                entry.write_position is None,
+                entry.write_position if entry.write_position is not None else entry.original_position,
+            ),
+        )
 
     @staticmethod
     def _propagate_container(
@@ -495,7 +539,11 @@ class TransferExecutor:
                         if entry.entity_type is EntityType.PLAYLIST_ITEM
                         and entry.container_source_id == playlist.source_id
                     ],
-                    position=lambda entry: entry.original_position,
+                    position=lambda entry: (
+                        entry.write_position
+                        if entry.write_position is not None
+                        else entry.original_position
+                    ),
                 )
             )
         return grouped

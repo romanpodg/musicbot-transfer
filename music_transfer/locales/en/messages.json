@@ -247,6 +247,7 @@
     "playlist_item_not_added": "⚠️ The track could not be added to the playlist.",
     "playlist_resume_mismatch": "⚠️ The playlist on the destination does not match the plan. The item was left for reconciliation.",
     "playlist_source_id_missing": "⚠️ Internal error: a playlist arrived without a source identifier.",
+    "playlist_state_inconclusive": "⚠️ The playlist state on the destination could not be confirmed. The item was left for reconciliation.",
     "provider_id_missing": "⚠️ The service response is missing an identifier. Nothing was changed.",
     "provider_mutation_failed": "⚠️ The service did not complete the write.",
     "provider_mutation_rejected": "⚠️ The service rejected the write.",

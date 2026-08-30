@@ -43,7 +43,7 @@ from ..enums import (
     MatchOutcome,
     TransferOperation,
 )
-from ..errors import UnsupportedCapabilityError
+from ..errors import TransferConfigurationError, UnsupportedCapabilityError
 from ..matching import TrackMatcher
 from ..ports import DestinationState, MusicPlatformAdapter, PlatformCapabilities, ReadOnlyAdapter
 from .ordering import apply_logical_order
@@ -150,6 +150,7 @@ class TransferPlanner:
             items.extend(
                 self._plan_section(job, source, read_only, capabilities, state, content_type, warnings)
             )
+        self._validate_plan(items)
         summary = self._summarize(items, source, state)
         plan = TransferPlan(
             job_id=job.id,
@@ -327,17 +328,24 @@ class TransferPlanner:
             planned.append(playlist_item)
             if not playlist.tracks:
                 continue
-            if not capabilities.supports_playlist_duplicates:
-                warnings.append(f"destination_deduplicates_playlists:{playlist.source_id}")
+            playlist_entries: list[TransferItem] = []
             for position, entry in enumerate(playlist.tracks):
                 if entry.track is None:
                     warnings.append(f"playlist_item_unresolved:{playlist.source_id}:{position}")
                     continue
-                planned.append(
-                    self._plan_playlist_item(
-                        job, destination, playlist, entry, position, capabilities
-                    )
+                planned_item = self._plan_playlist_item(
+                    job, destination, playlist, entry, position, capabilities
                 )
+                playlist_entries.append(planned_item)
+
+            write_pos = 0
+            for item in playlist_entries:
+                if item.operation is TransferOperation.ADD_PLAYLIST_ITEM and item.is_executable():
+                    item.write_position = write_pos
+                    write_pos += 1
+                else:
+                    item.write_position = None
+            planned.extend(playlist_entries)
         return planned
 
     def _plan_playlist_item(
@@ -480,3 +488,88 @@ class TransferPlanner:
                 1 for item in items if item.entity_type is EntityType.PLAYLIST
             ),
         )
+
+    @staticmethod
+    def _validate_plan(items: list[TransferItem]) -> None:
+        """Validate playlist write positions before plan finalization.
+
+        Rules:
+        1. Executable ADD_PLAYLIST_ITEM entries must have write_position is not None.
+        2. Non-executable or non-playlist items must have write_position is None.
+        3. For each playlist container, executable write positions must be unique
+           and strictly contiguous 0..N-1.
+        """
+        validate_plan_write_positions(items)
+
+
+def migrate_legacy_write_positions(items: list[TransferItem]) -> None:
+    """Derive write positions for legacy items lacking write_position.
+
+    If in a playlist container, every playlist item has write_position is None,
+    we derive contiguous write positions (0..N-1) for executable or already
+    transferred items in original_position order. Unresolved items (NOT_FOUND,
+    UNAVAILABLE, etc.) remain write_position = None.
+    """
+    by_container: dict[str, list[TransferItem]] = {}
+    for item in items:
+        if item.entity_type is not EntityType.PLAYLIST_ITEM:
+            continue
+        container = item.container_source_id or ""
+        by_container.setdefault(container, []).append(item)
+
+    for _container_id, entries in by_container.items():
+        if not any(e.write_position is not None for e in entries):
+            sorted_entries = sorted(entries, key=lambda e: e.original_position)
+            write_pos = 0
+            for entry in sorted_entries:
+                if (
+                    entry.operation is TransferOperation.ADD_PLAYLIST_ITEM
+                    or (entry.operation is TransferOperation.NONE and entry.destination_id)
+                ) and (entry.is_executable() or entry.status is ItemStatus.TRANSFERRED):
+                    entry.write_position = write_pos
+                    write_pos += 1
+                else:
+                    entry.write_position = None
+
+
+def validate_plan_write_positions(items: list[TransferItem]) -> None:
+    """Validate write positions across all plan items.
+
+    Raises:
+        TransferConfigurationError: If any playlist container has invalid,
+            duplicate, non-contiguous, or missing write positions for executable entries.
+    """
+    migrate_legacy_write_positions(items)
+
+    by_container: dict[str, list[TransferItem]] = {}
+    for item in items:
+        if item.entity_type is not EntityType.PLAYLIST_ITEM:
+            continue
+        container = item.container_source_id or ""
+        by_container.setdefault(container, []).append(item)
+
+    for container_id, entries in by_container.items():
+        positioned_entries = [e for e in entries if e.write_position is not None]
+        executable_entries = [
+            e
+            for e in entries
+            if e.operation is TransferOperation.ADD_PLAYLIST_ITEM and e.is_executable()
+        ]
+        for e in executable_entries:
+            if e.write_position is None:
+                raise TransferConfigurationError(
+                    f"invalid_playlist_write_positions:missing_write_position:{container_id}:{e.id}"
+                )
+
+        positions = [e.write_position for e in positioned_entries]
+        if len(positions) != len(set(positions)):
+            raise TransferConfigurationError(
+                f"invalid_playlist_write_positions:duplicate_position:{container_id}"
+            )
+        if positions:
+            expected_positions = list(range(len(positions)))
+            if sorted(positions) != expected_positions:
+                raise TransferConfigurationError(
+                    f"invalid_playlist_write_positions:non_contiguous:{container_id}"
+                )
+

@@ -19,7 +19,6 @@ from music_transfer.core.domain import (
     AccountProfile,
     LibrarySnapshot,
     TransferItem,
-    TransferSettings,
 )
 from music_transfer.core.enums import (
     ContentType,
@@ -29,12 +28,11 @@ from music_transfer.core.enums import (
     Platform,
 )
 from music_transfer.core.errors import TransferConfigurationError
-from music_transfer.core.transfer import RecoveryService, TransferExecutor
 from music_transfer.infrastructure.persistence import (
     JsonTransferItemRepository,
     JsonTransferJobRepository,
 )
-from music_transfer.core.domain import TransferJob
+
 from tests.support import FakePlatformAdapter, playlist, track
 
 
@@ -348,16 +346,41 @@ class IdempotentPlaylistWrites(unittest.TestCase):
         This is the same Invariant E guarantee applied to a two-level structure:
         the playlist was written and checkpointed, so a resumed run must find
         the existing container id and continue appending entries to it.
+        Unresolved source gaps must not cause duplicate writes after resume.
         """
 
-        entries = [track("A", identifier="a"), track("B", identifier="b"), track("C", identifier="c")]
+        # Mix entries with an unmatched gap to exercise recovery across gaps
+        entries = [
+            track("A", identifier="a"),
+            track("Missing", identifier="unmatched_gap"),
+            track("B", identifier="b"),
+            track("C", identifier="c"),
+        ]
         source_playlist = playlist("Mixed", entries)
         job = self.service.create_job(
             Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
         )
         source = FakePlatformAdapter(display_name="source", playlists=[source_playlist])
-        destination = FakePlatformAdapter(display_name="destination")
+        # Make "unmatched_gap" unresolvable by rejecting search on it
+        destination = FakePlatformAdapter(
+            display_name="destination",
+            fail_on={"search_tracks"},  # won't match if searched or we can mark it directly
+        )
         self.service.analyze(job, source, destination)
+
+        # Explicitly mark "unmatched_gap" as NOT_FOUND to create a gap in the planned items
+        planned_items = self.service.items.list_for_job(job.id)
+        for pi in planned_items:
+            if pi.source_id == "unmatched_gap":
+                pi.mark(ItemStatus.NOT_FOUND)
+                pi.write_position = None
+                self.service.items.update(pi)
+            elif pi.source_id == "b":
+                pi.write_position = 1
+                self.service.items.update(pi)
+            elif pi.source_id == "c":
+                pi.write_position = 2
+                self.service.items.update(pi)
 
         original = destination.add_playlist_item
         counter = {"writes": 0}
@@ -376,8 +399,15 @@ class IdempotentPlaylistWrites(unittest.TestCase):
         reloaded = self.service.jobs.get(job.id)
         assert reloaded is not None
         destination.add_playlist_item = original  # type: ignore[method-assign]
+        calls_before_resume = len(destination.write_calls)
         self.service.resume(reloaded, destination, confirmed=True)
 
+        # Exactly 2 more writes ("b" and "c"), no duplicate write for "a"
+        new_item_writes = [
+            call for call in destination.write_calls[calls_before_resume:]
+            if call[0] == "add_playlist_item"
+        ]
+        self.assertEqual(len(new_item_writes), 2)
         created = [item for item in destination.playlists if item.source_id == "dst-mixed"]
         self.assertEqual(len(created), 1, "the playlist must not be created twice")
         self.assertEqual(destination.playlist_item_ids("dst-mixed"), ["a", "b", "c"])

@@ -371,6 +371,7 @@ class TransferService:
                 operation=item.operation,
             )
             clone.destination_id = item.destination_id
+            clone.write_position = item.write_position
             clone.match_method = item.match_method
             clone.match_score = item.match_score
             clone.container_destination_id = item.container_destination_id

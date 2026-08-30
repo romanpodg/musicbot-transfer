@@ -85,7 +85,7 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in ordered], ["b", "a", "c"])
 
     def test_catalogs_have_matching_keys(self) -> None:
-        localization_dir = Path(__file__).resolve().parents[1] / "localization"
+        localization_dir = Path(__file__).resolve().parents[2] / "tidal_manager" / "localization"
         manager = LocalizationManager(localization_dir)
         manager.validate_catalogs()
         self.assertEqual(set(manager.available_languages()), {"en", "ru"})
@@ -122,7 +122,7 @@ class SafetyTests(unittest.TestCase):
         self.assertNotIn("Bearer value", record.getMessage())
 
     def test_console_messages_reference_localization_keys(self) -> None:
-        project_root = Path(__file__).resolve().parents[1]
+        project_root = Path(__file__).resolve().parents[2] / "tidal_manager"
         manager = LocalizationManager(project_root / "localization")
         message_keys = _leaf_keys(manager._catalogs["en"])
         sources = [project_root / "main.py", *(project_root / "ui").glob("*.py")]
@@ -138,7 +138,7 @@ class SafetyTests(unittest.TestCase):
                     self.assertIn(first_argument.value, message_keys, path)
 
     def test_deletion_requires_yes_no_and_exact_delete_phrase(self) -> None:
-        localization_dir = Path(__file__).resolve().parents[1] / "localization"
+        localization_dir = Path(__file__).resolve().parents[2] / "tidal_manager" / "localization"
         console = Console(LocalizationManager(localization_dir), output=lambda _: None)
         accepted_answers = iter(["y", "DELETE"])
         accepted = Prompts(console, input_function=lambda _: next(accepted_answers))

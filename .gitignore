@@ -1,14 +1,37 @@
+# Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .pytest_cache/
 .mypy_cache/
-.venv/
+.ruff_cache/
+build/
+dist/
 
-data/backups/*
-!data/backups/.gitkeep
-data/reports/*
-!data/reports/.gitkeep
-data/logs/*
-!data/logs/.gitkeep
-data/state/*
-!data/state/.gitkeep
+# Virtual environments
+.venv/
+venv/
+
+# Environment files may hold credentials - never commit them.
+.env
+.env.*
+!.env.example
+
+# Runtime output of the new core: job state, logs, and real library data.
+data/
+
+# Legacy project runtime output: contains a real library backup and account id.
+tidal_manager/data/backups/*
+tidal_manager/data/reports/*
+tidal_manager/data/logs/*
+tidal_manager/data/state/*
+!tidal_manager/data/*/.gitkeep
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Agent workspace state
+.workbuddy-ai/

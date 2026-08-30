@@ -171,3 +171,19 @@ class OperationKind(StrEnum):
     READ = "read"
     MUTATING = "mutating"
     DESTRUCTIVE = "destructive"
+
+
+class TransferOperation(StrEnum):
+    """The planned mutation action to be performed at the destination.
+
+    Separates 'what happened to the item' (ItemStatus) from 'what mutation
+    should happen next' (TransferOperation).
+    """
+
+    NONE = "none"
+    SAVE_TRACK = "save_track"
+    SAVE_ALBUM = "save_album"
+    FOLLOW_ARTIST = "follow_artist"
+    CREATE_PLAYLIST = "create_playlist"
+    ADD_PLAYLIST_ITEM = "add_playlist_item"
+

@@ -19,6 +19,7 @@ Design rules encoded here:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,7 +31,7 @@ from ..domain import (
     TransferProgress,
     TransferReport,
 )
-from ..enums import EntityType, ItemStatus, JobStatus, Platform
+from ..enums import EntityType, ItemStatus, JobStatus, TransferOperation
 from ..errors import (
     AmbiguousOperationError,
     AuthenticationError,
@@ -82,28 +83,71 @@ _FAILURE_STATUS: dict[str, ItemStatus] = {
 }
 
 
+_CREDENTIAL_PATTERNS = (
+    re.compile(
+        r"(?i)(access[_ -]?token|refresh[_ -]?token|authorization|password|api[_ -]?key|secret)"
+        r"\s*[=:]\s*(?:bearer\s+)?[^\s,;]+"
+    ),
+    re.compile(r"(?i)bearer\s+[^\s,;]+"),
+    re.compile(r"(?i)\beyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.?[A-Za-z0-9_\-]*"),
+)
+
+
+def scrub_credentials(text: str | None) -> str | None:
+    """Redact token-like or credential-like values from an error message."""
+    if not text:
+        return text
+    sanitized = text
+    for pattern in _CREDENTIAL_PATTERNS:
+        sanitized = pattern.sub("[REDACTED]", sanitized)
+    return sanitized
+
+
+_scrub_credentials = scrub_credentials
+
+
 @dataclass(slots=True)
-class ExecutionOutcome:
-    """What one execution run achieved."""
+class ExecutionResult:
+    """Authoritative structured outcome of an execution run."""
 
     processed: int = 0
     succeeded: int = 0
     skipped: int = 0
     failed: int = 0
     cancelled: bool = False
-    aborted_error: str | None = None
+    aborted: bool = False
+    abort_error: str | None = None
+    abort_reason: str | None = None
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def aborted_error(self) -> str | None:
+        """Backward-compatible alias for abort_error."""
+        return self.abort_error
+
+    @aborted_error.setter
+    def aborted_error(self, value: str | None) -> None:
+        self.abort_error = value
+        if value is not None:
+            self.aborted = True
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible values."""
-
         return {
             "processed": self.processed,
             "succeeded": self.succeeded,
             "skipped": self.skipped,
             "failed": self.failed,
             "cancelled": self.cancelled,
-            "aborted_error": self.aborted_error,
+            "aborted": self.aborted,
+            "abort_error": self.abort_error,
+            "abort_reason": self.abort_reason,
+            "warnings": list(self.warnings),
+            "aborted_error": self.abort_error,
         }
+
+
+ExecutionOutcome = ExecutionResult
 
 
 class TransferExecutor:
@@ -146,10 +190,10 @@ class TransferExecutor:
             An :class:`ExecutionOutcome`.  Item statuses are already persisted.
         """
 
-        outcome = ExecutionOutcome()
+        outcome = ExecutionResult()
         ordered = self._write_order(job, plan_items)
         total = len(ordered)
-        for index, item in enumerate(ordered, start=1):
+        for _, item in enumerate(ordered, start=1):
             if self._cancellation.is_cancelled or job.cancellation_requested:
                 outcome.cancelled = True
                 self._logger.warning(
@@ -157,6 +201,13 @@ class TransferExecutor:
                 )
                 break
             if item.is_terminal():
+                outcome.skipped += 1
+                outcome.processed += 1
+                self._emit(progress, job, "importing", total, outcome, item)
+                continue
+            if not item.is_executable():
+                # Item cannot be executed by destination mutation (e.g. AMBIGUOUS,
+                # NOT_FOUND, UNAVAILABLE, or missing operation/destination).
                 outcome.skipped += 1
                 outcome.processed += 1
                 self._emit(progress, job, "importing", total, outcome, item)
@@ -174,9 +225,15 @@ class TransferExecutor:
                 self._items.update(item)
                 outcome.failed += 1
                 outcome.processed += 1
-                outcome.aborted_error = getattr(error, "code", "authentication_error")
+                outcome.aborted = True
+                outcome.abort_error = getattr(error, "code", "authentication_error")
+                raw_reason = getattr(error, "message", None) or str(error)
+                outcome.abort_reason = _scrub_credentials(raw_reason)
                 self._logger.error(
-                    "event=execution_aborted job_id=%s reason=%s", job.id, outcome.aborted_error
+                    "event=execution_aborted job_id=%s error=%s reason=%s",
+                    job.id,
+                    outcome.abort_error,
+                    outcome.abort_reason,
                 )
                 break
             outcome.processed += 1
@@ -214,20 +271,23 @@ class TransferExecutor:
             return
         item.register_attempt()
         try:
-            if item.entity_type is EntityType.TRACK:
+            op = item.operation
+            if op is TransferOperation.SAVE_TRACK or (op is TransferOperation.NONE and item.entity_type is EntityType.TRACK):
                 self._write_track(item)
-            elif item.entity_type is EntityType.ALBUM:
+            elif op is TransferOperation.SAVE_ALBUM or (op is TransferOperation.NONE and item.entity_type is EntityType.ALBUM):
                 self._write_album(item)
-            elif item.entity_type is EntityType.ARTIST:
+            elif op is TransferOperation.FOLLOW_ARTIST or (op is TransferOperation.NONE and item.entity_type is EntityType.ARTIST):
                 self._write_artist(item)
-            elif item.entity_type is EntityType.PLAYLIST:
+            elif op is TransferOperation.CREATE_PLAYLIST or (op is TransferOperation.NONE and item.entity_type is EntityType.PLAYLIST):
                 self._write_playlist(job, item, all_items)
-            elif item.entity_type is EntityType.PLAYLIST_ITEM:
+            elif op is TransferOperation.ADD_PLAYLIST_ITEM or (op is TransferOperation.NONE and item.entity_type is EntityType.PLAYLIST_ITEM):
                 self._write_playlist_item(item, all_items)
             else:
-                item.mark(ItemStatus.SKIPPED, error="entity_type_not_executable")
+                item.mark(ItemStatus.SKIPPED, error="operation_not_executable")
                 self._items.update(item)
                 return
+        except (AuthenticationError, AuthorizationError):
+            raise
         except MusicTransferError as error:
             self._record_failure(item, error)
             self._items.update(item)
@@ -521,25 +581,24 @@ def _not_found(item: TransferItem) -> MusicTransferError:
 
 
 def build_report(
-    job: TransferJob, items: list[TransferItem], outcome: ExecutionOutcome
+    job: TransferJob, items: list[TransferItem], outcome: ExecutionResult
 ) -> TransferReport:
     """Build a report from durable item state, not from transient counters."""
 
     report = TransferReport.from_items(job.id, items, operation="transfer")
     if outcome.cancelled:
         report.warnings.append("cancelled")
-    if outcome.aborted_error:
-        report.warnings.append(f"aborted:{outcome.aborted_error}")
+    abort_err = outcome.abort_error or outcome.aborted_error
+    if outcome.aborted or abort_err:
+        report.warnings.append(f"aborted:{abort_err or 'unknown'}")
     return report
 
 
-def status_after_execution(job: TransferJob, outcome: ExecutionOutcome) -> JobStatus:
+def status_after_execution(job: TransferJob, outcome: ExecutionResult) -> JobStatus:
     """Decide which job status follows an execution run."""
 
     if outcome.cancelled:
         return JobStatus.CANCELLED
-    if outcome.aborted_error:
+    if outcome.aborted or outcome.abort_error or outcome.aborted_error:
         return JobStatus.FAILED
-    if outcome.failed:
-        return JobStatus.VERIFYING
     return JobStatus.VERIFYING

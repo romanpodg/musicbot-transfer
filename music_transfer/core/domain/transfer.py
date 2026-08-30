@@ -19,6 +19,7 @@ from ..enums import (
     MatchMethod,
     OrderingMode,
     Platform,
+    TransferOperation,
 )
 
 
@@ -288,6 +289,7 @@ class TransferItem:
     match_score: float = 0.0
     status: ItemStatus = ItemStatus.PENDING
     attempt_count: int = 0
+    operation: TransferOperation = TransferOperation.NONE
     last_error: str | None = None
     last_failure_kind: str | None = None
     created_at: str = field(default_factory=utc_now)
@@ -305,6 +307,7 @@ class TransferItem:
         original_position: int = 0,
         container_source_id: str | None = None,
         source_metadata: dict[str, Any] | None = None,
+        operation: TransferOperation = TransferOperation.NONE,
     ) -> TransferItem:
         """Create a pending item with a fresh identifier."""
 
@@ -318,6 +321,7 @@ class TransferItem:
             original_position=original_position,
             container_source_id=container_source_id,
             source_metadata=dict(source_metadata or {}),
+            operation=operation,
         )
 
     def touch(self) -> None:
@@ -345,6 +349,40 @@ class TransferItem:
 
         return self.status in TERMINAL_ITEM_STATUSES
 
+    def is_executable(self) -> bool:
+        """Central authoritative rule determining if an item can be executed.
+
+        Separates item status from operation. An item cannot execute merely
+        because it is not terminal. Unresolved items, terminal items, or items
+        with TransferOperation.NONE are not executable.
+        """
+
+        if self.is_terminal():
+            return False
+
+        if self.status in {ItemStatus.AMBIGUOUS, ItemStatus.NOT_FOUND, ItemStatus.UNAVAILABLE}:
+            return False
+
+        if self.operation is TransferOperation.NONE:
+            return False
+
+        if self.operation in {
+            TransferOperation.SAVE_TRACK,
+            TransferOperation.SAVE_ALBUM,
+            TransferOperation.FOLLOW_ARTIST,
+            TransferOperation.ADD_PLAYLIST_ITEM,
+        }:
+            return self.status is ItemStatus.MATCHED and bool(self.destination_id)
+
+        if self.operation is TransferOperation.CREATE_PLAYLIST:
+            # Creation requires playlist name metadata and must not have already landed (destination_id)
+            if self.destination_id is not None:
+                return False
+            name = self.source_metadata.get("name") if self.source_metadata else None
+            return bool(name or self.source_id)
+
+        return False
+
     def as_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible values."""
 
@@ -363,6 +401,7 @@ class TransferItem:
             "match_method": str(self.match_method),
             "match_score": self.match_score,
             "status": str(self.status),
+            "operation": str(self.operation),
             "attempt_count": self.attempt_count,
             "last_error": self.last_error,
             "last_failure_kind": self.last_failure_kind,
@@ -372,16 +411,35 @@ class TransferItem:
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> TransferItem:
-        """Rebuild an item from persisted data."""
+        """Rebuild an item from persisted data with backward compatibility."""
 
         try:
             method = MatchMethod(str(value.get("match_method", MatchMethod.NONE)))
         except ValueError:
             method = MatchMethod.NONE
+
+        entity_type = EntityType(str(value.get("entity_type")))
+
+        raw_operation = value.get("operation")
+        if raw_operation:
+            try:
+                operation = TransferOperation(str(raw_operation))
+            except ValueError:
+                operation = TransferOperation.NONE
+        else:
+            # Safe default / migration for legacy serialized records
+            operation = {
+                EntityType.TRACK: TransferOperation.SAVE_TRACK,
+                EntityType.ALBUM: TransferOperation.SAVE_ALBUM,
+                EntityType.ARTIST: TransferOperation.FOLLOW_ARTIST,
+                EntityType.PLAYLIST: TransferOperation.CREATE_PLAYLIST,
+                EntityType.PLAYLIST_ITEM: TransferOperation.ADD_PLAYLIST_ITEM,
+            }.get(entity_type, TransferOperation.NONE)
+
         return cls(
             id=str(value.get("id", "")),
             job_id=str(value.get("job_id", "")),
-            entity_type=EntityType(str(value.get("entity_type"))),
+            entity_type=entity_type,
             source_platform=Platform(str(value.get("source_platform"))),
             source_id=str(value.get("source_id", "")),
             destination_platform=Platform(str(value.get("destination_platform"))),
@@ -393,12 +451,14 @@ class TransferItem:
             match_method=method,
             match_score=float(value.get("match_score", 0.0) or 0.0),
             status=ItemStatus(str(value.get("status", ItemStatus.PENDING))),
+            operation=operation,
             attempt_count=int(value.get("attempt_count", 0)),
             last_error=value.get("last_error"),
             last_failure_kind=value.get("last_failure_kind"),
             created_at=str(value.get("created_at", utc_now())),
             updated_at=str(value.get("updated_at", utc_now())),
         )
+
 
 
 # --------------------------------------------------------------------------

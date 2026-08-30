@@ -38,10 +38,10 @@ from ..domain import (
 from ..enums import (
     ContentType,
     EntityType,
-    InsertionBehavior,
     ItemStatus,
     MatchMethod,
     MatchOutcome,
+    TransferOperation,
 )
 from ..errors import UnsupportedCapabilityError
 from ..matching import TrackMatcher
@@ -215,6 +215,11 @@ class TransferPlanner:
         raw_items = list(getattr(source, section))
         ordered = self._order(job, raw_items, section)
         planned: list[TransferItem] = []
+        op = {
+            EntityType.TRACK: TransferOperation.SAVE_TRACK,
+            EntityType.ALBUM: TransferOperation.SAVE_ALBUM,
+            EntityType.ARTIST: TransferOperation.FOLLOW_ARTIST,
+        }.get(entity_type, TransferOperation.NONE)
         for position, item in enumerate(ordered):
             source_id = str(getattr(item, "source_id", ""))
             if not source_id:
@@ -227,7 +232,9 @@ class TransferPlanner:
                 job.destination_platform,
                 original_position=position,
                 source_metadata=self._metadata_for(item),
+                operation=op,
             )
+
             reusable = None
             if entity_type is EntityType.TRACK and destination.can_reuse_identifier(
                 entity_type, job.source_platform
@@ -307,6 +314,7 @@ class TransferPlanner:
                     "description": playlist.description or "",
                     "track_count": playlist.track_count,
                 },
+                operation=TransferOperation.CREATE_PLAYLIST,
             )
             playlist_item.destination_id = playlist.source_id if destination.can_reuse_identifier(
                 EntityType.PLAYLIST, job.source_platform
@@ -358,7 +366,9 @@ class TransferPlanner:
                 "isrc": track.isrc,
                 "duration_ms": track.duration_ms,
             },
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
         )
+
         if destination.can_reuse_identifier(EntityType.PLAYLIST_ITEM, job.source_platform):
             item.destination_id = track.source_id
             item.match_method = _DIRECT_METHOD

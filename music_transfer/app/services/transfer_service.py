@@ -116,9 +116,12 @@ class TransferService:
 
         source_account = source if isinstance(source, Account) else None
         destination_account = destination if isinstance(destination, Account) else None
-        if source_account is not None and destination_account is not None:
-            if source_account.same_identity(destination_account):
-                raise TransferConfigurationError("same_account_transfer")
+        if (
+            source_account is not None
+            and destination_account is not None
+            and source_account.same_identity(destination_account)
+        ):
+            raise TransferConfigurationError("same_account_transfer")
         source_platform = source_account.platform if source_account else Platform(source)
         destination_platform = (
             destination_account.platform if destination_account else Platform(destination)
@@ -247,7 +250,18 @@ class TransferService:
         outcome = executor.execute(job, items, progress=progress)
         self._jobs.update(job)
         verification: dict[str, Any] = {}
-        if job.settings.dry_run:
+        if outcome.aborted or outcome.abort_error:
+            # Fatal failure (e.g. auth/authorization loss). Do not verify or mark completed.
+            transition(job, JobStatus.FAILED)
+            job.error_code = outcome.abort_error
+            job.finished_at = job.updated_at
+            self._jobs.update(job)
+        elif outcome.cancelled:
+            # Cancellation stops cleanly without verification.
+            transition(job, JobStatus.CANCELLED)
+            job.finished_at = job.updated_at
+            self._jobs.update(job)
+        elif job.settings.dry_run:
             job.status = JobStatus.COMPLETED
             job.finished_at = job.updated_at
             self._jobs.update(job)
@@ -257,9 +271,7 @@ class TransferService:
             verifier = TransferVerifier(destination, logger=self._logger)
             results = verifier.verify_job(job, self._items.list_for_job(job.id))
             verification = verifier.as_report(results)
-            job.status = (
-                JobStatus.CANCELLED if outcome.cancelled else JobStatus.COMPLETED
-            )
+            job.status = JobStatus.COMPLETED
             job.finished_at = job.updated_at
             self._jobs.update(job)
         report = build_report(job, self._items.list_for_job(job.id), outcome)
@@ -356,6 +368,7 @@ class TransferService:
                 original_position=item.original_position,
                 container_source_id=item.container_source_id,
                 source_metadata=dict(item.source_metadata),
+                operation=item.operation,
             )
             clone.destination_id = item.destination_id
             clone.match_method = item.match_method

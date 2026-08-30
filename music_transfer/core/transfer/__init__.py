@@ -9,8 +9,10 @@ from __future__ import annotations
 from .executor import (
     CancellationToken,
     ExecutionOutcome,
+    ExecutionResult,
     TransferExecutor,
     build_report,
+    scrub_credentials,
     status_after_execution,
 )
 from .lifecycle import (
@@ -38,6 +40,7 @@ __all__ = [
     "TRANSITIONS",
     "CancellationToken",
     "ExecutionOutcome",
+    "ExecutionResult",
     "PlannerResult",
     "RecoveryService",
     "TransferExecutor",
@@ -50,6 +53,7 @@ __all__ = [
     "is_terminal",
     "restore_positions",
     "resume_target",
+    "scrub_credentials",
     "sort_key_for_date_added",
     "sort_key_for_text",
     "status_after_execution",

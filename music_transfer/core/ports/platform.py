@@ -1,0 +1,576 @@
+"""The platform adapter contract and the capability model.
+
+This module is the *only* place where the core describes what a music service
+can do.  Adapters live under ``music_transfer/platforms/`` and implement these
+interfaces; the transfer engine asks :class:`PlatformCapabilities` instead of
+comparing platform names.
+
+Synchronous vs asynchronous
+---------------------------
+
+Adapter methods are **synchronous**.  Every current adapter performs blocking
+HTTP I/O through a provider SDK, and the proven TIDAL implementation is
+synchronous; rewriting it to ``async`` in the same change that introduces the
+abstraction would risk the pagination, retry, and resume behaviour that the
+project depends on.
+
+Future asynchronous interfaces (Telegram handlers, FastAPI workers) wrap an
+adapter in :class:`AsyncPlatformAdapter`, which offloads each call to a worker
+thread.  That keeps the event loop unblocked without forcing every adapter to
+be rewritten, and it keeps the core free of any asyncio dependency.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Protocol, runtime_checkable
+
+from ..domain import (
+    AccountProfile,
+    Album,
+    Artist,
+    LibrarySnapshot,
+    Playlist,
+    PlaylistItem,
+    Track,
+)
+from ..enums import EntityType, InsertionBehavior, OperationKind, Platform
+from ..errors import UnsupportedCapabilityError
+
+#: Progress callback signature: ``(section, current, total)``.
+ProgressCallback = Any
+
+
+# --------------------------------------------------------------------------
+# Capabilities
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformCapabilities:
+    """What one platform adapter can actually do.
+
+    The engine consults these flags instead of branching on platform names, and
+    a future UI uses them to decide which options to offer.  Unsupported
+    capabilities are represented explicitly: an adapter raises
+    :class:`~music_transfer.core.errors.UnsupportedCapabilityError` when a
+    disabled operation is called.
+    """
+
+    platform: Platform
+
+    # --- reads -----------------------------------------------------------
+    read_liked_tracks: bool = False
+    read_saved_albums: bool = False
+    read_followed_artists: bool = False
+    read_playlists: bool = False
+    read_videos: bool = False
+    read_mixes: bool = False
+    read_folders: bool = False
+
+    # --- non-destructive writes ------------------------------------------
+    write_liked_tracks: bool = False
+    write_saved_albums: bool = False
+    write_followed_artists: bool = False
+    create_playlists: bool = False
+    write_playlist_items: bool = False
+    write_videos: bool = False
+    write_mixes: bool = False
+    create_folders: bool = False
+
+    # --- destructive operations (library management only) -----------------
+    delete_liked_tracks: bool = False
+    delete_saved_albums: bool = False
+    delete_followed_artists: bool = False
+    delete_playlists: bool = False
+    delete_folders: bool = False
+
+    # --- search -----------------------------------------------------------
+    search_tracks: bool = False
+    search_albums: bool = False
+    search_artists: bool = False
+
+    # --- behavioural traits -----------------------------------------------
+    #: Whether the platform lets us set an arbitrary historical "date added".
+    preserves_custom_added_date: bool = False
+    #: Whether a playlist may contain the same track more than once.
+    supports_playlist_duplicates: bool = True
+    #: Whether the adapter can tell us an item is already present.
+    supports_already_exists_detection: bool = True
+    #: Whether several items can be appended to a playlist in one request.
+    supports_batch_playlist_writes: bool = False
+    #: How the destination visually orders newly written items.
+    insertion_behavior: InsertionBehavior = InsertionBehavior.APPEND
+    #: Whether the catalog distinguishes "not in catalog" from "not available
+    #: in this region", letting us report UNAVAILABLE instead of NOT_FOUND.
+    distinguishes_region_availability: bool = False
+    #: Whether the adapter can expose ISRC values for matching.
+    exposes_isrc: bool = False
+
+    def require(self, capability: str) -> None:
+        """Raise when a capability is disabled, instead of silently skipping.
+
+        Args:
+            capability: The field name to check.
+
+        Raises:
+            UnsupportedCapabilityError: If the flag is false or unknown.
+        """
+
+        if not hasattr(self, capability):
+            raise UnsupportedCapabilityError(
+                "capability_unknown", capability=capability
+            )
+        if not getattr(self, capability):
+            raise UnsupportedCapabilityError(
+                "capability_unsupported", capability=capability
+            )
+
+    def supports(self, capability: str) -> bool:
+        """Return whether a named capability is enabled."""
+
+        return bool(getattr(self, capability, False))
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize to JSON-compatible values (for logs and diagnostics)."""
+
+        return {
+            "platform": str(self.platform),
+            "read_liked_tracks": self.read_liked_tracks,
+            "read_saved_albums": self.read_saved_albums,
+            "read_followed_artists": self.read_followed_artists,
+            "read_playlists": self.read_playlists,
+            "write_liked_tracks": self.write_liked_tracks,
+            "write_saved_albums": self.write_saved_albums,
+            "write_followed_artists": self.write_followed_artists,
+            "create_playlists": self.create_playlists,
+            "write_playlist_items": self.write_playlist_items,
+            "search_tracks": self.search_tracks,
+            "supports_playlist_duplicates": self.supports_playlist_duplicates,
+            "preserves_custom_added_date": self.preserves_custom_added_date,
+            "insertion_behavior": str(self.insertion_behavior),
+        }
+
+
+# --------------------------------------------------------------------------
+# Destination state
+# --------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class DestinationState:
+    """A read-only view of what the destination already contains.
+
+    Used for "already exists" detection and for reconciling an ambiguous write.
+    ``incomplete_sections`` keeps a partial read honest: an absent id then means
+    "unknown", not "absent".
+    """
+
+    platform: Platform
+    track_ids: frozenset[str] = frozenset()
+    album_ids: frozenset[str] = frozenset()
+    artist_ids: frozenset[str] = frozenset()
+    playlist_ids: frozenset[str] = frozenset()
+    incomplete_sections: tuple[str, ...] = ()
+
+    def has_track(self, track_id: str | None) -> bool:
+        """Return whether a track id is known to be present."""
+
+        return bool(track_id) and track_id in self.track_ids
+
+    def is_trustworthy(self, section: str) -> bool:
+        """Return whether a section was read completely."""
+
+        return section not in self.incomplete_sections
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serialize to JSON-compatible values."""
+
+        return {
+            "platform": str(self.platform),
+            "track_count": len(self.track_ids),
+            "album_count": len(self.album_ids),
+            "artist_count": len(self.artist_ids),
+            "playlist_count": len(self.playlist_ids),
+            "incomplete_sections": list(self.incomplete_sections),
+        }
+
+
+# --------------------------------------------------------------------------
+# The adapter contract
+# --------------------------------------------------------------------------
+
+
+class MusicPlatformAdapter(ABC):
+    """The contract every music service implements.
+
+    Every method is optional in practice: the default implementation raises
+    :class:`UnsupportedCapabilityError`, so an adapter only overrides what its
+    platform genuinely supports.  That satisfies the rule that unsupported
+    platforms must not be forced to implement meaningless operations, while
+    keeping unsupported calls loud instead of silently successful.
+    """
+
+    #: Method names that change remote state (non-destructive writes).
+    MUTATING_METHODS: frozenset[str] = frozenset(
+        {
+            "save_track",
+            "save_album",
+            "follow_artist",
+            "save_video",
+            "save_mix",
+            "create_playlist",
+            "add_playlist_item",
+            "add_playlist_items",
+            "create_folder",
+        }
+    )
+
+    #: Method names that remove remote state.  Only the library-maintenance
+    #: service may call these, and only after its own stronger confirmation.
+    DESTRUCTIVE_METHODS: frozenset[str] = frozenset(
+        {
+            "remove_track",
+            "remove_album",
+            "unfollow_artist",
+            "remove_video",
+            "remove_mix",
+            "delete_playlist",
+            "delete_folder",
+        }
+    )
+
+    @property
+    @abstractmethod
+    def platform(self) -> Platform:
+        """Return the platform this adapter talks to."""
+
+    @property
+    @abstractmethod
+    def capabilities(self) -> PlatformCapabilities:
+        """Return the capability declaration for this adapter."""
+
+    # --- identity ---------------------------------------------------------
+
+    @abstractmethod
+    def get_profile(self) -> AccountProfile:
+        """Return safe, display-oriented account metadata."""
+
+    # --- reads -----------------------------------------------------------
+
+    def export_library(
+        self, sections: tuple[str, ...] | None = None, progress: ProgressCallback = None
+    ) -> LibrarySnapshot:
+        """Export the whole library, marking unreadable sections incomplete."""
+
+        raise UnsupportedCapabilityError("capability_unsupported", capability="export_library")
+
+    def get_liked_tracks(self, progress: ProgressCallback = None) -> list[Track]:
+        """Return every liked/saved track."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="read_liked_tracks"
+        )
+
+    def get_saved_albums(self, progress: ProgressCallback = None) -> list[Album]:
+        """Return every saved album."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="read_saved_albums"
+        )
+
+    def get_followed_artists(self, progress: ProgressCallback = None) -> list[Artist]:
+        """Return every followed artist."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="read_followed_artists"
+        )
+
+    def get_playlists(self, progress: ProgressCallback = None) -> list[Playlist]:
+        """Return playlists and, where available, their ordered items."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="read_playlists"
+        )
+
+    def get_playlist_items(
+        self, playlist_id: str, progress: ProgressCallback = None
+    ) -> list[PlaylistItem]:
+        """Return the ordered items of one playlist, duplicates preserved."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="read_playlists"
+        )
+
+    def get_destination_state(
+        self, sections: tuple[str, ...] | None = None
+    ) -> DestinationState:
+        """Return what the destination already contains.
+
+        Read-only.  Used for "already exists" detection and for reconciling an
+        ambiguous mutation before any retry (Invariant F).
+        """
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="supports_already_exists_detection"
+        )
+
+    def playlist_item_ids(self, playlist_id: str) -> list[str]:
+        """Return the exact media id sequence of a destination playlist.
+
+        Read-only.  Essential for resuming an interrupted playlist write and
+        for order verification.  Duplicates appear once per occurrence.
+        """
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="read_playlists"
+        )
+
+    # --- search -----------------------------------------------------------
+
+    def search_track(self, track: Track, limit: int = 5) -> list[Track]:
+        """Search the destination catalog for a track."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="search_tracks"
+        )
+
+    def search_album(self, album: Album, limit: int = 5) -> list[Album]:
+        """Search the destination catalog for an album."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="search_albums"
+        )
+
+    def search_artist(self, artist: Artist, limit: int = 5) -> list[Artist]:
+        """Search the destination catalog for an artist."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="search_artists"
+        )
+
+    # --- non-destructive writes ------------------------------------------
+
+    def save_track(self, track_id: str) -> None:
+        """Add one track to the destination's liked/saved tracks."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="write_liked_tracks"
+        )
+
+    def save_album(self, album_id: str) -> None:
+        """Save one album at the destination."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="write_saved_albums"
+        )
+
+    def follow_artist(self, artist_id: str) -> None:
+        """Follow one artist at the destination."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="write_followed_artists"
+        )
+
+    def create_playlist(self, playlist: Playlist) -> str:
+        """Create a destination playlist and return its identifier.
+
+        Raises:
+            AmbiguousOperationError: When the request timed out or failed in a
+                way that leaves the remote outcome unknown.  Callers must
+                reconcile against destination state before retrying.
+        """
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="create_playlists"
+        )
+
+    def add_playlist_item(self, playlist_id: str, track_id: str) -> None:
+        """Append one item to a destination playlist.
+
+        Implementations must allow duplicates so that a source playlist with
+        repeated entries is reproduced exactly (Invariant D).
+        """
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="write_playlist_items"
+        )
+
+    def add_playlist_items(self, playlist_id: str, track_ids: list[str]) -> int:
+        """Append several items at once; return how many were accepted.
+
+        Only meaningful when the adapter declares
+        ``supports_batch_playlist_writes``.
+        """
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="supports_batch_playlist_writes"
+        )
+
+    def create_folder(self, name: str, parent_id: str) -> str:
+        """Create a playlist folder and return its identifier."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="create_folders"
+        )
+
+    # --- capability query -------------------------------------------------
+
+    def can_reuse_identifier(self, entity_type: EntityType, source: Platform) -> bool:
+        """Return whether source ids can be written directly to this platform.
+
+        TIDAL returns ``True`` for TIDAL sources, which is what makes a
+        TIDAL -> TIDAL transfer a direct copy with no catalog search.  Keeping
+        this a capability query means the core contains no ``if platform ==
+        "tidal"`` branch.
+        """
+
+        return False
+
+
+class LibraryMaintenanceAdapter(ABC):
+    """Destructive library operations, deliberately kept out of transfers.
+
+    A transfer never calls these.  They exist only for the separate library
+    management / cleanup service, which applies stronger confirmation than a
+    transfer does (Invariant C).
+    """
+
+    def remove_track(self, track_id: str) -> None:
+        """Unfavorite/remove one track."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="delete_liked_tracks"
+        )
+
+    def remove_album(self, album_id: str) -> None:
+        """Remove one saved album."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="delete_saved_albums"
+        )
+
+    def unfollow_artist(self, artist_id: str) -> None:
+        """Unfollow one artist."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="delete_followed_artists"
+        )
+
+    def remove_video(self, video_id: str) -> None:
+        """Remove one saved video."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="delete_liked_tracks"
+        )
+
+    def remove_mix(self, mix_id: str) -> None:
+        """Remove one saved mix."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="delete_liked_tracks"
+        )
+
+    def delete_playlist(self, playlist_id: str) -> None:
+        """Permanently delete an owned playlist, or unfavorite a public one."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="delete_playlists"
+        )
+
+    def delete_folder(self, folder_id: str) -> None:
+        """Delete a playlist folder."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="delete_folders"
+        )
+
+
+# --------------------------------------------------------------------------
+# Guards and async bridge
+# --------------------------------------------------------------------------
+
+
+def operation_kind(adapter: MusicPlatformAdapter, method_name: str) -> OperationKind:
+    """Classify an adapter method as read, mutating, or destructive."""
+
+    if method_name in MusicPlatformAdapter.DESTRUCTIVE_METHODS:
+        return OperationKind.DESTRUCTIVE
+    if method_name in MusicPlatformAdapter.MUTATING_METHODS:
+        return OperationKind.MUTATING
+    return OperationKind.READ
+
+
+class ReadOnlyAdapter:
+    """A wrapper that makes every write unreachable.
+
+    The transfer planner receives destination adapters through this wrapper so
+    that Invariant B ("a transfer plan performs no destination mutations") is
+    enforced at runtime, not merely documented.  Attempting a write raises
+    :class:`UnsupportedCapabilityError` naming the attempted method.
+    """
+
+    def __init__(self, inner: MusicPlatformAdapter) -> None:
+        self._inner = inner
+
+    @property
+    def inner(self) -> MusicPlatformAdapter:
+        """Return the wrapped adapter (for tests and diagnostics)."""
+
+        return self._inner
+
+    def __getattr__(self, name: str) -> Any:
+        attribute = getattr(self._inner, name)
+        if callable(attribute) and operation_kind(self._inner, name) is not OperationKind.READ:
+            def blocked(*args: Any, **kwargs: Any) -> Any:
+                raise UnsupportedCapabilityError(
+                    "read_only_adapter_write_blocked", capability=name
+                )
+
+            return blocked
+        return attribute
+
+
+@runtime_checkable
+class AsyncPlatformAdapter(Protocol):
+    """The async shape a worker-facing adapter should expose.
+
+    This protocol documents the future direction; it is intentionally not
+    implemented by TIDAL yet.  :func:`to_async` provides the bridge so an async
+    worker can use today's synchronous adapters without blocking its loop.
+    """
+
+    async def export_library(self, sections: tuple[str, ...] | None = None) -> LibrarySnapshot: ...
+    async def get_liked_tracks(self) -> list[Track]: ...
+    async def save_track(self, track_id: str) -> None: ...
+
+
+def to_async(adapter: MusicPlatformAdapter) -> _AsyncBridge:
+    """Wrap a synchronous adapter so ``await`` runs it in a worker thread.
+
+    The bridge exposes the same method names as the underlying adapter, which
+    keeps future async call sites readable while the adapters stay synchronous
+    and proven.
+    """
+
+    return _AsyncBridge(adapter)
+
+
+class _AsyncBridge:
+    """Run synchronous adapter calls in threads (see :func:`to_async`)."""
+
+    def __init__(self, adapter: MusicPlatformAdapter) -> None:
+        self._adapter = adapter
+
+    def __getattr__(self, name: str) -> Any:
+        import asyncio
+
+        attribute = getattr(self._adapter, name)
+        if not callable(attribute):
+            return attribute
+
+        async def run(*args: Any, **kwargs: Any) -> Any:
+            return await asyncio.to_thread(attribute, *args, **kwargs)
+
+        return run

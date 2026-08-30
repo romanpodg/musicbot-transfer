@@ -1,0 +1,370 @@
+{
+  "language_name": "English",
+  "language": {
+    "choose": "🌐 Choose language / Выберите язык"
+  },
+  "app": {
+    "banner": "╔══════════════════════════╗\n║ 🎵 TIDAL Library Manager ║\n╚══════════════════════════╝",
+    "goodbye": "👋 Goodbye!",
+    "interrupted": "⏸ Operation interrupted. A resumable transfer checkpoint has been kept.",
+    "unexpected_error": "⚠️ The operation could not be completed safely. See the local log for a sanitized error record.",
+    "dry_run_enabled": "🧪 DRY RUN MODE",
+    "dry_run_mutation_blocked": "🧪 Dry run is active. TIDAL library changes were not made.",
+    "invalid_arguments": "⚠️ Unsupported command option. Use --dry-run or --diagnostics."
+  },
+  "menu": {
+    "choose": "Choose an action:",
+    "transfer": "1️⃣ Transfer library",
+    "backup": "2️⃣ Create backup",
+    "restore": "3️⃣ Restore backup",
+    "cleanup": "4️⃣ Clean library",
+    "account": "5️⃣ Account information",
+    "settings": "6️⃣ Settings",
+    "exit": "0️⃣ Exit",
+    "settings_choose": "⚙️ Settings",
+    "language": "1️⃣ Change language",
+    "disconnect_source": "2️⃣ Forget source account session",
+    "disconnect_destination": "3️⃣ Forget destination account session",
+    "back": "0️⃣ Back"
+  },
+  "summary": {
+    "account": "👤 Account: {account}",
+    "library": "📚 Library:",
+    "count_line": "{label}: {count}",
+    "source": "SOURCE ACCOUNT",
+    "destination": "DESTINATION ACCOUNT"
+  },
+  "category": {
+    "tracks": "🎵 Tracks",
+    "albums": "💿 Albums",
+    "artists": "👥 Artists",
+    "videos": "🎬 Videos",
+    "mixes": "📻 Mixes and Radio",
+    "folders": "📁 Playlist folders",
+    "playlists": "🎧 Playlists",
+    "playlist_items": "🎼 Playlist items"
+  },
+  "prompt": {
+    "answer": "➜ ",
+    "yes_no": "[Y/N] ➜ ",
+    "option_line": "{number} {label}",
+    "invalid_choice": "⚠️ Please choose one of the listed options.",
+    "invalid_yes_no": "⚠️ Please answer yes or no.",
+    "sort_choose": "↕️ Choose transfer order:",
+    "backup_choose": "🗂 Choose a backup to restore:",
+    "cleanup_choose": "🗑 Library cleanup"
+  },
+  "input": {
+    "yes": "y,yes",
+    "no": "n,no"
+  },
+  "sort": {
+    "newest": "1️⃣ Added date — newest first",
+    "oldest": "2️⃣ Added date — oldest first",
+    "alphabetical": "3️⃣ Alphabetical",
+    "artist": "4️⃣ Artist",
+    "album": "5️⃣ Album",
+    "original": "6️⃣ Original TIDAL order"
+  },
+  "auth": {
+    "open_url": "🔐 Open this TIDAL authorization link in your browser, approve access, then return here:\n{url}",
+    "session_not_saved": "ℹ️ The OAuth session will not be saved because a secure OS keyring is unavailable."
+  },
+  "confirmation": {
+    "warning_title": "⚠️ WARNING",
+    "danger_title": "🚨 DANGER",
+    "account": "Account: {account}",
+    "action": "Action: {action}",
+    "mutates_account": "This will modify your TIDAL account.",
+    "continue": "Continue?",
+    "deleting": "You are deleting: {summary}",
+    "irreversible": "This action cannot be undone.",
+    "type_phrase": "Type {phrase} to continue.",
+    "delete_phrase": "DELETE",
+    "transfer_action": "Transfer {count} tracks and related library items",
+    "restore_action": "Restore {count} tracks and related library items",
+    "resume_action": "Resume the previous transfer with {count} source tracks",
+    "resume_cleanup_action": "Resume cleanup of {count} selected library objects"
+  },
+  "transfer": {
+    "start": "Start transfer?",
+    "cancelled": "ℹ️ Transfer cancelled. No TIDAL data was changed.",
+    "completed": "✅ Transfer processing finished.",
+    "partial": "⚠️ Transfer finished with failures or unavailable items. Resume state was kept.",
+    "report_written": "📄 Verification report saved: {path}",
+    "state_invalid": "⚠️ The saved transfer state is invalid and cannot be resumed safely.",
+    "resume_detected": "⏯ Previous {operation} detected.",
+    "resume_question": "Resume it?",
+    "resume_declined": "ℹ️ The previous transfer state was kept for a later resume.",
+    "source_incomplete": "⚠️ Transfer was blocked because the source snapshot is incomplete. Create a complete backup or retry the read first."
+  },
+  "backup": {
+    "creating": "💾 Creating library backup…",
+    "completed": "✅ Backup saved: {path}",
+    "partial": "⚠️ Backup saved, but these sections are incomplete: {sections}",
+    "none": "ℹ️ No backups are available.",
+    "invalid": "⚠️ The selected backup cannot be read safely."
+  },
+  "restore": {
+    "summary": "Backup source account: {account}",
+    "cancelled": "ℹ️ Restore cancelled. No TIDAL data was changed."
+  },
+  "cleanup": {
+    "full": "1️⃣ Full library cleanup",
+    "tracks": "2️⃣ Favorite tracks only",
+    "albums": "3️⃣ Albums only",
+    "artists": "4️⃣ Artists only",
+    "playlists": "5️⃣ Playlists only",
+    "videos": "6️⃣ Videos only",
+    "mixes": "7️⃣ Mixes and Radio only",
+    "cancel": "0️⃣ Cancel",
+    "offer_backup": "Create a backup before deletion?",
+    "cancelled": "ℹ️ Cleanup cancelled. No TIDAL data was changed.",
+    "preparing": "🔎 Reviewing current library targets…",
+    "incomplete": "⚠️ Cleanup was blocked because the selected targets could not be read completely.",
+    "completed": "✅ Cleanup finished: {successful} succeeded, {failed} failed.",
+    "target_summary": "{count} selected library objects",
+    "deleting_started": "🗑 Removing selected library objects…",
+    "dry_run_would_delete": "Would delete:",
+    "dry_run_no_changes": "No TIDAL library changes were made.",
+    "resume_detected": "⚠️ Previous cleanup interrupted.",
+    "resume_progress": "Completed: {completed}/{total}",
+    "resume_question": "Continue cleanup?",
+    "resume_declined": "ℹ️ Cleanup state was kept so you can continue later.",
+    "state_invalid": "⚠️ The saved cleanup queue is invalid and cannot be resumed safely.",
+    "verify_remaining": "🔎 Verification complete. Remaining selected objects: {count}",
+    "verification_unavailable": "⚠️ Cleanup completed, but verification could not safely read every selected section."
+  },
+  "account": {
+    "unknown": "Unknown account",
+    "loading": "🔐 Connecting to TIDAL…",
+    "information": "👤 Account information",
+    "library_incomplete": "⚠️ Some library sections could not be read completely: {sections}"
+  },
+  "settings": {
+    "language_saved": "✅ Language preference saved.",
+    "source_forgotten": "✅ Source account session forgotten.",
+    "destination_forgotten": "✅ Destination account session forgotten."
+  },
+  "progress": {
+    "line": "{label}: [{bar}] {current}/{total}",
+    "scanning": "{label}: scanning… {current}",
+    "current": "Current: {item}",
+    "errors": "Errors: {errors}",
+    "item_unit": "item",
+    "not_available": "not available",
+    "postfix": "Current: {item} | Errors: {errors}",
+    "description": "{operation} {label}",
+    "operation": {
+      "transfer": "Transferring",
+      "backup": "Backing up",
+      "cleanup": "Removing",
+      "verification": "Verifying"
+    }
+  },
+  "retry": {
+    "attempt": "Attempt {attempt}/{total}",
+    "retrying": "⚠️ {reason}. Retrying in {seconds} seconds…",
+    "reason": {
+      "api_timeout": "Connection timeout",
+      "network_error": "Network connection failed",
+      "rate_limited": "TIDAL rate limit reached",
+      "api_server_error": "TIDAL service error",
+      "provider_error": "TIDAL request failed",
+      "item_unavailable": "Item is unavailable"
+    }
+  },
+  "shutdown": {
+    "stopping": "⚠️ Stopping safely…",
+    "saving_state": "Saving state…",
+    "progress_saved": "Progress saved: {completed}/{total}",
+    "continue_later": "You can continue later."
+  },
+  "diagnostics": {
+    "heading": "System check:",
+    "line": "{label}: {status}{detail}",
+    "label": {
+      "adapters": "Adapters",
+      "api": "API",
+      "backup": "Backup",
+      "config": "Config",
+      "keyring": "Keyring",
+      "logs": "Logs",
+      "python": "Python",
+      "state": "State",
+      "tidalapi": "tidalapi"
+    },
+    "status": {
+      "ok": "OK",
+      "error": "ERROR",
+      "found": "Found",
+      "missing": "Not found",
+      "available": "Available",
+      "unavailable": "Unavailable"
+    }
+  },
+  "operation": {
+    "transfer": "transfer",
+    "restore": "restore"
+  },
+  "errors": {
+    "account_id_missing": "⚠️ Internal error: an account record has no identifier.",
+    "account_missing": "⚠️ The service did not return an account for this session.",
+    "account_platform_id_missing": "⚠️ Internal error: an account record has no platform identifier.",
+    "album_source_id_missing": "⚠️ Internal error: an album arrived without a source identifier.",
+    "ambiguous_operation": "⚠️ The result of this operation is unknown. It was recorded for reconciliation, not retried blindly.",
+    "artist_source_id_missing": "⚠️ Internal error: an artist arrived without a source identifier.",
+    "authentication_failed": "⚠️ Authentication failed. Nothing was changed.",
+    "authorization_error": "⚠️ The service refused to authorize this action.",
+    "authorization_failed": "⚠️ The account is not authorized for this action.",
+    "capability_unknown": "⚠️ Internal error: unknown capability {capability}.",
+    "capability_unsupported": "⚠️ This platform does not support the requested operation ({capability}).",
+    "cleanup_confirmation_required": "⚠️ No deletion was performed because confirmation was not provided.",
+    "confirmation_required": "⚠️ No change was made because confirmation was not provided.",
+    "destination_identifier_missing": "⚠️ The item could not be matched on the destination, so it was not written.",
+    "favorite_category_unsupported": "⚠️ This library section is not supported by the service.",
+    "favorites_unavailable": "⚠️ The service could not return this favourites list.",
+    "folder_creation_failed": "⚠️ The folder could not be created.",
+    "invalid_state_transition": "⚠️ Invalid job state change: {current} → {target}.",
+    "item_unavailable": "⚠️ The item is not available for this account or region.",
+    "job_already_finished": "⚠️ This job has already finished and cannot be resumed.",
+    "job_not_ready_for_execution": "⚠️ The job is not ready to run. Build a plan first.",
+    "not_found": "⚠️ The item was not found on the destination service.",
+    "oauth_login_failed": "⚠️ Sign-in did not complete. Please connect the account again.",
+    "oauth_url_missing": "⚠️ The service did not return a sign-in link. Please try again.",
+    "operation_failed": "⚠️ The operation could not be completed safely. See the sanitized local log for details.",
+    "pagination_max_items_exceeded": "⚠️ The library is larger than the configured read limit.",
+    "pagination_max_pages_exceeded": "⚠️ The service kept returning pages past the configured page limit. Reading stopped.",
+    "pagination_repeated_page": "⚠️ The service returned the same page twice. Reading stopped to avoid an infinite loop.",
+    "partial_export": "⚠️ Some library sections could not be read completely: {sections}",
+    "permanent_platform_error": "⚠️ The service rejected the request. This item will not be retried automatically.",
+    "persistence_error": "⚠️ Local state could not be written safely. Nothing was changed.",
+    "platform_not_implemented": "⚠️ This platform is not implemented yet.",
+    "platform_not_registered": "⚠️ No adapter is registered for this platform.",
+    "playlist_creation_failed": "⚠️ The playlist could not be created.",
+    "playlist_creation_unconfirmed": "⚠️ The playlist may have been created, but the service did not confirm it. It was recorded for reconciliation.",
+    "playlist_deletion_failed": "⚠️ The playlist could not be deleted.",
+    "playlist_item_not_added": "⚠️ The track could not be added to the playlist.",
+    "playlist_resume_mismatch": "⚠️ The playlist on the destination does not match the plan. The item was left for reconciliation.",
+    "playlist_source_id_missing": "⚠️ Internal error: a playlist arrived without a source identifier.",
+    "provider_id_missing": "⚠️ The service response is missing an identifier. Nothing was changed.",
+    "provider_mutation_failed": "⚠️ The service did not complete the write.",
+    "provider_mutation_rejected": "⚠️ The service rejected the write.",
+    "rate_limited": "⚠️ The service rate limit was reached. Try again later.",
+    "rate_limited_write_unconfirmed": "⚠️ The rate limit was reached and the result is unknown. It was recorded for reconciliation, not retried blindly.",
+    "read_only_adapter_write_blocked": "⚠️ Internal error: a write was attempted while only reading was allowed ({capability}).",
+    "same_account_transfer": "⚠️ Source and destination are the same account. Nothing to transfer.",
+    "session_expired": "⚠️ The saved session expired. Please connect the account again.",
+    "session_initialization_failed": "⚠️ The session could not be started. Please connect the account again.",
+    "session_not_valid": "⚠️ The saved session is no longer valid. Please connect the account again.",
+    "snapshot_account_missing": "⚠️ Internal error: a library snapshot arrived without an account.",
+    "temporary_platform_error": "⚠️ The service is temporarily unavailable. The operation can be resumed.",
+    "tidalapi_missing": "⚠️ TIDAL integration is unavailable. Install the project requirements and try again.",
+    "track_source_id_missing": "⚠️ Internal error: a track arrived without a source identifier.",
+    "transfer_confirmation_required": "⚠️ No change was made because confirmation was not provided.",
+    "unavailable": "⚠️ The item is not available for this account or region.",
+    "unknown": "⚠️ {code}",
+    "unsupported_capability": "⚠️ This platform does not support the requested operation ({capability})."
+  },
+  "platform": {
+    "tidal": "TIDAL",
+    "spotify": "Spotify",
+    "apple_music": "Apple Music",
+    "deezer": "Deezer",
+    "youtube_music": "YouTube Music"
+  },
+  "accounts": {
+    "heading": "Connected accounts",
+    "connected": "Connected",
+    "not_connected": "Not connected",
+    "account_line": "{platform}\n{status}\n{name}",
+    "not_implemented": "Not implemented yet",
+    "disconnected": "✅ {platform} session forgotten.",
+    "reconnect_hint": "Use the account settings to connect {platform}."
+  },
+  "plan": {
+    "heading": "📋 Transfer plan (read-only, nothing has been changed yet)",
+    "route": "{source} ➜ {destination}",
+    "total_items": "Items: {count}",
+    "matched": "Matched: {count}",
+    "unmatched": "Not found on destination: {count}",
+    "already_exists": "Already on destination: {count}",
+    "ambiguous": "Needs review: {count}",
+    "content_line": "{label}: {count}",
+    "warning_line": "⚠️ {warning}",
+    "confirm": "Execute this plan?",
+    "cancelled": "ℹ️ Plan not executed. No changes were made."
+  },
+  "job": {
+    "status": {
+      "created": "Created",
+      "authenticating": "Authenticating",
+      "exporting": "Reading source library",
+      "normalizing": "Normalizing metadata",
+      "matching": "Matching tracks",
+      "planning": "Building plan",
+      "waiting_confirmation": "Waiting for confirmation",
+      "importing": "Writing to destination",
+      "verifying": "Verifying result",
+      "completed": "Completed",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "paused": "Paused"
+    },
+    "status_line": "Status: {status}",
+    "job_line": "Job {job_id}: {status}",
+    "progress_line": "{status}: {current}/{total}"
+  },
+  "item": {
+    "status": {
+      "pending": "Pending",
+      "matched": "Matched",
+      "transferred": "Transferred",
+      "already_exists": "Already existed",
+      "not_found": "Not found on destination",
+      "ambiguous": "Ambiguous — check destination",
+      "unavailable": "Unavailable in region",
+      "skipped": "Skipped",
+      "failed": "Failed"
+    }
+  },
+  "matching": {
+    "method": {
+      "isrc": "ISRC",
+      "direct_id": "Same platform id",
+      "exact_metadata": "Exact metadata",
+      "normalized_metadata": "Normalized metadata",
+      "fuzzy_metadata": "Fuzzy metadata",
+      "none": "No match"
+    },
+    "score_line": "Match: {method} ({score:.2f})",
+    "warning_explicit_to_clean": "Destination only has the clean version.",
+    "warning_version_mismatch": "Destination has a different version (remaster/live/remix).",
+    "warning_duration_mismatch": "Duration differs by more than 15 seconds."
+  },
+  "verification": {
+    "heading": "🔎 Verification",
+    "ok": "✅ Destination matches the plan (identifiers and order).",
+    "missing": "Missing on destination: {count}",
+    "unexpected": "Unexpected on destination: {count}",
+    "order_mismatches": "Order differences: {count}",
+    "unverifiable": "⚠️ Destination does not expose {section}; verification skipped.",
+    "report_written": "📄 Verification report saved: {path}"
+  },
+  "report": {
+    "heading": "📊 Transfer report",
+    "transferred": "Transferred: {count}",
+    "already_existed": "Already existed: {count}",
+    "failed": "Failed: {count}",
+    "not_found": "Not found: {count}",
+    "unavailable": "Unavailable: {count}",
+    "ambiguous": "Ambiguous: {count}",
+    "skipped": "Skipped: {count}",
+    "duration": "Duration: {seconds:.1f}s"
+  },
+  "resume": {
+    "pending": "{count} items remain from the previous run.",
+    "nothing_pending": "Nothing left to resume.",
+    "retry_created": "Created retry job with {count} items."
+  }
+}

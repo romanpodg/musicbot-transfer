@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "music-transfer"
+version = "0.1.0"
+description = "Platform-independent music library transfer core (TIDAL first)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+dependencies = [
+    # Upper bounds mirror the legacy tidal_manager/requirements.txt: these are
+    # the versions the TIDAL adapter was actually developed and tested against.
+    # tidalapi in particular changes its session/pagination behaviour between
+    # minor releases, so widening this range requires re-running the pagination
+    # regression suite.
+    "tidalapi>=0.8.11,<0.9.0",
+    "requests>=2.31,<3.0",
+    "keyring>=25.0,<26.0",
+    "tqdm>=4.66,<5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+music-transfer = "music_transfer.interfaces.cli.main:main"
+
+[tool.setuptools.packages.find]
+include = ["music_transfer*"]
+
+[tool.setuptools.package-data]
+music_transfer = ["locales/*/messages.json"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["music_transfer", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "BLE", "C4", "SIM"]
+ignore = [
+    # Long docstrings in this codebase are deliberate: every module explains
+    # *why* a rule exists, which is what keeps the invariants from eroding.
+    "E501",
+    # `except Exception` around a single item write is intentional; the item is
+    # recorded as failed and the job continues.  See core/transfer/executor.py.
+    "BLE001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["SIM"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = false
+ignore_missing_imports = true

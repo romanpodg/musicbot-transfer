@@ -35,6 +35,7 @@ from ...core.enums import (
     JobStatus,
     MutationState,
     Platform,
+    PreconditionExpectation,
     TransferOperation,
     VerificationStatus,
 )
@@ -42,14 +43,13 @@ from ...core.errors import (
     AuthenticationError,
     AuthorizationError,
     ConfirmationRequired,
+    InvalidPersistedStateError,
     InvalidStateTransition,
     PlanConfirmationMismatch,
     PlanIntegrityError,
     PlanStaleError,
     PlanValidationUnavailableError,
-    TemporaryPlatformError,
     TransferConfigurationError,
-    UnsupportedCapabilityError,
 )
 from ...core.matching import MatchingPolicy, TrackMatcher
 from ...core.ports import MusicPlatformAdapter, TransferItemRepository, TransferJobRepository
@@ -429,33 +429,80 @@ class TransferService:
                 or plan.revision != job.confirmed_plan_revision
                 or plan.plan_hash != job.confirmed_plan_hash
             ):
+                job.confirmed_plan_id = None
+                job.confirmed_plan_revision = None
+                job.confirmed_plan_hash = None
+                job.confirmed_at = None
+                job.error_code = "plan_stale"
+                self._jobs.update(job)
                 raise PlanStaleError("plan_stale")
 
-            # Execution item drift check (Invariant H, Section 27-28)
-            if not has_started_execution and plan.items:
-                # Build map of plan items by (entity_type, container_source_id or "", original_position or 0, source_id)
-                # Compare plan-critical fields
-                plan_item_map = {
-                    (it.entity_type, it.container_source_id or "", it.original_position or 0, it.source_id): it
-                    for it in plan.items
-                }
-                drift_detected = False
-                for ci in current_items:
-                    key = (ci.entity_type, ci.container_source_id or "", ci.original_position or 0, ci.source_id)
-                    pi = plan_item_map.get(key)
-                    if pi is None:
-                        drift_detected = True
-                        break
-                    if (
-                        ci.destination_id != pi.destination_id
-                        or ci.operation != pi.operation
-                        or ci.write_position != pi.write_position
-                        or ci.container_destination_id != pi.container_destination_id
-                    ):
-                        drift_detected = True
-                        break
+            # Material job context drift check (Sections 7-9, 15)
+            context_drift = False
+            plan_settings = plan.metadata.get("settings")
+            if plan_settings is not None:
+                if job.settings.as_dict() != plan_settings:
+                    context_drift = True
+            else:
+                if "ordering" in plan.metadata and str(job.settings.ordering) != str(plan.metadata["ordering"]):
+                    context_drift = True
+                if "dry_run" in plan.metadata and bool(job.settings.dry_run) != bool(plan.metadata["dry_run"]):
+                    context_drift = True
 
-                if drift_detected:
+            plan_req_content = plan.metadata.get("requested_content")
+            if plan_req_content is not None:
+                current_req_content = [c.value for c in job.requested_content]
+                if current_req_content != list(plan_req_content):
+                    context_drift = True
+
+            if (
+                "source_account_id" in plan.metadata
+                and job.source_account_id != plan.metadata.get("source_account_id")
+            ):
+                context_drift = True
+
+            if (
+                "destination_account_id" in plan.metadata
+                and job.destination_account_id != plan.metadata.get("destination_account_id")
+            ):
+                context_drift = True
+
+            if job.source_platform != plan.source_platform or job.destination_platform != plan.destination_platform:
+                context_drift = True
+
+            if context_drift:
+                job.confirmed_plan_id = None
+                job.confirmed_plan_revision = None
+                job.confirmed_plan_hash = None
+                job.confirmed_at = None
+                job.error_code = "plan_stale"
+                self._jobs.update(job)
+                self._logger.warning("event=plan_stale reason=job_context_drift job_id=%s", job.id)
+                raise PlanStaleError("plan_stale")
+
+            # Execution item exact membership and order check (Sections 2-6)
+            if not has_started_execution:
+                item_drift = False
+                if len(current_items) != len(plan.items):
+                    item_drift = True
+                else:
+                    for pi, ci in zip(plan.items, current_items, strict=True):
+                        if (
+                            ci.entity_type != pi.entity_type
+                            or ci.source_id != pi.source_id
+                            or ci.destination_id != pi.destination_id
+                            or ci.operation != pi.operation
+                            or ci.status != pi.planned_status
+                            or ci.match_method != pi.match_method
+                            or ci.container_source_id != pi.container_source_id
+                            or ci.container_destination_id != pi.container_destination_id
+                            or ci.original_position != pi.original_position
+                            or ci.write_position != pi.write_position
+                        ):
+                            item_drift = True
+                            break
+
+                if item_drift:
                     job.confirmed_plan_id = None
                     job.confirmed_plan_revision = None
                     job.confirmed_plan_hash = None
@@ -465,7 +512,7 @@ class TransferService:
                     self._logger.warning("event=plan_stale reason=execution_intent_drift job_id=%s", job.id)
                     raise PlanStaleError("plan_stale")
 
-            # Destination precondition drift check (Invariant I, K, M, Section 30-39)
+            # Destination precondition validation (Sections 10-13)
             if not has_started_execution and plan.preconditions:
                 try:
                     dest_state = destination.get_destination_state()
@@ -477,42 +524,55 @@ class TransferService:
                     job.finished_at = job.updated_at
                     self._jobs.update(job)
                     raise
-                except TemporaryPlatformError as err:
+                except Exception as err:
                     raise PlanValidationUnavailableError("plan_validation_unavailable") from err
-                except UnsupportedCapabilityError:
-                    dest_state = None
 
-                if dest_state is not None:
-                    for pre in plan.preconditions:
-                        if not dest_state.is_trustworthy(pre.section):
-                            continue
-                        if pre.section == "tracks":
-                            actual = dest_state.has_track(pre.destination_id)
-                        elif pre.section == "albums":
-                            actual = pre.destination_id in dest_state.album_ids
-                        elif pre.section == "artists":
-                            actual = pre.destination_id in dest_state.artist_ids
-                        elif pre.section == "playlists":
-                            actual = pre.destination_id in dest_state.playlist_ids
-                        else:
-                            continue
+                if dest_state is None:
+                    raise PlanValidationUnavailableError("plan_validation_unavailable")
 
-                        expected = (pre.expected == "present")
-                        if actual != expected:
-                            job.confirmed_plan_id = None
-                            job.confirmed_plan_revision = None
-                            job.confirmed_plan_hash = None
-                            job.confirmed_at = None
-                            job.error_code = "plan_stale"
-                            self._jobs.update(job)
-                            self._logger.warning(
-                                "event=plan_stale reason=destination_drift job_id=%s destination_id=%s expected=%s actual=%s",
-                                job.id,
-                                pre.destination_id,
-                                expected,
-                                actual,
-                            )
-                            raise PlanStaleError("plan_stale")
+                for pre in plan.preconditions:
+                    if not dest_state.is_trustworthy(pre.section):
+                        raise PlanValidationUnavailableError("plan_validation_unavailable")
+
+                    if pre.section == "tracks":
+                        actual = dest_state.has_track(pre.destination_id)
+                    elif pre.section == "albums":
+                        actual = pre.destination_id in dest_state.album_ids
+                    elif pre.section == "artists":
+                        actual = pre.destination_id in dest_state.artist_ids
+                    elif pre.section == "playlists":
+                        actual = pre.destination_id in dest_state.playlist_ids
+                    else:
+                        raise InvalidPersistedStateError(
+                            "invalid_persisted_state",
+                            f"Invalid precondition section: '{pre.section}'",
+                        )
+
+                    if pre.expected == PreconditionExpectation.PRESENT or pre.expected == "present":
+                        expected = True
+                    elif pre.expected == PreconditionExpectation.ABSENT or pre.expected == "absent":
+                        expected = False
+                    else:
+                        raise InvalidPersistedStateError(
+                            "invalid_persisted_state",
+                            f"Invalid precondition expectation: '{pre.expected}'",
+                        )
+
+                    if actual != expected:
+                        job.confirmed_plan_id = None
+                        job.confirmed_plan_revision = None
+                        job.confirmed_plan_hash = None
+                        job.confirmed_at = None
+                        job.error_code = "plan_stale"
+                        self._jobs.update(job)
+                        self._logger.warning(
+                            "event=plan_stale reason=destination_drift job_id=%s destination_id=%s expected=%s actual=%s",
+                            job.id,
+                            pre.destination_id,
+                            expected,
+                            actual,
+                        )
+                        raise PlanStaleError("plan_stale")
 
 
         if job.status is not JobStatus.IMPORTING:

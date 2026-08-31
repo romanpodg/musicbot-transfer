@@ -43,6 +43,7 @@ from ..enums import (
     ItemStatus,
     MatchMethod,
     MatchOutcome,
+    PreconditionExpectation,
     TransferOperation,
 )
 from ..errors import TransferConfigurationError, UnsupportedCapabilityError
@@ -200,7 +201,7 @@ class TransferPlanner:
                         PlanPrecondition(
                             entity_type=it.entity_type,
                             destination_id=it.destination_id,
-                            expected="present",
+                            expected=PreconditionExpectation.PRESENT,
                             section=section,
                         )
                     )
@@ -209,7 +210,7 @@ class TransferPlanner:
                         PlanPrecondition(
                             entity_type=it.entity_type,
                             destination_id=it.destination_id,
-                            expected="absent",
+                            expected=PreconditionExpectation.ABSENT,
                             section=section,
                         )
                     )
@@ -225,9 +226,12 @@ class TransferPlanner:
             source_incomplete=source.is_partial,
             metadata={
                 "destination_state": state.as_dict() if state is not None else None,
-                "ordering": str(job.settings.ordering),
+                "settings": job.settings.as_dict(),
+                "requested_content": [c.value for c in job.requested_content],
                 "source_account_id": job.source_account_id,
                 "destination_account_id": job.destination_account_id,
+                "source_platform": job.source_platform.value,
+                "destination_platform": job.destination_platform.value,
             },
         )
         self._logger.info(

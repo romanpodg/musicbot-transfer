@@ -20,6 +20,7 @@ from ..enums import (
     MutationState,
     OrderingMode,
     Platform,
+    PreconditionExpectation,
     TransferOperation,
     VerificationStatus,
 )
@@ -661,12 +662,17 @@ class TransferPlanItem:
             "match_method": self.match_method.value,
             "match_score": round(self.match_score, 4),
             "operation": self.operation.value,
-            "original_position": self.original_position if self.original_position is not None else -1,
+            "original_position": self.original_position,
             "planned_status": self.planned_status.value,
             "source_id": self.source_id,
             "source_metadata": plan_meta,
-            "write_position": self.write_position if self.write_position is not None else -1,
+            "write_position": self.write_position,
         }
+
+
+VALID_PRECONDITION_SECTIONS: frozenset[str] = frozenset(
+    {"tracks", "albums", "artists", "playlists"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -675,31 +681,100 @@ class PlanPrecondition:
 
     entity_type: EntityType
     destination_id: str
-    expected: str  # "present" | "absent"
+    expected: PreconditionExpectation | str  # "present" | "absent"
     section: str   # "tracks" | "albums" | "artists" | "playlists"
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entity_type, EntityType):
+            try:
+                object.__setattr__(self, "entity_type", EntityType(str(self.entity_type)))
+            except ValueError as err:
+                raise InvalidPersistedStateError(
+                    "invalid_persisted_state",
+                    f"Invalid precondition entity_type: '{self.entity_type}'",
+                ) from err
+
+        if not isinstance(self.expected, PreconditionExpectation):
+            try:
+                object.__setattr__(
+                    self, "expected", PreconditionExpectation(str(self.expected))
+                )
+            except ValueError as err:
+                raise InvalidPersistedStateError(
+                    "invalid_persisted_state",
+                    f"Invalid precondition expected: '{self.expected}'",
+                ) from err
+
+        if self.section not in VALID_PRECONDITION_SECTIONS:
+            raise InvalidPersistedStateError(
+                "invalid_persisted_state",
+                f"Invalid precondition section: '{self.section}'",
+            )
+
+        if not self.destination_id:
+            raise InvalidPersistedStateError(
+                "invalid_persisted_state",
+                "Precondition destination_id cannot be empty",
+            )
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "entity_type": self.entity_type.value,
             "destination_id": self.destination_id,
-            "expected": self.expected,
+            "expected": str(self.expected),
             "section": self.section,
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> PlanPrecondition:
+        if not isinstance(value, dict):
+            raise InvalidPersistedStateError(
+                "invalid_persisted_state", "Invalid precondition record: must be a dict"
+            )
+        raw_entity_type = value.get("entity_type")
+        try:
+            entity_type = EntityType(str(raw_entity_type))
+        except ValueError as err:
+            raise InvalidPersistedStateError(
+                "invalid_persisted_state",
+                f"Invalid precondition entity_type: '{raw_entity_type}'",
+            ) from err
+
+        raw_expected = value.get("expected")
+        try:
+            expected = PreconditionExpectation(str(raw_expected))
+        except ValueError as err:
+            raise InvalidPersistedStateError(
+                "invalid_persisted_state",
+                f"Invalid precondition expected: '{raw_expected}'",
+            ) from err
+
+        raw_section = str(value.get("section", ""))
+        if raw_section not in VALID_PRECONDITION_SECTIONS:
+            raise InvalidPersistedStateError(
+                "invalid_persisted_state",
+                f"Invalid precondition section: '{raw_section}'",
+            )
+
+        destination_id = str(value.get("destination_id", ""))
+        if not destination_id:
+            raise InvalidPersistedStateError(
+                "invalid_persisted_state",
+                "Precondition destination_id cannot be empty",
+            )
+
         return cls(
-            entity_type=EntityType(str(value.get("entity_type"))),
-            destination_id=str(value.get("destination_id", "")),
-            expected=str(value.get("expected", "present")),
-            section=str(value.get("section", "")),
+            entity_type=entity_type,
+            destination_id=destination_id,
+            expected=expected,
+            section=raw_section,
         )
 
     def canonical_dict(self) -> dict[str, Any]:
         return {
             "destination_id": self.destination_id,
             "entity_type": self.entity_type.value,
-            "expected": self.expected,
+            "expected": str(self.expected),
             "section": self.section,
         }
 
@@ -734,23 +809,32 @@ class TransferPlan:
 
         Excludes: plan_hash, created_at, runtime execution state.
         Includes: schema_version, job_id, platforms, incompleteness flags,
-        context metadata, sorted items, sorted preconditions.
+        full material settings/context, approved-order items, sorted preconditions.
         """
-        context_keys = ("ordering", "skip_already_existing", "source_account_id", "destination_account_id")
-        plan_context: dict[str, Any] = {}
-        for k in context_keys:
-            if k in self.metadata and self.metadata[k] is not None:
-                plan_context[k] = str(self.metadata[k])
+        raw_settings = self.metadata.get("settings")
+        if isinstance(raw_settings, dict):
+            settings_dict = TransferSettings.from_dict(raw_settings).as_dict()
+        else:
+            settings_dict = {
+                "ordering": str(self.metadata.get("ordering", "source_order")),
+                "preserve_visible_order": bool(self.metadata.get("preserve_visible_order", False)),
+                "allow_explicit_to_clean_fallback": bool(self.metadata.get("allow_explicit_to_clean_fallback", False)),
+                "allow_duplicates_in_playlists": bool(self.metadata.get("allow_duplicates_in_playlists", True)),
+                "skip_already_existing": bool(self.metadata.get("skip_already_existing", True)),
+                "max_item_attempts": int(self.metadata.get("max_item_attempts", 3)),
+                "dry_run": bool(self.metadata.get("dry_run", False)),
+            }
 
-        sorted_items = sorted(
-            [item.canonical_dict() for item in self.items],
-            key=lambda d: (
-                d["entity_type"],
-                d["container_source_id"],
-                d["original_position"],
-                d["source_id"],
-            ),
-        )
+        raw_content = self.metadata.get("requested_content")
+        if isinstance(raw_content, (list, tuple)):
+            requested_content = [str(c) for c in raw_content]
+        else:
+            requested_content = ["liked_tracks"]
+
+        source_account_id = self.metadata.get("source_account_id")
+        destination_account_id = self.metadata.get("destination_account_id")
+
+        items_payload = [item.canonical_dict() for item in self.items]
 
         sorted_preconditions = sorted(
             [p.canonical_dict() for p in self.preconditions],
@@ -763,13 +847,16 @@ class TransferPlan:
         )
 
         return {
+            "destination_account_id": str(destination_account_id) if destination_account_id is not None else None,
             "destination_incomplete": bool(self.destination_incomplete),
             "destination_platform": self.destination_platform.value,
-            "items": sorted_items,
+            "items": items_payload,
             "job_id": self.job_id,
-            "metadata_context": plan_context,
             "preconditions": sorted_preconditions,
+            "requested_content": requested_content,
             "schema_version": self.schema_version,
+            "settings": settings_dict,
+            "source_account_id": str(source_account_id) if source_account_id is not None else None,
             "source_incomplete": bool(self.source_incomplete),
             "source_platform": self.source_platform.value,
         }
@@ -839,11 +926,17 @@ class TransferPlan:
                     )
 
         raw_preconditions = value.get("preconditions") or []
-        preconditions = tuple(
-            p if isinstance(p, PlanPrecondition) else PlanPrecondition.from_dict(p)
-            for p in raw_preconditions
-            if isinstance(p, (PlanPrecondition, dict))
-        )
+        preconditions_list: list[PlanPrecondition] = []
+        for p in raw_preconditions:
+            if isinstance(p, PlanPrecondition):
+                preconditions_list.append(p)
+            elif isinstance(p, dict):
+                preconditions_list.append(PlanPrecondition.from_dict(p))
+            else:
+                raise InvalidPersistedStateError(
+                    "invalid_persisted_state", f"Invalid precondition entry: {p}"
+                )
+        preconditions = tuple(preconditions_list)
 
         summary_data = value.get("summary")
         summary = (

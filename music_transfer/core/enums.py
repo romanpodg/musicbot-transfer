@@ -213,3 +213,10 @@ class MutationState(StrEnum):
     IN_FLIGHT = "in_flight"
 
 
+class PreconditionExpectation(StrEnum):
+    """The expected presence of an entity at the destination before execution."""
+
+    PRESENT = "present"
+    ABSENT = "absent"
+
+

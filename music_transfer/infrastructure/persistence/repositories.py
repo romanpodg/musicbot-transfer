@@ -171,7 +171,6 @@ class JsonTransferItemRepository(TransferItemRepository):
         self, job_id: str, *, statuses: tuple[ItemStatus, ...] | None = None
     ) -> list[TransferItem]:
         items = self.load(job_id)
-        items.sort(key=lambda item: (item.original_position, item.id))
         if statuses is None:
             return items
         return [item for item in items if item.status in statuses]

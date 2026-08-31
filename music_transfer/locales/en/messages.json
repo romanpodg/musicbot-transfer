@@ -225,6 +225,7 @@
     "favorite_category_unsupported": "⚠️ This library section is not supported by the service.",
     "favorites_unavailable": "⚠️ The service could not return this favourites list.",
     "folder_creation_failed": "⚠️ The folder could not be created.",
+    "invalid_persisted_state": "⚠️ Saved state contains invalid or unrecognizable data.",
     "invalid_state_transition": "⚠️ Invalid job state change: {current} → {target}.",
     "item_unavailable": "⚠️ The item is not available for this account or region.",
     "job_already_finished": "⚠️ This job has already finished and cannot be resumed.",

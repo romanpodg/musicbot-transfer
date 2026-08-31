@@ -8,27 +8,35 @@ from pathlib import Path
 
 from music_transfer.app.services import TransferService
 from music_transfer.core.domain import (
+    PlanPrecondition,
     TransferItem,
     TransferPlan,
+    TransferPlanItem,
+    TransferSettings,
 )
 from music_transfer.core.enums import (
     ContentType,
     EntityType,
     ItemStatus,
     JobStatus,
+    MatchMethod,
     MutationState,
+    OrderingMode,
     Platform,
+    PreconditionExpectation,
     TransferOperation,
     VerificationStatus,
 )
 from music_transfer.core.errors import (
     AuthenticationError,
     ConfirmationRequired,
+    InvalidPersistedStateError,
     PlanConfirmationMismatch,
     PlanIntegrityError,
     PlanStaleError,
     PlanValidationUnavailableError,
     TemporaryPlatformError,
+    UnsupportedCapabilityError,
 )
 from music_transfer.core.ports import DestinationState
 from music_transfer.infrastructure.persistence import (
@@ -134,6 +142,62 @@ class PlanIdentityAndRevisioningTests(unittest.TestCase):
         assert rev2 is not None
         self.assertEqual(rev1.plan_id, plan1.plan_id)
         self.assertEqual(rev2.plan_id, plan2.plan_id)
+
+    def test_reordering_plan_items_changes_plan_hash(self) -> None:
+        item_a = TransferPlanItem(
+            entity_type=EntityType.TRACK,
+            source_id="t1",
+            destination_id="d1",
+            operation=TransferOperation.SAVE_TRACK,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            original_position=0,
+        )
+        item_b = TransferPlanItem(
+            entity_type=EntityType.TRACK,
+            source_id="t2",
+            destination_id="d2",
+            operation=TransferOperation.SAVE_TRACK,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            original_position=1,
+        )
+
+        plan_ab = TransferPlan.create("job_1", revision=1, items=(item_a, item_b))
+        plan_ba = TransferPlan.create("job_1", revision=1, items=(item_b, item_a))
+
+        self.assertNotEqual(plan_ab.plan_hash, plan_ba.plan_hash)
+
+    def test_none_and_zero_positions_do_not_collide_in_plan_identity(self) -> None:
+        item_pos_zero = TransferPlanItem(
+            entity_type=EntityType.TRACK,
+            source_id="t1",
+            destination_id="d1",
+            operation=TransferOperation.SAVE_TRACK,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            original_position=0,
+        )
+        item_pos_none = TransferPlanItem(
+            entity_type=EntityType.TRACK,
+            source_id="t1",
+            destination_id="d1",
+            operation=TransferOperation.SAVE_TRACK,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            original_position=None,
+        )
+
+        self.assertNotEqual(item_pos_zero.canonical_dict(), item_pos_none.canonical_dict())
+
+        plan_zero = TransferPlan.create("job_1", revision=1, items=(item_pos_zero,))
+        plan_none = TransferPlan.create("job_1", revision=1, items=(item_pos_none,))
+
+        self.assertNotEqual(plan_zero.plan_hash, plan_none.plan_hash)
 
 
 class PlanConfirmationSafetyTests(unittest.TestCase):
@@ -449,6 +513,287 @@ class PlanIntegrityAndDriftTests(unittest.TestCase):
         self.assertEqual(reloaded.status, JobStatus.FAILED)
         self.assertEqual(reloaded.verification_status, VerificationStatus.NOT_RUN)
         self.assertEqual(destination.write_calls, [])
+
+    def test_missing_runtime_item_from_confirmed_plan_is_rejected(self) -> None:
+        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL)
+        source = FakePlatformAdapter(
+            tracks=[track("Track 1", identifier="t1"), track("Track 2", identifier="t2")]
+        )
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.assertEqual(len(plan.items), 2)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Remove item 2 from runtime repository (leaving incomplete subset)
+        items = self.service.items.list_for_job(job.id)
+        self.assertEqual(len(items), 2)
+        self.service.items.replace_for_job(job.id, [items[0]])
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_extra_runtime_item_is_rejected(self) -> None:
+        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL)
+        source = FakePlatformAdapter(tracks=[track("Track 1", identifier="t1")])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.assertEqual(len(plan.items), 1)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Inject extra runtime item
+        items = self.service.items.list_for_job(job.id)
+        extra_item = TransferItem.create(
+            job.id,
+            EntityType.TRACK,
+            Platform.TIDAL,
+            "t2",
+            Platform.TIDAL,
+            original_position=1,
+            operation=TransferOperation.SAVE_TRACK,
+        )
+        extra_item.destination_id = "t2"
+        extra_item.status = ItemStatus.MATCHED
+        self.service.items.replace_for_job(job.id, [items[0], extra_item])
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_runtime_item_reordering_is_rejected_before_write(self) -> None:
+        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL)
+        source = FakePlatformAdapter(
+            tracks=[track("Track 1", identifier="t1"), track("Track 2", identifier="t2")]
+        )
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.assertEqual(len(plan.items), 2)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Reorder runtime items in repository [t2, t1]
+        items = self.service.items.list_for_job(job.id)
+        self.service.items.replace_for_job(job.id, [items[1], items[0]])
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_requested_content_change_stales_confirmed_plan(self) -> None:
+        job = self.service.create_job(
+            Platform.TIDAL,
+            Platform.TIDAL,
+            content=(ContentType.LIKED_TRACKS,),
+        )
+        source = FakePlatformAdapter(tracks=[track("Track 1", identifier="t1")])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Mutate requested_content before execution
+        job.requested_content = (ContentType.LIKED_TRACKS, ContentType.SAVED_ALBUMS)
+        self.service.jobs.update(job)
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_dry_run_change_stales_confirmed_plan(self) -> None:
+        job = self.service.create_job(
+            Platform.TIDAL,
+            Platform.TIDAL,
+            settings=TransferSettings(dry_run=True),
+        )
+        source = FakePlatformAdapter(tracks=[track("Track 1", identifier="t1")])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Mutate dry_run from True to False before execution
+        job.settings = TransferSettings(dry_run=False)
+        self.service.jobs.update(job)
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_ordering_change_stales_confirmed_plan(self) -> None:
+        job = self.service.create_job(
+            Platform.TIDAL,
+            Platform.TIDAL,
+            settings=TransferSettings(ordering=OrderingMode.SOURCE_ORDER),
+        )
+        source = FakePlatformAdapter(tracks=[track("Track 1", identifier="t1")])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Mutate ordering before execution
+        job.settings = TransferSettings(ordering=OrderingMode.ALPHABETICAL)
+        self.service.jobs.update(job)
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_destination_account_change_stales_confirmed_plan(self) -> None:
+        job = self.service.create_job(
+            Platform.TIDAL,
+            Platform.TIDAL,
+        )
+        job.destination_account_id = "acc_original"
+        self.service.jobs.update(job)
+        source = FakePlatformAdapter(tracks=[track("Track 1", identifier="t1")])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Mutate destination_account_id before execution
+        job.destination_account_id = "acc_changed"
+        self.service.jobs.update(job)
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_precondition_read_unsupported_fails_closed(self) -> None:
+        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL)
+        source = FakePlatformAdapter(tracks=[track("Track 1", identifier="t1")])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.assertTrue(len(plan.preconditions) > 0)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Make destination throw UnsupportedCapabilityError during preflight check
+        destination.fail_on.add("get_destination_state")
+        destination.error_factory = lambda: UnsupportedCapabilityError("get_destination_state")
+
+        with self.assertRaises(PlanValidationUnavailableError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_current_precondition_section_untrustworthy_fails_closed(self) -> None:
+        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL)
+        source = FakePlatformAdapter(tracks=[track("Track 1", identifier="t1")])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.assertTrue(len(plan.preconditions) > 0)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Destination returns untrustworthy section for precondition check
+        destination.get_destination_state = lambda: DestinationState(  # type: ignore[method-assign]
+            platform=Platform.TIDAL,
+            incomplete_sections=("tracks",),
+        )
+
+        with self.assertRaises(PlanValidationUnavailableError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.saved_tracks, [])
+
+    def test_unknown_precondition_expectation_fails_closed(self) -> None:
+        with self.assertRaises(InvalidPersistedStateError):
+            PlanPrecondition(
+                entity_type=EntityType.TRACK,
+                destination_id="t1",
+                expected="unknown_future_expectation",  # type: ignore[arg-type]
+                section="tracks",
+            )
+
+        with self.assertRaises(InvalidPersistedStateError):
+            PlanPrecondition.from_dict({
+                "entity_type": "track",
+                "destination_id": "t1",
+                "expected": "unknown_future_expectation",
+                "section": "tracks",
+            })
+
+    def test_unknown_precondition_section_fails_closed(self) -> None:
+        with self.assertRaises(InvalidPersistedStateError):
+            PlanPrecondition(
+                entity_type=EntityType.TRACK,
+                destination_id="t1",
+                expected=PreconditionExpectation.PRESENT,
+                section="unknown_section",
+            )
+
+        with self.assertRaises(InvalidPersistedStateError):
+            PlanPrecondition.from_dict({
+                "entity_type": "track",
+                "destination_id": "t1",
+                "expected": "present",
+                "section": "unknown_section",
+            })
 
 
 class ResumeAndCompatibilityTests(unittest.TestCase):

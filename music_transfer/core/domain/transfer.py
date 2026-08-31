@@ -22,6 +22,7 @@ from ..enums import (
     Platform,
     TransferOperation,
 )
+from ..errors import InvalidPersistedStateError
 
 
 def utc_now() -> str:
@@ -443,12 +444,19 @@ class TransferItem:
                 EntityType.PLAYLIST_ITEM: TransferOperation.ADD_PLAYLIST_ITEM,
             }.get(entity_type, TransferOperation.NONE)
 
-        raw_mutation_state = value.get("mutation_state")
-        if raw_mutation_state:
+        # Invariant: missing mutation_state defaults to NONE for backward compatibility (Case A).
+        # Explicit known values parse normally (Case B).
+        # Explicit unknown/corrupted values MUST fail closed by raising InvalidPersistedStateError (Case C),
+        # ensuring that an unknown state is never converted into executable NONE.
+        if "mutation_state" in value and value["mutation_state"] is not None:
+            raw_mutation_state = value["mutation_state"]
             try:
                 mutation_state = MutationState(str(raw_mutation_state))
-            except ValueError:
-                mutation_state = MutationState.NONE
+            except ValueError as error:
+                item_id = value.get("id", "<unknown>")
+                raise InvalidPersistedStateError(
+                    f"Invalid persisted mutation_state '{raw_mutation_state}' for item '{item_id}'"
+                ) from error
         else:
             mutation_state = MutationState.NONE
 

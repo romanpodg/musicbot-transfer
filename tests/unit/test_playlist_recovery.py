@@ -37,6 +37,9 @@ from music_transfer.core.enums import (
     TransferOperation,
 )
 from music_transfer.core.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    InvalidPersistedStateError,
     PersistenceError,
     TemporaryPlatformError,
     TransferConfigurationError,
@@ -1792,6 +1795,425 @@ class PlaylistRecoveryTests(unittest.TestCase):
         self.assertIn(item_normal_failed.id, selected_ids)
         self.assertNotIn(item_inflight_ambiguous.id, selected_ids)
         self.assertNotIn(item_inflight_failed.id, selected_ids)
+
+    # -------------------------------------------------------------------------
+    # Test 32: Legacy missing mutation_state defaults to NONE
+    # -------------------------------------------------------------------------
+    def test_legacy_missing_mutation_state_defaults_to_none(self) -> None:
+        """Test 32 (Phase 1.2.3): Missing mutation_state safely defaults to NONE.
+
+        Preserves backward compatibility for legacy records created before Phase 1.2.2.
+        """
+        payload: dict[str, Any] = {
+            "id": "legacy_item_1",
+            "job_id": "job_1",
+            "entity_type": "playlist_item",
+            "source_platform": "tidal",
+            "source_id": "src_1",
+            "destination_platform": "tidal",
+            "status": "matched",
+        }
+        self.assertNotIn("mutation_state", payload)
+        item = TransferItem.from_dict(payload)
+        self.assertEqual(item.mutation_state, MutationState.NONE)
+
+    # -------------------------------------------------------------------------
+    # Test 33: Unknown persisted mutation_state fails closed
+    # -------------------------------------------------------------------------
+    def test_unknown_persisted_mutation_state_fails_closed(self) -> None:
+        """Test 33 (Phase 1.2.3): Unknown explicit mutation_state raises InvalidPersistedStateError.
+
+        A persisted value other than NONE or IN_FLIGHT indicates corrupt or future
+        mutation state that MUST NOT be silently treated as executable NONE.
+        """
+        for unknown_val in ("unknown_future_state", "in_flight_v2", "corrupted"):
+            payload: dict[str, Any] = {
+                "id": f"item_corrupt_{unknown_val}",
+                "job_id": "job_1",
+                "entity_type": "playlist_item",
+                "source_platform": "tidal",
+                "source_id": "src_1",
+                "destination_platform": "tidal",
+                "status": "matched",
+                "mutation_state": unknown_val,
+            }
+            with self.assertRaises(InvalidPersistedStateError):
+                TransferItem.from_dict(payload)
+
+    # -------------------------------------------------------------------------
+    # Test 34: Unknown mutation state never reaches destination write
+    # -------------------------------------------------------------------------
+    def test_unknown_mutation_state_never_reaches_destination_write(self) -> None:
+        """Test 34 (Phase 1.2.3): Repository load of unknown mutation_state aborts before any write.
+
+        When repository loads a corrupted payload, deserialization raises InvalidPersistedStateError,
+        preventing any execution or remote destination calls.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        calls: list[tuple[str, str]] = []
+        destination.add_playlist_item = lambda cid, tid: calls.append((cid, tid))  # type: ignore[method-assign]
+
+        # Inject corrupted item directly into repository disk file
+        repo = self.service.items
+        raw_payload: dict[str, Any] = {
+            "id": "corrupt_item_1",
+            "job_id": job.id,
+            "entity_type": "playlist_item",
+            "source_platform": "tidal",
+            "source_id": "src_1",
+            "destination_platform": "tidal",
+            "destination_id": "dst_1",
+            "container_source_id": "pl1",
+            "original_position": 0,
+            "write_position": 0,
+            "status": "matched",
+            "operation": "add_playlist_item",
+            "mutation_state": "corrupted_state_xyz",
+        }
+        from music_transfer.infrastructure.persistence import atomic_write_json
+        atomic_write_json(repo._path(job.id), {"job_id": job.id, "items": [raw_payload]})  # type: ignore[attr-defined]
+
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        with self.assertRaises(InvalidPersistedStateError):
+            self.service.resume(job, destination, confirmed=True)
+
+        self.assertEqual(len(calls), 0, "Destination write was invoked despite invalid persisted mutation_state")
+
+    # -------------------------------------------------------------------------
+    # Test 35: Authentication error during in-flight reconciliation propagates fatally
+    # -------------------------------------------------------------------------
+    def test_authentication_error_during_inflight_reconciliation_propagates_fatally(self) -> None:
+        """Test 35 (Phase 1.2.3): AuthenticationError during reconciliation propagates to fatal handler.
+
+        When destination raises AuthenticationError while inspecting an IN_FLIGHT item:
+        - It must NOT be converted to AMBIGUOUS or playlist_state_inconclusive.
+        - Zero destination writes are made.
+        - The fatal handler marks the job FAILED.
+        - The item's durable mutation_state remains IN_FLIGHT (not cleared to NONE).
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        def auth_error_on_inspection(container_id: str) -> list[str]:
+            raise AuthenticationError(message="session_expired")
+
+        destination.playlist_item_ids = auth_error_on_inspection  # type: ignore[method-assign]
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        calls: list[tuple[str, str]] = []
+        destination.add_playlist_item = lambda cid, tid: calls.append((cid, tid))  # type: ignore[method-assign]
+
+        res = self.service.resume(job, destination, confirmed=True)
+        outcome = res["outcome"]
+
+        self.assertEqual(len(calls), 0, "Destination write was called despite fatal AuthenticationError")
+        self.assertTrue(outcome.aborted)
+        self.assertEqual(outcome.abort_error, "authentication_error")
+
+        # Reload job and item to verify fatal job status and preserved durable intent
+        reloaded_job = self.service.jobs.get(job.id)
+        self.assertIsNotNone(reloaded_job)
+        self.assertEqual(reloaded_job.status, JobStatus.FAILED)
+
+        reloaded_item = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertNotEqual(reloaded_item.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(reloaded_item.status, ItemStatus.FAILED)
+        self.assertEqual(reloaded_item.last_failure_kind, "authentication")
+        self.assertEqual(reloaded_item.mutation_state, MutationState.IN_FLIGHT, "Unresolved IN_FLIGHT intent was cleared")
+
+    # -------------------------------------------------------------------------
+    # Test 36: Authorization error during in-flight reconciliation propagates fatally
+    # -------------------------------------------------------------------------
+    def test_authorization_error_during_inflight_reconciliation_propagates_fatally(self) -> None:
+        """Test 36 (Phase 1.2.3): AuthorizationError during reconciliation propagates to fatal handler.
+
+        When destination raises AuthorizationError while inspecting an IN_FLIGHT item:
+        - It must NOT be converted to AMBIGUOUS.
+        - Zero destination writes are made.
+        - The job becomes FAILED.
+        - The item's durable mutation_state remains IN_FLIGHT.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        def authz_error_on_inspection(container_id: str) -> list[str]:
+            raise AuthorizationError(message="scope_insufficient")
+
+        destination.playlist_item_ids = authz_error_on_inspection  # type: ignore[method-assign]
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        calls: list[tuple[str, str]] = []
+        destination.add_playlist_item = lambda cid, tid: calls.append((cid, tid))  # type: ignore[method-assign]
+
+        res = self.service.resume(job, destination, confirmed=True)
+        outcome = res["outcome"]
+
+        self.assertEqual(len(calls), 0)
+        self.assertTrue(outcome.aborted)
+        self.assertEqual(outcome.abort_error, "authorization_error")
+
+        reloaded_job = self.service.jobs.get(job.id)
+        self.assertIsNotNone(reloaded_job)
+        self.assertEqual(reloaded_job.status, JobStatus.FAILED)
+
+        reloaded_item = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertNotEqual(reloaded_item.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(reloaded_item.status, ItemStatus.FAILED)
+        self.assertEqual(reloaded_item.last_failure_kind, "authentication")
+        self.assertEqual(reloaded_item.mutation_state, MutationState.IN_FLIGHT)
+
+    # -------------------------------------------------------------------------
+    # Test 37: Authentication error during post-timeout inspection is not swallowed
+    # -------------------------------------------------------------------------
+    def test_authentication_error_during_post_timeout_inspection_is_not_swallowed(self) -> None:
+        """Test 37 (Phase 1.2.3): AuthenticationError during post-timeout inspection propagates fatally.
+
+        When add_playlist_item() times out and subsequent destination inspection encounters
+        AuthenticationError:
+        - Must NOT convert to playlist_state_inconclusive / AMBIGUOUS.
+        - Must propagate to fatal execution handler.
+        - Job becomes FAILED.
+        - Durable mutation_state remains IN_FLIGHT.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        call_count = 0
+
+        def timeout_add(container_id: str, track_id: str) -> None:
+            raise TemporaryPlatformError("write_timeout")
+
+        def auth_error_inspect(container_id: str) -> list[str]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Pre-write reconciliation before mutation: playlist is currently empty
+                return []
+            # Post-timeout inspection after mutation was in flight: auth fails
+            raise AuthenticationError(message="token_expired_during_inspection")
+
+        destination.add_playlist_item = timeout_add  # type: ignore[method-assign]
+        destination.playlist_item_ids = auth_error_inspect  # type: ignore[method-assign]
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        res = self.service.resume(job, destination, confirmed=True)
+        outcome = res["outcome"]
+
+        self.assertTrue(outcome.aborted)
+        self.assertEqual(outcome.abort_error, "authentication_error")
+
+        reloaded_job = self.service.jobs.get(job.id)
+        self.assertIsNotNone(reloaded_job)
+        self.assertEqual(reloaded_job.status, JobStatus.FAILED)
+
+        reloaded_item = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertNotEqual(reloaded_item.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(reloaded_item.status, ItemStatus.FAILED)
+        self.assertEqual(reloaded_item.mutation_state, MutationState.IN_FLIGHT)
+
+    # -------------------------------------------------------------------------
+    # Test 38: Authorization error during post-timeout inspection is not swallowed
+    # -------------------------------------------------------------------------
+    def test_authorization_error_during_post_timeout_inspection_is_not_swallowed(self) -> None:
+        """Test 38 (Phase 1.2.3): AuthorizationError during post-timeout inspection propagates fatally.
+
+        When add_playlist_item() times out and subsequent destination inspection encounters
+        AuthorizationError:
+        - Must NOT convert to playlist_state_inconclusive / AMBIGUOUS.
+        - Must propagate to fatal execution handler.
+        - Job becomes FAILED.
+        - Durable mutation_state remains IN_FLIGHT.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        call_count = 0
+
+        def timeout_add(container_id: str, track_id: str) -> None:
+            raise TemporaryPlatformError("write_timeout")
+
+        def authz_error_inspect(container_id: str) -> list[str]:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Pre-write reconciliation before mutation: playlist is currently empty
+                return []
+            # Post-timeout inspection after mutation was in flight: authz fails
+            raise AuthorizationError(message="permissions_revoked")
+
+        destination.add_playlist_item = timeout_add  # type: ignore[method-assign]
+        destination.playlist_item_ids = authz_error_inspect  # type: ignore[method-assign]
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        res = self.service.resume(job, destination, confirmed=True)
+        outcome = res["outcome"]
+
+        self.assertTrue(outcome.aborted)
+        self.assertEqual(outcome.abort_error, "authorization_error")
+
+        reloaded_job = self.service.jobs.get(job.id)
+        self.assertIsNotNone(reloaded_job)
+        self.assertEqual(reloaded_job.status, JobStatus.FAILED)
+
+        reloaded_item = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertNotEqual(reloaded_item.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(reloaded_item.status, ItemStatus.FAILED)
+        self.assertEqual(reloaded_item.mutation_state, MutationState.IN_FLIGHT)
 
 
 if __name__ == "__main__":

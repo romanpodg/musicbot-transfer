@@ -434,6 +434,8 @@ class TransferExecutor:
         except (AmbiguousOperationError, TemporaryPlatformError) as error:
             try:
                 actual = list(self._destination.playlist_item_ids(container_id))
+            except (AuthenticationError, AuthorizationError):
+                raise
             except UnsupportedCapabilityError:
                 item.last_failure_kind = "ambiguous"
                 item.mark(ItemStatus.AMBIGUOUS, error="playlist_commit_unverifiable")
@@ -502,6 +504,8 @@ class TransferExecutor:
             return
         try:
             actual = list(self._destination.playlist_item_ids(container_id))
+        except (AuthenticationError, AuthorizationError):
+            raise
         except UnsupportedCapabilityError as error:
             if item.mutation_state is MutationState.IN_FLIGHT:
                 item.last_failure_kind = "ambiguous"

@@ -196,6 +196,13 @@ class PersistenceError(MusicTransferError):
     retryable = False
 
 
+class InvalidPersistedStateError(PersistenceError):
+    """Persisted state contains invalid, corrupted, or unrecognizable data."""
+
+    code = "invalid_persisted_state"
+    retryable = False
+
+
 #: Errors that mean "re-running this item may succeed later".
 RETRYABLE_ERROR_TYPES: tuple[type[MusicTransferError], ...] = (
     RateLimitError,
@@ -237,7 +244,7 @@ def classify_error(error: Exception) -> str:
         return ItemFailureKind.UNAVAILABLE
     if isinstance(error, NotFoundError):
         return ItemFailureKind.NOT_FOUND
-    if isinstance(error, AuthenticationError) or isinstance(error, AuthorizationError):
+    if isinstance(error, (AuthenticationError, AuthorizationError)):
         return ItemFailureKind.AUTHENTICATION
     if isinstance(error, RETRYABLE_ERROR_TYPES):
         return ItemFailureKind.TEMPORARY

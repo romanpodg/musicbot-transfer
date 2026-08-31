@@ -21,6 +21,7 @@ from ..enums import (
     OrderingMode,
     Platform,
     TransferOperation,
+    VerificationStatus,
 )
 from ..errors import InvalidPersistedStateError
 
@@ -134,6 +135,7 @@ class TransferJob:
     requested_content: tuple[ContentType, ...] = (ContentType.LIKED_TRACKS,)
     settings: TransferSettings = field(default_factory=TransferSettings)
     status: JobStatus = JobStatus.CREATED
+    verification_status: VerificationStatus = VerificationStatus.NOT_RUN
     cancellation_requested: bool = False
     error_code: str | None = None
     total_items: int = 0
@@ -202,6 +204,7 @@ class TransferJob:
             "requested_content": [str(item) for item in self.requested_content],
             "settings": self.settings.as_dict(),
             "status": str(self.status),
+            "verification_status": str(self.verification_status),
             "cancellation_requested": self.cancellation_requested,
             "error_code": self.error_code,
             "total_items": self.total_items,
@@ -221,6 +224,15 @@ class TransferJob:
         """Rebuild a job from persisted data."""
 
         content = value.get("requested_content") or []
+        raw_verification_status = value.get("verification_status")
+        if raw_verification_status is not None:
+            try:
+                verification_status = VerificationStatus(str(raw_verification_status))
+            except ValueError:
+                verification_status = VerificationStatus.NOT_RUN
+        else:
+            verification_status = VerificationStatus.NOT_RUN
+
         return cls(
             id=str(value.get("id", "")),
             user_id=value.get("user_id"),
@@ -236,6 +248,7 @@ class TransferJob:
             or (ContentType.LIKED_TRACKS,),
             settings=TransferSettings.from_dict(value.get("settings")),
             status=JobStatus(str(value.get("status", JobStatus.CREATED))),
+            verification_status=verification_status,
             cancellation_requested=bool(value.get("cancellation_requested", False)),
             error_code=value.get("error_code"),
             total_items=int(value.get("total_items", 0)),
@@ -639,6 +652,7 @@ class TransferReport:
     failed: int = 0
     failures: list[dict[str, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    verification_status: VerificationStatus = VerificationStatus.NOT_RUN
 
     def finish(self) -> None:
         """Mark the report complete."""
@@ -647,7 +661,11 @@ class TransferReport:
 
     @classmethod
     def from_items(
-        cls, job_id: str, items: list[TransferItem], operation: str = "transfer"
+        cls,
+        job_id: str,
+        items: list[TransferItem],
+        operation: str = "transfer",
+        verification_status: VerificationStatus = VerificationStatus.NOT_RUN,
     ) -> TransferReport:
         """Build a report by counting stored item statuses.
 
@@ -655,7 +673,12 @@ class TransferReport:
         report can never disagree with the durable item state.
         """
 
-        report = cls(job_id=job_id, operation=operation, total=len(items))
+        report = cls(
+            job_id=job_id,
+            operation=operation,
+            total=len(items),
+            verification_status=verification_status,
+        )
         for item in items:
             if item.status is ItemStatus.TRANSFERRED:
                 report.transferred += 1
@@ -699,4 +722,5 @@ class TransferReport:
             "failed": self.failed,
             "failures": list(self.failures),
             "warnings": list(self.warnings),
+            "verification_status": str(self.verification_status),
         }

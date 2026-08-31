@@ -42,8 +42,9 @@ class TransferJobRepository(ABC):
         transition the same way.
         """
 
-        job.status = status
-        job.touch()
+        from ..transfer.lifecycle import transition
+
+        transition(job, status)
         return self.update(job)
 
 

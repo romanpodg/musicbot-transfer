@@ -10,15 +10,27 @@ Lifecycle::
         -> PLANNING -> WAITING_CONFIRMATION -> IMPORTING -> VERIFYING
         -> COMPLETED
 
+    For dry runs where no destination mutation occurs, verification is skipped
+    and the job transitions directly:
+        IMPORTING -> COMPLETED (verification_status = NOT_RUN)
+
     PAUSED, FAILED and CANCELLED are the exceptional states.  PAUSED is
     resumable back into IMPORTING; FAILED and CANCELLED are terminal.
 """
 
 from __future__ import annotations
 
+import logging
+from typing import TYPE_CHECKING, Any
+
 from ..domain import TransferJob
 from ..enums import JobStatus
 from ..errors import InvalidStateTransition
+
+if TYPE_CHECKING:
+    from .executor import ExecutionResult
+
+_LOGGER = logging.getLogger("music_transfer.lifecycle")
 
 #: The authoritative transition table.
 TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
@@ -55,6 +67,9 @@ TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.IMPORTING: frozenset(
         {
             JobStatus.VERIFYING,
+            # Allowed for completed dry-run executions where destination mutation
+            # and verification are intentionally skipped.
+            JobStatus.COMPLETED,
             JobStatus.PAUSED,
             JobStatus.CANCELLED,
             JobStatus.FAILED,
@@ -98,12 +113,27 @@ def transition(job: TransferJob, target: JobStatus) -> TransferJob:
             :data:`TRANSITIONS`.
     """
 
-    if not can_transition(job.status, target):
+    old_status = job.status
+    if not can_transition(old_status, target):
+        _LOGGER.warning(
+            "event=illegal_job_transition job_id=%s current_status=%s target_status=%s",
+            job.id,
+            old_status.value,
+            target.value,
+        )
         raise InvalidStateTransition(
-            current=str(job.status), target=str(target)
+            current=str(old_status), target=str(target)
         )
     job.status = target
     job.touch()
+    if is_terminal(target) and job.finished_at is None:
+        job.finished_at = job.updated_at
+    _LOGGER.info(
+        "event=job_transition job_id=%s old_status=%s new_status=%s",
+        job.id,
+        old_status.value,
+        target.value,
+    )
     return job
 
 
@@ -126,3 +156,28 @@ def resume_target(job: TransferJob) -> JobStatus | None:
     if job.status in {JobStatus.PAUSED, JobStatus.IMPORTING}:
         return JobStatus.IMPORTING
     return JobStatus.PLANNING
+
+
+def status_after_execution(
+    job: TransferJob, outcome: ExecutionResult | Any
+) -> JobStatus:
+    """Decide which job status follows an execution run.
+
+    This is the authoritative execution-outcome policy:
+    - cancelled -> CANCELLED
+    - fatal abort -> FAILED
+    - dry run -> COMPLETED
+    - normal execution -> VERIFYING
+    """
+
+    if outcome.cancelled:
+        return JobStatus.CANCELLED
+    if (
+        outcome.aborted
+        or getattr(outcome, "abort_error", None)
+        or getattr(outcome, "aborted_error", None)
+    ):
+        return JobStatus.FAILED
+    if job.settings.dry_run:
+        return JobStatus.COMPLETED
+    return JobStatus.VERIFYING

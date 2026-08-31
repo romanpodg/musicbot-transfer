@@ -118,6 +118,7 @@ class ReportView:
     failed: int = 0
     failures: tuple[dict[str, Any], ...] = ()
     warnings: tuple[str, ...] = ()
+    verification_status: str = "not_run"
 
     @property
     def succeeded(self) -> int:
@@ -141,6 +142,7 @@ class ReportView:
             "failed": self.failed,
             "failures": [dict(item) for item in self.failures],
             "warnings": list(self.warnings),
+            "verification_status": self.verification_status,
         }
 
 
@@ -255,6 +257,9 @@ def report_view(job: TransferJob, report: TransferReport) -> ReportView:
         failed=report.failed,
         failures=tuple(report.failures),
         warnings=tuple(report.warnings),
+        verification_status=report.verification_status.value
+        if hasattr(report.verification_status, "value")
+        else str(report.verification_status),
     )
 
 
@@ -274,5 +279,5 @@ __all__ = [
     "account_statuses",
     "plan_view",
     "report_view",
-    "verification_view",
+    "verification_views",
 ]

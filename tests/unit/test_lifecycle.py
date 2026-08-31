@@ -73,6 +73,20 @@ class ValidTransitions(unittest.TestCase):
         transition(job, JobStatus.PLANNING)
         self.assertIs(job.status, JobStatus.PLANNING)
 
+    def test_dry_run_completed_transition(self) -> None:
+        """A dry-run job can move directly from IMPORTING to COMPLETED."""
+
+        job = new_job()
+        transition(job, JobStatus.AUTHENTICATING)
+        transition(job, JobStatus.EXPORTING)
+        transition(job, JobStatus.NORMALIZING)
+        transition(job, JobStatus.MATCHING)
+        transition(job, JobStatus.PLANNING)
+        transition(job, JobStatus.WAITING_CONFIRMATION)
+        transition(job, JobStatus.IMPORTING)
+        transition(job, JobStatus.COMPLETED)
+        self.assertIs(job.status, JobStatus.COMPLETED)
+
 
 class RejectedTransitions(unittest.TestCase):
     """Invalid moves raise instead of quietly "fixing" the state."""
@@ -113,6 +127,9 @@ class RejectedTransitions(unittest.TestCase):
         """A completed job cannot go back to importing."""
 
         job = new_job()
+        job.status = JobStatus.COMPLETED
+        with self.assertRaises(InvalidStateTransition):
+            transition(job, JobStatus.IMPORTING)
         self.assertFalse(can_transition(JobStatus.COMPLETED, JobStatus.IMPORTING))
 
     def test_error_carries_both_states(self) -> None:
@@ -242,6 +259,56 @@ class JobContentTests(unittest.TestCase):
         job = new_job()
         self.assertIsNotNone(job.created_at)
         self.assertIsNotNone(job.updated_at)
+
+    def test_terminal_transition_sets_finished_at(self) -> None:
+        """Transitioning to a terminal status stamps finished_at."""
+
+        job = new_job()
+        self.assertIsNone(job.finished_at)
+        transition(job, JobStatus.CANCELLED)
+        self.assertIsNotNone(job.finished_at)
+        self.assertEqual(job.finished_at, job.updated_at)
+
+
+class StatusAfterExecutionTests(unittest.TestCase):
+    """Execution finalization outcome policy tests."""
+
+    def test_cancelled_outcome(self) -> None:
+        from music_transfer.core.transfer.executor import ExecutionResult
+        from music_transfer.core.transfer.lifecycle import status_after_execution
+
+        job = new_job()
+        outcome = ExecutionResult(cancelled=True)
+        self.assertIs(status_after_execution(job, outcome), JobStatus.CANCELLED)
+
+    def test_aborted_outcome(self) -> None:
+        from music_transfer.core.transfer.executor import ExecutionResult
+        from music_transfer.core.transfer.lifecycle import status_after_execution
+
+        job = new_job()
+        outcome = ExecutionResult(aborted=True, abort_error="fatal_auth")
+        self.assertIs(status_after_execution(job, outcome), JobStatus.FAILED)
+
+    def test_dry_run_outcome(self) -> None:
+        from music_transfer.core.domain import TransferSettings
+        from music_transfer.core.transfer.executor import ExecutionResult
+        from music_transfer.core.transfer.lifecycle import status_after_execution
+
+        job = TransferJob.create(
+            Platform.TIDAL,
+            Platform.SPOTIFY,
+            settings=TransferSettings(dry_run=True),
+        )
+        outcome = ExecutionResult()
+        self.assertIs(status_after_execution(job, outcome), JobStatus.COMPLETED)
+
+    def test_normal_outcome(self) -> None:
+        from music_transfer.core.transfer.executor import ExecutionResult
+        from music_transfer.core.transfer.lifecycle import status_after_execution
+
+        job = new_job()
+        outcome = ExecutionResult()
+        self.assertIs(status_after_execution(job, outcome), JobStatus.VERIFYING)
 
 
 if __name__ == "__main__":

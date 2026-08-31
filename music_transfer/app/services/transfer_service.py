@@ -33,8 +33,15 @@ from ...core.enums import (
     JobStatus,
     Platform,
     TransferOperation,
+    VerificationStatus,
 )
-from ...core.errors import ConfirmationRequired, TransferConfigurationError
+from ...core.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    ConfirmationRequired,
+    InvalidStateTransition,
+    TransferConfigurationError,
+)
 from ...core.matching import MatchingPolicy, TrackMatcher
 from ...core.ports import MusicPlatformAdapter, TransferItemRepository, TransferJobRepository
 from ...core.transfer import (
@@ -45,6 +52,7 @@ from ...core.transfer import (
     TransferPlanner,
     TransferVerifier,
     build_report,
+    status_after_execution,
     transition,
 )
 
@@ -240,13 +248,8 @@ class TransferService:
 
         if not confirmed:
             raise ConfirmationRequired("transfer_confirmation_required")
-        if job.status is not JobStatus.WAITING_CONFIRMATION:
-            # A resumed job comes back from PAUSED or a crashed IMPORTING run.
-            if job.status not in {JobStatus.PAUSED, JobStatus.IMPORTING}:
-                raise ConfirmationRequired("job_not_ready_for_execution")
-        else:
+        if job.status is not JobStatus.IMPORTING:
             transition(job, JobStatus.IMPORTING)
-        job.status = JobStatus.IMPORTING
         if job.started_at is None:
             job.started_at = job.updated_at
         self._jobs.update(job)
@@ -257,41 +260,98 @@ class TransferService:
         outcome = executor.execute(job, items, progress=progress)
         self._jobs.update(job)
         verification: dict[str, Any] = {}
-        if outcome.aborted or outcome.abort_error:
+        next_status = status_after_execution(job, outcome)
+        if next_status is JobStatus.FAILED:
             # Fatal failure (e.g. auth/authorization loss). Do not verify or mark completed.
             transition(job, JobStatus.FAILED)
             job.error_code = outcome.abort_error
+            job.verification_status = VerificationStatus.NOT_RUN
             job.finished_at = job.updated_at
             self._jobs.update(job)
-        elif outcome.cancelled:
+        elif next_status is JobStatus.CANCELLED:
             # Cancellation stops cleanly without verification.
             transition(job, JobStatus.CANCELLED)
+            job.verification_status = VerificationStatus.NOT_RUN
             job.finished_at = job.updated_at
             self._jobs.update(job)
-        elif job.settings.dry_run:
-            job.status = JobStatus.COMPLETED
+        elif next_status is JobStatus.COMPLETED:
+            # Dry run execution finishes without destination mutation or verification.
+            transition(job, JobStatus.COMPLETED)
+            job.verification_status = VerificationStatus.NOT_RUN
             job.finished_at = job.updated_at
             self._jobs.update(job)
-        else:
+        elif next_status is JobStatus.VERIFYING:
             transition(job, JobStatus.VERIFYING)
             self._jobs.update(job)
-            verifier = TransferVerifier(destination, logger=self._logger)
-            results = verifier.verify_job(job, self._items.list_for_job(job.id))
-            verification = verifier.as_report(results)
-            job.status = JobStatus.COMPLETED
-            job.finished_at = job.updated_at
-            self._jobs.update(job)
+            try:
+                verifier = TransferVerifier(destination, logger=self._logger)
+                results = verifier.verify_job(job, self._items.list_for_job(job.id))
+                verification = verifier.as_report(results)
+                verif_status = verifier.aggregate_status(results)
+                job.verification_status = verif_status
+                if verif_status is VerificationStatus.PASSED:
+                    self._logger.info(
+                        "event=verification_passed job_id=%s verification_status=%s",
+                        job.id,
+                        verif_status.value,
+                    )
+                elif verif_status is VerificationStatus.FAILED:
+                    self._logger.warning(
+                        "event=verification_failed job_id=%s verification_status=%s",
+                        job.id,
+                        verif_status.value,
+                    )
+                elif verif_status is VerificationStatus.PARTIAL:
+                    self._logger.warning(
+                        "event=verification_partial job_id=%s verification_status=%s",
+                        job.id,
+                        verif_status.value,
+                    )
+                transition(job, JobStatus.COMPLETED)
+                job.finished_at = job.updated_at
+                self._jobs.update(job)
+            except (AuthenticationError, AuthorizationError) as error:
+                self._logger.error(
+                    "event=verification_fatal_error job_id=%s error_type=%s error_code=%s",
+                    job.id,
+                    type(error).__name__,
+                    error.code,
+                )
+                transition(job, JobStatus.FAILED)
+                job.error_code = error.code
+                job.verification_status = VerificationStatus.NOT_RUN
+                job.finished_at = job.updated_at
+                self._jobs.update(job)
+                verification = {}
+            except Exception as error:  # noqa: BLE001
+                self._logger.error(
+                    "event=verification_unexpected_error job_id=%s error_type=%s",
+                    job.id,
+                    type(error).__name__,
+                )
+                transition(job, JobStatus.FAILED)
+                job.error_code = "verification_error"
+                job.verification_status = VerificationStatus.NOT_RUN
+                job.finished_at = job.updated_at
+                self._jobs.update(job)
+                verification = {}
         report = build_report(job, self._items.list_for_job(job.id), outcome)
         report.finish()
         self._logger.info(
-            "event=job_finished job_id=%s status=%s transferred=%d failed=%d skipped=%d",
+            "event=job_finished job_id=%s status=%s verification_status=%s transferred=%d failed=%d skipped=%d",
             job.id,
             job.status.value,
+            job.verification_status.value,
             report.transferred,
             report.failed,
             report.skipped,
         )
-        return {"report": report, "verification": verification, "outcome": outcome}
+        return {
+            "report": report,
+            "verification": verification,
+            "verification_status": job.verification_status,
+            "outcome": outcome,
+        }
 
     # -- resume and retry --------------------------------------------------
 
@@ -313,8 +373,13 @@ class TransferService:
 
         if not confirmed:
             raise ConfirmationRequired("transfer_confirmation_required")
-        if job.is_finished:
-            raise TransferConfigurationError("job_already_finished")
+        from ...core.transfer.lifecycle import resume_target
+
+        target = resume_target(job)
+        if target is not JobStatus.IMPORTING:
+            raise InvalidStateTransition(
+                current=str(job.status), target=str(JobStatus.IMPORTING)
+            )
         try:
             state = destination.get_destination_state()
         except Exception as error:  # noqa: BLE001 - reconciliation is best-effort
@@ -326,7 +391,8 @@ class TransferService:
             state = None
         if state is not None:
             self._recovery.resolve_ambiguous(job.id, state)
-        job.status = JobStatus.IMPORTING
+        if job.status is not JobStatus.IMPORTING:
+            transition(job, JobStatus.IMPORTING)
         job.cancellation_requested = False
         self._jobs.update(job)
         return self.execute(
@@ -411,29 +477,33 @@ class TransferService:
         return job
 
     def cancel(self, job: TransferJob) -> TransferJob:
-        """Mark a job cancelled and persist it."""
+        """Mark a job cancelled and persist it.
 
-        from ...core.transfer.lifecycle import can_transition
+        Idempotent: cancelling an already-cancelled job is a no-op.
+        Cancelling a COMPLETED or FAILED job raises InvalidStateTransition.
+        """
 
-        if can_transition(job.status, JobStatus.CANCELLED):
-            transition(job, JobStatus.CANCELLED)
-        else:
-            job.status = JobStatus.CANCELLED
-            job.touch()
+        if job.status is JobStatus.CANCELLED:
+            return job
+        transition(job, JobStatus.CANCELLED)
         job.finished_at = job.updated_at
         return self._jobs.update(job)
 
     def fail(self, job: TransferJob, error_code: str) -> TransferJob:
-        """Mark a job failed and persist it."""
+        """Mark a job failed and persist it.
 
-        from ...core.transfer.lifecycle import can_transition
+        Idempotent: failing an already-failed job is a no-op and preserves
+        the original failure state unless previously unset.
+        Failing a COMPLETED or CANCELLED job raises InvalidStateTransition.
+        """
 
+        if job.status is JobStatus.FAILED:
+            if not job.error_code:
+                job.error_code = error_code
+                self._jobs.update(job)
+            return job
         job.error_code = error_code
-        if can_transition(job.status, JobStatus.FAILED):
-            transition(job, JobStatus.FAILED)
-        else:
-            job.status = JobStatus.FAILED
-            job.touch()
+        transition(job, JobStatus.FAILED)
         job.finished_at = job.updated_at
         return self._jobs.update(job)
 
@@ -444,7 +514,11 @@ class TransferService:
         after a crash or in a different process than the one that ran the job.
         """
 
-        return TransferReport.from_items(job.id, self._items.list_for_job(job.id))
+        return TransferReport.from_items(
+            job.id,
+            self._items.list_for_job(job.id),
+            verification_status=job.verification_status,
+        )
 
     def matching_policy(self) -> MatchingPolicy:
         """Return the matcher's policy (used by diagnostics and tests)."""

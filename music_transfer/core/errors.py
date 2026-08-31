@@ -145,7 +145,14 @@ class UnsupportedCapabilityError(MusicTransferError):
         self.capability = capability
 
 
-class InvalidStateTransition(MusicTransferError):
+class TransferConfigurationError(MusicTransferError):
+    """The requested transfer cannot be planned safely (e.g. same account)."""
+
+    code = "transfer_configuration_error"
+    retryable = False
+
+
+class InvalidStateTransition(TransferConfigurationError):
     """A transfer job was asked to move to a state it cannot legally reach."""
 
     code = "invalid_state_transition"
@@ -172,13 +179,6 @@ class ConfirmationRequired(MusicTransferError):
     """
 
     code = "confirmation_required"
-    retryable = False
-
-
-class TransferConfigurationError(MusicTransferError):
-    """The requested transfer cannot be planned safely (e.g. same account)."""
-
-    code = "transfer_configuration_error"
     retryable = False
 
 

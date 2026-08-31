@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..domain import SequenceComparison, TransferItem, TransferJob, VerificationResult
-from ..enums import EntityType, ItemStatus
+from ..enums import EntityType, ItemStatus, VerificationStatus
 from ..errors import UnsupportedCapabilityError
 from ..ports import MusicPlatformAdapter
 
@@ -43,7 +43,7 @@ def compare_sequences(
         missing=sorted((expected_counter - actual_counter).elements()),
         unexpected=sorted((actual_counter - expected_counter).elements()),
     )
-    for position, (expected_id, actual_id) in enumerate(zip(expected, actual)):
+    for position, (expected_id, actual_id) in enumerate(zip(expected, actual, strict=False)):
         if len(comparison.order_mismatches) >= MAX_REPORTED_ORDER_MISMATCHES:
             break
         if expected_id != actual_id:
@@ -178,6 +178,13 @@ class TransferVerifier:
                 expected_count=len(expected),
                 warnings=[f"verification_unsupported:{getattr(error, 'capability', 'unknown')}"],
             )
+        if not state.is_trustworthy(section):
+            return VerificationResult(
+                success=False,
+                expected_count=len(expected),
+                actual_count=len(state.album_ids if section == "albums" else state.artist_ids),
+                warnings=["destination_state_incomplete"],
+            )
         actual = (
             sorted(state.album_ids) if section == "albums" else sorted(state.artist_ids)
         )
@@ -201,7 +208,50 @@ class TransferVerifier:
         return combined
 
     @staticmethod
+    def aggregate_status(
+        results: dict[str, VerificationResult]
+    ) -> VerificationStatus:
+        """Determine aggregate verification status across all verified containers."""
+
+        return aggregate_verification_status(results)
+
+    @staticmethod
     def as_report(results: dict[str, VerificationResult]) -> dict[str, Any]:
         """Serialize verification results for a JSON report."""
 
         return {key: value.as_dict() for key, value in results.items()}
+
+
+def aggregate_verification_status(
+    results: dict[str, VerificationResult]
+) -> VerificationStatus:
+    """Determine the aggregate verification status across all verified containers.
+
+    Aggregation rules:
+    - NOT_RUN: No sections were verified (empty results).
+    - FAILED: At least one section has a confirmed discrepancy (missing items,
+      unexpected items, or order mismatches).
+    - PARTIAL: No confirmed discrepancies, but one or more sections could not
+      be verified (unsupported capability or incomplete destination state).
+    - PASSED: All sections completed verification successfully with no discrepancies
+      and no incomplete/unsupported warnings.
+    """
+
+    if not results:
+        return VerificationStatus.NOT_RUN
+
+    has_mismatch = False
+    has_partial = False
+
+    for result in results.values():
+        if result.missing or result.unexpected or result.order_mismatches:
+            has_mismatch = True
+            break
+        if not result.success or result.warnings:
+            has_partial = True
+
+    if has_mismatch:
+        return VerificationStatus.FAILED
+    if has_partial:
+        return VerificationStatus.PARTIAL
+    return VerificationStatus.PASSED

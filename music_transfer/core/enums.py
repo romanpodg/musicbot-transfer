@@ -78,6 +78,20 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class VerificationStatus(StrEnum):
+    """The outcome of post-write destination verification.
+
+    Distinct from :class:`JobStatus` (which tracks overall workflow progression):
+    a job can reach ``COMPLETED`` status while verification status is ``FAILED``
+    if execution finished but destination verification discovered discrepancies.
+    """
+
+    NOT_RUN = "not_run"
+    PASSED = "passed"
+    FAILED = "failed"
+    PARTIAL = "partial"
+
+
 class ItemStatus(StrEnum):
     """The per-item lifecycle used for resumable, auditable transfers.
 

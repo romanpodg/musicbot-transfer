@@ -31,7 +31,7 @@ from ..domain import (
     TransferProgress,
     TransferReport,
 )
-from ..enums import EntityType, ItemStatus, JobStatus, MutationState, TransferOperation
+from ..enums import EntityType, ItemStatus, MutationState, TransferOperation
 from ..errors import (
     AmbiguousOperationError,
     AuthenticationError,
@@ -42,6 +42,17 @@ from ..errors import (
     classify_error,
 )
 from ..ports import MusicPlatformAdapter, TransferItemRepository
+from .lifecycle import status_after_execution
+
+__all__ = [
+    "CancellationToken",
+    "ExecutionOutcome",
+    "ExecutionResult",
+    "TransferExecutor",
+    "build_report",
+    "scrub_credentials",
+    "status_after_execution",
+]
 
 _LOGGER = logging.getLogger("music_transfer.executor")
 
@@ -753,20 +764,15 @@ def build_report(
 ) -> TransferReport:
     """Build a report from durable item state, not from transient counters."""
 
-    report = TransferReport.from_items(job.id, items, operation="transfer")
+    report = TransferReport.from_items(
+        job.id,
+        items,
+        operation="transfer",
+        verification_status=job.verification_status,
+    )
     if outcome.cancelled:
         report.warnings.append("cancelled")
     abort_err = outcome.abort_error or outcome.aborted_error
     if outcome.aborted or abort_err:
         report.warnings.append(f"aborted:{abort_err or 'unknown'}")
     return report
-
-
-def status_after_execution(job: TransferJob, outcome: ExecutionResult) -> JobStatus:
-    """Decide which job status follows an execution run."""
-
-    if outcome.cancelled:
-        return JobStatus.CANCELLED
-    if outcome.aborted or outcome.abort_error or outcome.aborted_error:
-        return JobStatus.FAILED
-    return JobStatus.VERIFYING

@@ -23,9 +23,12 @@ CREATED ──▶ AUTHENTICATING ──▶ EXPORTING ──▶ NORMALIZING ─�
                                                 │
                                                 ▼
                                           IMPORTING ◀────── PAUSED
-                                                │      └──────┘
-                                                ▼
-                                           VERIFYING ──▶ COMPLETED
+                                           │     │    └──────┘
+                               (dry run)   │     ▼
+                                   ────────┼──▶ VERIFYING ──▶ COMPLETED
+                                           │                     ▲
+                                           └─────────────────────┘
+                                                 (dry run only)
 
 CANCELLED ◀── reachable from every non-terminal state
 FAILED    ◀── reachable from every non-terminal state
@@ -36,12 +39,14 @@ FAILED    ◀── reachable from every non-terminal state
 | `COMPLETED`, `FAILED`, `CANCELLED` have no outgoing edges | Terminal; a finished job is retired, not resumed. |
 | `PAUSED → IMPORTING` only | Pause is exclusively a pause of *writing*. |
 | `WAITING_CONFIRMATION → PLANNING` allowed | Re-planning is read-only and cheap; replaying writes is not. |
+| `IMPORTING → COMPLETED` allowed for dry runs | Dry runs execute no destination writes and skip verification. |
 | `resume_target()` returns `None` for terminal jobs | Makes "resume a finished job" impossible by construction. |
 
-`TransferService.resume()` additionally raises
-`TransferConfigurationError("job_already_finished")`. **Resume means "the
-process died"; retry means "some items failed"** — different operations with
-different safety properties.
+`TransferService.resume()` enforces that only jobs with `resume_target() == IMPORTING`
+can be resumed. Resuming any terminal job raises `InvalidStateTransition`.
+Idempotent terminal operations:
+- `cancel(CANCELLED)` is an idempotent no-op; cancelling `COMPLETED` or `FAILED` raises `InvalidStateTransition`.
+- `fail(FAILED)` is an idempotent no-op; failing `COMPLETED` or `CANCELLED` raises `InvalidStateTransition`.
 
 ---
 
@@ -190,10 +195,25 @@ No adapter write is issued.
 
 ---
 
-## 7. Verification
+## 7. Verification and VerificationStatus
 
 Verification is separate from the API acknowledgement (Invariant G): a platform
 can return success and still not hold the item.
+
+Job lifecycle status (`JobStatus`) and post-write verification outcome (`VerificationStatus`)
+are decoupled concepts:
+* `JobStatus` tracks overall workflow progression (`IMPORTING -> VERIFYING -> COMPLETED`).
+* `VerificationStatus` tracks observed destination state correctness (`NOT_RUN`, `PASSED`, `FAILED`, `PARTIAL`).
+
+### Status Combinations
+
+* `COMPLETED + PASSED`: All destination writes finished, and verification confirmed exact membership and order.
+* `COMPLETED + FAILED`: Destination writes finished, but verification observed discrepancies (missing items, unexpected items, or playlist order mismatches). **This does NOT mean execution was rolled back.** It means writes landed or were attempted, but observed destination state does not match the plan.
+* `COMPLETED + PARTIAL`: Destination writes finished, but verification could only be partially completed (e.g. read capability was unsupported for a section, or destination state was incomplete).
+* `COMPLETED + NOT_RUN`: Execution completed under a dry run where no destination mutations occurred, so destination verification was intentionally skipped.
+* `FAILED + NOT_RUN`: Execution or verification aborted fatally (e.g. `AuthenticationError` / `AuthorizationError`). Credential loss during verification halts immediately and transitions `VERIFYING -> FAILED`, never leaving a job stuck in `VERIFYING`.
+
+### Section Verification Rules
 
 - **Set-like sections** (liked tracks, albums, artists): membership only.
 - **Playlists**: membership **and** order.

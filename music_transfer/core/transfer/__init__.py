@@ -32,7 +32,7 @@ from .ordering import (
 )
 from .planner import CONTENT_SPECS, PlannerResult, TransferPlanner
 from .recovery import RecoveryService
-from .verifier import TransferVerifier, compare_sequences
+from .verifier import TransferVerifier, aggregate_verification_status, compare_sequences
 
 __all__ = [
     "CONTENT_SPECS",
@@ -46,6 +46,7 @@ __all__ = [
     "TransferExecutor",
     "TransferPlanner",
     "TransferVerifier",
+    "aggregate_verification_status",
     "apply_logical_order",
     "build_report",
     "can_transition",

@@ -42,6 +42,7 @@ from music_transfer.core.enums import (
 from music_transfer.core.errors import (
     AuthenticationError,
     AuthorizationError,
+    InvalidPersistedStateError,
     InvalidStateTransition,
     UnsupportedCapabilityError,
 )
@@ -175,6 +176,95 @@ class LifecycleIntegrityServiceTests(unittest.TestCase):
         assert reloaded is not None
         self.assertEqual(reloaded.status, JobStatus.COMPLETED)
         self.assertEqual(reloaded.verification_status, VerificationStatus.PASSED)
+
+    def test_authentication_error_during_resume_destination_state_is_fatal(self) -> None:
+        """AuthenticationError during resume destination state recovery transitions job to FAILED."""
+        job, _ = self._create_and_plan_job()
+        transition(job, JobStatus.IMPORTING)
+        transition(job, JobStatus.PAUSED)
+        self.service.jobs.update(job)
+
+        def auth_error_state(sections=None) -> DestinationState:
+            raise AuthenticationError(code="auth_revoked", message="Session expired")
+
+        destination = FakePlatformAdapter()
+        destination.get_destination_state = auth_error_state  # type: ignore[method-assign]
+
+        result = self.service.resume(job, destination, confirmed=True)
+
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.error_code, "auth_revoked")
+        self.assertEqual(job.verification_status, VerificationStatus.NOT_RUN)
+        self.assertEqual(result["verification_status"], VerificationStatus.NOT_RUN)
+        self.assertTrue(result["outcome"].aborted)
+        self.assertEqual(result["outcome"].abort_error, "auth_revoked")
+        self.assertIsNotNone(job.finished_at)
+
+        reloaded = self.service.jobs.get(job.id)
+        assert reloaded is not None
+        self.assertEqual(reloaded.status, JobStatus.FAILED)
+        self.assertEqual(reloaded.error_code, "auth_revoked")
+        self.assertEqual(reloaded.verification_status, VerificationStatus.NOT_RUN)
+
+    def test_authorization_error_during_resume_destination_state_is_fatal(self) -> None:
+        """AuthorizationError during resume destination state recovery transitions job to FAILED."""
+        job, _ = self._create_and_plan_job()
+        transition(job, JobStatus.IMPORTING)
+        transition(job, JobStatus.PAUSED)
+        self.service.jobs.update(job)
+
+        def authz_error_state(sections=None) -> DestinationState:
+            raise AuthorizationError(code="scope_missing", message="Missing permission")
+
+        destination = FakePlatformAdapter()
+        destination.get_destination_state = authz_error_state  # type: ignore[method-assign]
+
+        result = self.service.resume(job, destination, confirmed=True)
+
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.error_code, "scope_missing")
+        self.assertEqual(job.verification_status, VerificationStatus.NOT_RUN)
+        self.assertEqual(result["verification_status"], VerificationStatus.NOT_RUN)
+        self.assertTrue(result["outcome"].aborted)
+        self.assertEqual(result["outcome"].abort_error, "scope_missing")
+        self.assertIsNotNone(job.finished_at)
+
+        reloaded = self.service.jobs.get(job.id)
+        assert reloaded is not None
+        self.assertEqual(reloaded.status, JobStatus.FAILED)
+        self.assertEqual(reloaded.error_code, "scope_missing")
+        self.assertEqual(reloaded.verification_status, VerificationStatus.NOT_RUN)
+
+    def test_resume_auth_failure_with_no_executable_items_never_completes(self) -> None:
+        """A resume run with only ambiguous/non-executable items transitions to FAILED upon auth error, never COMPLETED."""
+        job = self.service.create_job(new_account("src-amb"), new_account("dst-amb"))
+        item = TransferItem.create(
+            job.id,
+            EntityType.TRACK,
+            Platform.TIDAL,
+            "track-amb",
+            Platform.TIDAL,
+            operation=TransferOperation.SAVE_TRACK,
+        )
+        item.mark(ItemStatus.AMBIGUOUS)
+        self.service.items.add_many([item])
+        # Position job in PAUSED state
+        job.status = JobStatus.PAUSED
+        self.service.jobs.update(job)
+
+        def auth_error_state(sections=None) -> DestinationState:
+            raise AuthenticationError(code="token_expired", message="Token expired")
+
+        destination = FakePlatformAdapter()
+        destination.get_destination_state = auth_error_state  # type: ignore[method-assign]
+
+        result = self.service.resume(job, destination, confirmed=True)
+
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertNotEqual(job.status, JobStatus.COMPLETED)
+        self.assertEqual(job.error_code, "token_expired")
+        self.assertEqual(job.verification_status, VerificationStatus.NOT_RUN)
+        self.assertEqual(result["verification_status"], VerificationStatus.NOT_RUN)
 
     def test_completed_job_remains_terminal(self) -> None:
         """All attempts to transition out of COMPLETED are rejected."""
@@ -572,6 +662,10 @@ class VerificationSemanticsTests(unittest.TestCase):
         self.assertEqual(reloaded.status, JobStatus.COMPLETED)
         self.assertEqual(reloaded.verification_status, VerificationStatus.NOT_RUN)
 
+    test_dry_run_remains_completed_with_verification_not_run = (
+        test_dry_run_completes_without_fake_verification_success
+    )
+
     # -- Section 30: Finalization Matrix --------------------------------------
 
     def test_finalization_matrix_cancel(self) -> None:
@@ -613,7 +707,7 @@ class VerificationSemanticsTests(unittest.TestCase):
 
     # -- Section 31: Backward compatibility -----------------------------------
 
-    def test_legacy_job_deserialization_defaults_verification_status_to_not_run(self) -> None:
+    def test_legacy_job_without_verification_status_defaults_to_not_run(self) -> None:
         """Legacy persisted jobs lacking verification_status load safely as NOT_RUN."""
         legacy_data = {
             "id": "job_legacy_123",
@@ -629,17 +723,44 @@ class VerificationSemanticsTests(unittest.TestCase):
         self.assertEqual(loaded.status, JobStatus.COMPLETED)
         self.assertEqual(loaded.verification_status, VerificationStatus.NOT_RUN)
 
-        # Corrupted verification_status also defaults safely to NOT_RUN
-        corrupted_data = dict(legacy_data, verification_status="completely_bogus_status")
-        loaded_corrupted = TransferJob.from_dict(corrupted_data)
-        self.assertEqual(loaded_corrupted.verification_status, VerificationStatus.NOT_RUN)
+    def test_unknown_persisted_verification_status_fails_closed(self) -> None:
+        """Explicit unknown/corrupted verification_status fails closed with InvalidPersistedStateError."""
+        data = {
+            "id": "job_corrupt_123",
+            "source_platform": "tidal",
+            "destination_platform": "spotify",
+            "status": "completed",
+            "total_items": 10,
+            "processed_items": 10,
+            "successful_items": 10,
+            "verification_status": "completely_bogus_status",
+        }
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferJob.from_dict(data)
+
+        # Confirm repository deserialization also raises InvalidPersistedStateError
+        with tempfile.TemporaryDirectory() as td:
+            repo = JsonTransferJobRepository(Path(td))
+            from music_transfer.infrastructure.persistence import atomic_write_json
+            atomic_write_json(repo._path("job_corrupt_123"), data)
+            with self.assertRaises(InvalidPersistedStateError):
+                repo.get("job_corrupt_123")
 
     # -- Section 13: Result aggregation unit tests ----------------------------
 
     def test_aggregate_verification_status_rules(self) -> None:
         """Unit tests for aggregate_verification_status logic."""
-        # Empty -> NOT_RUN
-        self.assertEqual(aggregate_verification_status({}), VerificationStatus.NOT_RUN)
+        # Empty when verification not attempted -> NOT_RUN
+        self.assertEqual(
+            aggregate_verification_status({}, verification_attempted=False),
+            VerificationStatus.NOT_RUN,
+        )
+
+        # Empty when verification attempted -> PARTIAL (never PASSED or NOT_RUN)
+        self.assertEqual(
+            aggregate_verification_status({}, verification_attempted=True),
+            VerificationStatus.PARTIAL,
+        )
 
         # All passed -> PASSED
         passed_result = VerificationResult(success=True, expected_count=5, actual_count=5)
@@ -743,6 +864,83 @@ class VerificationSemanticsTests(unittest.TestCase):
         view = report_view(job, report)
         self.assertEqual(view.verification_status, "passed")
         self.assertEqual(view.as_dict()["verification_status"], "passed")
+
+
+    def test_normal_verification_with_no_results_is_partial_not_not_run(self) -> None:
+        """When execution runs normally but verification produces no results, status is COMPLETED / PARTIAL with warning."""
+        # Create a job with an item that does not generate verifiable sets/playlists
+        # (e.g., entity_type unsupported for verification or only skipped items without destination_id)
+        job = self.service.create_job(new_account("src-skip"), new_account("dst-skip"))
+        item = TransferItem.create(
+            job.id,
+            EntityType.TRACK,
+            Platform.TIDAL,
+            "track-skip",
+            Platform.TIDAL,
+            operation=TransferOperation.SAVE_TRACK,
+        )
+        item.mark(ItemStatus.SKIPPED)
+        self.service.items.add_many([item])
+        job.status = JobStatus.WAITING_CONFIRMATION
+        self.service.jobs.update(job)
+
+        destination = FakePlatformAdapter()
+        result = self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(job.status, JobStatus.COMPLETED)
+        self.assertEqual(job.verification_status, VerificationStatus.PARTIAL)
+        self.assertNotEqual(job.verification_status, VerificationStatus.NOT_RUN)
+        self.assertNotEqual(job.verification_status, VerificationStatus.PASSED)
+        self.assertEqual(result["verification_status"], VerificationStatus.PARTIAL)
+        self.assertIn("nothing_verifiable", result["report"].warnings)
+
+    def test_empty_verification_is_never_passed(self) -> None:
+        """Empty verification results must never aggregate to PASSED under any circumstances."""
+        self.assertNotEqual(
+            aggregate_verification_status({}, verification_attempted=True),
+            VerificationStatus.PASSED,
+        )
+        self.assertNotEqual(
+            aggregate_verification_status({}, verification_attempted=False),
+            VerificationStatus.PASSED,
+        )
+
+    def test_already_existing_track_is_included_in_expected_verification_state(self) -> None:
+        """Confirmed desired ALREADY_EXISTS set-like entity is included in expected verification state without mutating item status."""
+        job = self.service.create_job(new_account("src-ae"), new_account("dst-ae"))
+        item = TransferItem.create(
+            job.id,
+            EntityType.TRACK,
+            Platform.TIDAL,
+            "track-ae",
+            Platform.TIDAL,
+            operation=TransferOperation.SAVE_TRACK,
+        )
+        item.destination_id = "dst-track-ae"
+        # Item was found already existing at destination during execution
+        item.mark(ItemStatus.ALREADY_EXISTS)
+        self.service.items.add_many([item])
+        job.status = JobStatus.WAITING_CONFIRMATION
+        self.service.jobs.update(job)
+
+        # Destination contains the item
+        destination = FakePlatformAdapter(
+            tracks=[track("Track AE", identifier="dst-track-ae")]
+        )
+
+        result = self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(job.status, JobStatus.COMPLETED)
+        self.assertEqual(job.verification_status, VerificationStatus.PASSED)
+        self.assertEqual(result["verification_status"], VerificationStatus.PASSED)
+        self.assertIn("tracks", result["verification"])
+        self.assertEqual(result["verification"]["tracks"]["expected_count"], 1)
+        self.assertEqual(result["verification"]["tracks"]["actual_count"], 1)
+
+        # Invariant: verification must remain read-only and not mutate ALREADY_EXISTS into TRANSFERRED
+        persisted_items = self.service.items.list_for_job(job.id)
+        self.assertEqual(len(persisted_items), 1)
+        self.assertEqual(persisted_items[0].status, ItemStatus.ALREADY_EXISTS)
 
 
 if __name__ == "__main__":

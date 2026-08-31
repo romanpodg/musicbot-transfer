@@ -52,6 +52,7 @@ from ...core.transfer import (
     TransferPlanner,
     TransferVerifier,
     build_report,
+    scrub_credentials,
     status_after_execution,
     transition,
 )
@@ -287,8 +288,15 @@ class TransferService:
                 verifier = TransferVerifier(destination, logger=self._logger)
                 results = verifier.verify_job(job, self._items.list_for_job(job.id))
                 verification = verifier.as_report(results)
-                verif_status = verifier.aggregate_status(results)
+                verif_status = verifier.aggregate_status(
+                    results, verification_attempted=True
+                )
                 job.verification_status = verif_status
+                if not results:
+                    self._logger.warning(
+                        "event=verification_empty job_id=%s reason=nothing_verifiable",
+                        job.id,
+                    )
                 if verif_status is VerificationStatus.PASSED:
                     self._logger.info(
                         "event=verification_passed job_id=%s verification_status=%s",
@@ -336,6 +344,8 @@ class TransferService:
                 self._jobs.update(job)
                 verification = {}
         report = build_report(job, self._items.list_for_job(job.id), outcome)
+        if job.verification_status is VerificationStatus.PARTIAL and not verification:
+            report.warnings.append("nothing_verifiable")
         report.finish()
         self._logger.info(
             "event=job_finished job_id=%s status=%s verification_status=%s transferred=%d failed=%d skipped=%d",
@@ -382,7 +392,32 @@ class TransferService:
             )
         try:
             state = destination.get_destination_state()
-        except Exception as error:  # noqa: BLE001 - reconciliation is best-effort
+        except (AuthenticationError, AuthorizationError) as error:
+            self._logger.error(
+                "event=resume_fatal_auth_error job_id=%s error_type=%s error_code=%s",
+                job.id,
+                type(error).__name__,
+                error.code,
+            )
+            transition(job, JobStatus.FAILED)
+            job.error_code = error.code
+            job.verification_status = VerificationStatus.NOT_RUN
+            job.finished_at = job.updated_at
+            self._jobs.update(job)
+            outcome = ExecutionOutcome(
+                aborted=True,
+                abort_error=error.code,
+                abort_reason=scrub_credentials(error.message),
+            )
+            report = build_report(job, self._items.list_for_job(job.id), outcome)
+            report.finish()
+            return {
+                "report": report,
+                "verification": {},
+                "verification_status": job.verification_status,
+                "outcome": outcome,
+            }
+        except Exception as error:  # noqa: BLE001 - non-auth reconciliation is best-effort
             self._logger.warning(
                 "event=resume_state_unavailable job_id=%s error_type=%s",
                 job.id,

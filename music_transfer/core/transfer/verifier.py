@@ -150,7 +150,7 @@ class TransferVerifier:
                 item.destination_id
                 for item in items
                 if item.entity_type is entity_type
-                and item.status is ItemStatus.TRANSFERRED
+                and item.status in (ItemStatus.TRANSFERRED, ItemStatus.ALREADY_EXISTS)
                 and item.destination_id
             ]
             if not expected:
@@ -209,11 +209,15 @@ class TransferVerifier:
 
     @staticmethod
     def aggregate_status(
-        results: dict[str, VerificationResult]
+        results: dict[str, VerificationResult],
+        *,
+        verification_attempted: bool = True,
     ) -> VerificationStatus:
         """Determine aggregate verification status across all verified containers."""
 
-        return aggregate_verification_status(results)
+        return aggregate_verification_status(
+            results, verification_attempted=verification_attempted
+        )
 
     @staticmethod
     def as_report(results: dict[str, VerificationResult]) -> dict[str, Any]:
@@ -223,12 +227,16 @@ class TransferVerifier:
 
 
 def aggregate_verification_status(
-    results: dict[str, VerificationResult]
+    results: dict[str, VerificationResult],
+    *,
+    verification_attempted: bool = True,
 ) -> VerificationStatus:
     """Determine the aggregate verification status across all verified containers.
 
     Aggregation rules:
-    - NOT_RUN: No sections were verified (empty results).
+    - If results are empty:
+      - If verification was NOT attempted (dry run, early fatal abort): NOT_RUN.
+      - If verification WAS attempted but nothing was verifiable: PARTIAL.
     - FAILED: At least one section has a confirmed discrepancy (missing items,
       unexpected items, or order mismatches).
     - PARTIAL: No confirmed discrepancies, but one or more sections could not
@@ -238,7 +246,7 @@ def aggregate_verification_status(
     """
 
     if not results:
-        return VerificationStatus.NOT_RUN
+        return VerificationStatus.PARTIAL if verification_attempted else VerificationStatus.NOT_RUN
 
     has_mismatch = False
     has_partial = False

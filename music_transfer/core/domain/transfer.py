@@ -224,12 +224,18 @@ class TransferJob:
         """Rebuild a job from persisted data."""
 
         content = value.get("requested_content") or []
-        raw_verification_status = value.get("verification_status")
-        if raw_verification_status is not None:
+        # Invariant: missing verification_status defaults to NOT_RUN for backward compatibility (Case A).
+        # Explicit known values parse normally (Case B).
+        # Explicit unknown/corrupted values MUST fail closed by raising InvalidPersistedStateError (Case C).
+        if "verification_status" in value and value["verification_status"] is not None:
+            raw_verification_status = value["verification_status"]
             try:
                 verification_status = VerificationStatus(str(raw_verification_status))
-            except ValueError:
-                verification_status = VerificationStatus.NOT_RUN
+            except ValueError as error:
+                job_id = value.get("id", "<unknown>")
+                raise InvalidPersistedStateError(
+                    f"Invalid persisted verification_status '{raw_verification_status}' for job '{job_id}'"
+                ) from error
         else:
             verification_status = VerificationStatus.NOT_RUN
 

@@ -187,3 +187,15 @@ class TransferOperation(StrEnum):
     CREATE_PLAYLIST = "create_playlist"
     ADD_PLAYLIST_ITEM = "add_playlist_item"
 
+
+class MutationState(StrEnum):
+    """Durable intent tracking for non-idempotent destination operations.
+
+    Recorded before an external mutating call so recovery can determine
+    whether a write was in flight if the process crashed.
+    """
+
+    NONE = "none"
+    IN_FLIGHT = "in_flight"
+
+

@@ -32,10 +32,12 @@ from music_transfer.core.enums import (
     EntityType,
     ItemStatus,
     JobStatus,
+    MutationState,
     Platform,
     TransferOperation,
 )
 from music_transfer.core.errors import (
+    PersistenceError,
     TemporaryPlatformError,
     TransferConfigurationError,
     UnsupportedCapabilityError,
@@ -1299,7 +1301,500 @@ class PlaylistRecoveryTests(unittest.TestCase):
         self.assertEqual(item_b_after.status, ItemStatus.AMBIGUOUS)
         self.assertEqual(item_b_after.write_position, 1)
 
+    # -------------------------------------------------------------------------
+    # Test 24: Playlist mutation intent is persisted before remote write
+    # -------------------------------------------------------------------------
+    def test_playlist_mutation_intent_is_persisted_before_remote_write(self) -> None:
+        """Test 24: Durable intent checkpoint.
+
+        Verify that mutation_state = IN_FLIGHT is written durably to storage
+        before destination.add_playlist_item() is invoked.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        saw_inflight_in_storage = False
+
+        original_add = destination.add_playlist_item
+
+        def observing_add_playlist_item(container_id: str, track_id: str) -> None:
+            nonlocal saw_inflight_in_storage
+            stored = self.service.items.list_for_job(job.id)
+            target = next(it for it in stored if it.id == item_a.id)
+            if target.mutation_state == MutationState.IN_FLIGHT:
+                saw_inflight_in_storage = True
+            original_add(container_id, track_id)
+
+        destination.add_playlist_item = observing_add_playlist_item  # type: ignore[method-assign]
+
+        self.service.resume(job, destination, confirmed=True)
+
+        self.assertTrue(saw_inflight_in_storage, "mutation_state=IN_FLIGHT was not persisted prior to add_playlist_item")
+        final_item = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertEqual(final_item.status, ItemStatus.TRANSFERRED)
+        self.assertEqual(final_item.mutation_state, MutationState.NONE)
+
+    # -------------------------------------------------------------------------
+    # Test 25: Playlist write is not sent when mutation intent checkpoint fails
+    # -------------------------------------------------------------------------
+    def test_playlist_write_is_not_sent_when_mutation_intent_checkpoint_fails(self) -> None:
+        """Test 25: Persistence failure aborts before mutation.
+
+        If persisting mutation_state = IN_FLIGHT raises an error,
+        destination.add_playlist_item() MUST NOT be called.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        remote_mutation_called = False
+
+        def spy_add(container_id: str, track_id: str) -> None:
+            nonlocal remote_mutation_called
+            remote_mutation_called = True
+
+        destination.add_playlist_item = spy_add  # type: ignore[method-assign]
+
+        original_update = self.service.items.update
+
+        def failing_update(item: TransferItem) -> TransferItem:
+            if item.id == item_a.id and item.mutation_state == MutationState.IN_FLIGHT:
+                raise PersistenceError("disk_full")
+            return original_update(item)
+
+        self.service.items.update = failing_update  # type: ignore[method-assign]
+
+        self.service.resume(job, destination, confirmed=True)
+
+        self.assertFalse(remote_mutation_called, "Remote write was called despite mutation checkpoint failure")
+
+    # -------------------------------------------------------------------------
+    # Test 26: Resume reconciles persisted in-flight commit without duplicate
+    # -------------------------------------------------------------------------
+    def test_resume_reconciles_persisted_inflight_commit_without_duplicate(self) -> None:
+        """Test 26: Crash recovery when mutation landed remotely.
+
+        Simulates process crash after add_playlist_item succeeded remotely,
+        leaving mutation_state = IN_FLIGHT on disk.
+        On resume, destination sequence shows track committed.
+        Reconciliation must mark item TRANSFERRED, clear mutation_state to NONE,
+        and issue zero duplicate writes.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[PlaylistItem(position=1, track=track("A", identifier="dst-a"))],
+            )
+        )
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        calls: list[tuple[str, str]] = []
+        destination.add_playlist_item = lambda cid, tid: calls.append((cid, tid))  # type: ignore[method-assign]
+
+        self.service.resume(job, destination, confirmed=True)
+
+        self.assertEqual(len(calls), 0, "add_playlist_item was called despite item already committed")
+        reconciled_a = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertEqual(reconciled_a.status, ItemStatus.TRANSFERRED)
+        self.assertEqual(reconciled_a.mutation_state, MutationState.NONE)
+
+    # -------------------------------------------------------------------------
+    # Test 27: Resume does not retry in-flight write when destination is unreadable
+    # -------------------------------------------------------------------------
+    def test_resume_does_not_retry_inflight_playlist_write_when_destination_is_unreadable(self) -> None:
+        """Test 27: Unreadable destination with IN_FLIGHT intent fails closed.
+
+        If destination does not support playlist_item_ids() and mutation_state is
+        IN_FLIGHT, resuming must NOT blindly re-write. It must mark AMBIGUOUS with
+        'playlist_commit_unverifiable'.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        def unreadable_playlist_item_ids(container_id: str) -> list[str]:
+            raise UnsupportedCapabilityError("playlist_inspection_unsupported")
+
+        destination.playlist_item_ids = unreadable_playlist_item_ids  # type: ignore[method-assign]
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        calls: list[tuple[str, str]] = []
+        destination.add_playlist_item = lambda cid, tid: calls.append((cid, tid))  # type: ignore[method-assign]
+
+        self.service.resume(job, destination, confirmed=True)
+
+        self.assertEqual(len(calls), 0, "add_playlist_item was called on unreadable destination with in-flight mutation")
+        final_a = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertEqual(final_a.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(final_a.last_error, "playlist_commit_unverifiable")
+        self.assertEqual(final_a.last_failure_kind, "ambiguous")
+
+    # -------------------------------------------------------------------------
+    # Test 28: Resume retries in-flight write only after confirmed absence
+    # -------------------------------------------------------------------------
+    def test_resume_retries_inflight_write_only_after_confirmed_absence(self) -> None:
+        """Test 28: Confirmed absence clears stale intent and allows retry.
+
+        If mutation_state is IN_FLIGHT but destination inspection confirms the
+        exact expected prefix and absence of the current track, stale intent is
+        cleared and the write proceeds normally to TRANSFERRED.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        calls: list[tuple[str, str]] = []
+        original_add = destination.add_playlist_item
+
+        def tracking_add(container_id: str, track_id: str) -> None:
+            calls.append((container_id, track_id))
+            original_add(container_id, track_id)
+
+        destination.add_playlist_item = tracking_add  # type: ignore[method-assign]
+
+        self.service.resume(job, destination, confirmed=True)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0], ("dst-pl1", "dst-a"))
+        final_a = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertEqual(final_a.status, ItemStatus.TRANSFERRED)
+        self.assertEqual(final_a.mutation_state, MutationState.NONE)
+
+    # -------------------------------------------------------------------------
+    # Test 29: Resume with inconclusive inspection fails safe without writes
+    # -------------------------------------------------------------------------
+    def test_resume_inconclusive_inspection_fails_safe_without_writes(self) -> None:
+        """Test 29: Inconclusive destination check during resume fails safe.
+
+        If inspection raises TemporaryPlatformError while mutation intent is
+        IN_FLIGHT, the item is marked AMBIGUOUS with playlist_state_inconclusive
+        and NO destination writes are made.
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[],
+            )
+        )
+
+        def flaky_inspection(container_id: str) -> list[str]:
+            raise TemporaryPlatformError("network_timeout")
+
+        destination.playlist_item_ids = flaky_inspection  # type: ignore[method-assign]
+
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        calls: list[tuple[str, str]] = []
+        destination.add_playlist_item = lambda cid, tid: calls.append((cid, tid))  # type: ignore[method-assign]
+
+        self.service.resume(job, destination, confirmed=True)
+
+        self.assertEqual(len(calls), 0)
+        final_a = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertEqual(final_a.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(final_a.last_error, "playlist_state_inconclusive")
+        self.assertEqual(final_a.last_failure_kind, "ambiguous")
+
+    # -------------------------------------------------------------------------
+    # Test 30: Transfer item mutation_state serialization and backward compatibility
+    # -------------------------------------------------------------------------
+    def test_transfer_item_mutation_state_serialization_and_backward_compatibility(self) -> None:
+        """Test 30: Serialization and backward compatibility for mutation_state.
+
+        Verify as_dict preserves mutation_state, from_dict restores it, and legacy
+        dictionaries without mutation_state default safely to MutationState.NONE.
+        """
+        item = TransferItem.create(
+            "job-1",
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "trk-1",
+            Platform.TIDAL,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        d = item.as_dict()
+        self.assertEqual(d["mutation_state"], "in_flight")
+
+        restored = TransferItem.from_dict(d)
+        self.assertEqual(restored.mutation_state, MutationState.IN_FLIGHT)
+
+        # Legacy payload missing 'mutation_state'
+        del d["mutation_state"]
+        legacy_restored = TransferItem.from_dict(d)
+        self.assertEqual(legacy_restored.mutation_state, MutationState.NONE)
+
+    # -------------------------------------------------------------------------
+    # Test 31: Retry selection excludes unresolved in-flight items
+    # -------------------------------------------------------------------------
+    def test_retry_selection_excludes_unresolved_inflight_items(self) -> None:
+        """Test 31: select_for_retry excludes items with mutation_state == IN_FLIGHT.
+
+        Even if an item is in a retryable status (such as FAILED or AMBIGUOUS),
+        it MUST NOT be directly selected for retry while its mutation intent remains
+        unresolved (IN_FLIGHT).
+        """
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        item_normal_failed = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "trk-1",
+            Platform.TIDAL,
+            mutation_state=MutationState.NONE,
+        )
+        item_normal_failed.status = ItemStatus.FAILED
+
+        item_inflight_ambiguous = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "trk-2",
+            Platform.TIDAL,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        item_inflight_ambiguous.status = ItemStatus.AMBIGUOUS
+
+        item_inflight_failed = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "trk-3",
+            Platform.TIDAL,
+            mutation_state=MutationState.IN_FLIGHT,
+        )
+        item_inflight_failed.status = ItemStatus.FAILED
+
+        self.service.items.add_many([item_normal_failed, item_inflight_ambiguous, item_inflight_failed])
+
+        # Default retry selection queries retryable statuses (FAILED, AMBIGUOUS, etc.)
+        selected = self.service.recovery.select_for_retry(job.id)
+        selected_ids = [it.id for it in selected]
+
+        self.assertIn(item_normal_failed.id, selected_ids)
+        self.assertNotIn(item_inflight_ambiguous.id, selected_ids)
+        self.assertNotIn(item_inflight_failed.id, selected_ids)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

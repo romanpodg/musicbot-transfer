@@ -31,7 +31,7 @@ from ..domain import (
     TransferProgress,
     TransferReport,
 )
-from ..enums import EntityType, ItemStatus, JobStatus, TransferOperation
+from ..enums import EntityType, ItemStatus, JobStatus, MutationState, TransferOperation
 from ..errors import (
     AmbiguousOperationError,
     AuthenticationError,
@@ -350,6 +350,7 @@ class TransferExecutor:
             return
         item.last_failure_kind = None
         item.last_error = None
+        item.mutation_state = MutationState.NONE
         item.mark(ItemStatus.TRANSFERRED)
         self._items.update(item)
         self._logger.info(
@@ -418,6 +419,16 @@ class TransferExecutor:
         self._reconcile(item, all_items, container_id)
         if item.status is ItemStatus.TRANSFERRED:
             return
+
+        # Write ordering invariant: persist mutation intent = IN_FLIGHT BEFORE remote call.
+        # If persisting IN_FLIGHT fails, the exception propagates and add_playlist_item is never called.
+        item.mutation_state = MutationState.IN_FLIGHT
+        try:
+            self._items.update(item)
+        except Exception:
+            item.mutation_state = MutationState.NONE
+            raise
+
         try:
             self._destination.add_playlist_item(container_id, item.destination_id)
         except (AmbiguousOperationError, TemporaryPlatformError) as error:
@@ -454,6 +465,7 @@ class TransferExecutor:
                     and actual[item.write_position] == item.destination_id
                 ):
                     # The mutation actually committed remotely despite timeout/error!
+                    item.mutation_state = MutationState.NONE
                     item.mark(ItemStatus.TRANSFERRED)
                     self._items.update(item)
                     return
@@ -462,7 +474,9 @@ class TransferExecutor:
                     and actual == expected[: item.write_position]
                 ):
                     # Confirmed absence: remote state did not receive the item.
-                    # Re-raise the original error so standard retry/failure policies handle it.
+                    # Clear in-flight mutation state so item can be retried safely.
+                    item.mutation_state = MutationState.NONE
+                    self._items.update(item)
                     raise error
 
             # Inconclusive or diverged: fail safely without blind duplicates.
@@ -488,7 +502,12 @@ class TransferExecutor:
             return
         try:
             actual = list(self._destination.playlist_item_ids(container_id))
-        except UnsupportedCapabilityError:
+        except UnsupportedCapabilityError as error:
+            if item.mutation_state is MutationState.IN_FLIGHT:
+                item.last_failure_kind = "ambiguous"
+                item.mark(ItemStatus.AMBIGUOUS, error="playlist_commit_unverifiable")
+                self._items.update(item)
+                raise AmbiguousOperationError("playlist_commit_unverifiable") from error
             return
         except Exception as error:
             item.last_failure_kind = "ambiguous"
@@ -519,9 +538,26 @@ class TransferExecutor:
             item.mark(ItemStatus.AMBIGUOUS, error="playlist_resume_mismatch")
             self._items.update(item)
             raise AmbiguousOperationError("playlist_resume_mismatch")
+
         if len(actual) > item.write_position and actual[item.write_position] == item.destination_id:
             # The write landed before the checkpoint was saved.
+            item.mutation_state = MutationState.NONE
             item.mark(ItemStatus.TRANSFERRED)
+            self._items.update(item)
+            return
+
+        if (
+            len(actual) == item.write_position
+            and actual == expected[: item.write_position]
+            and item.mutation_state is MutationState.IN_FLIGHT
+        ):
+            # Confirmed absence: previous attempt did not commit. Clear stale intent.
+            self._logger.info(
+                "event=inflight_confirmed_absent item_id=%s write_position=%d",
+                item.id,
+                item.write_position,
+            )
+            item.mutation_state = MutationState.NONE
             self._items.update(item)
 
     @staticmethod

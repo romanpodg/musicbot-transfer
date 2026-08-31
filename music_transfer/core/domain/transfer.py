@@ -17,6 +17,7 @@ from ..enums import (
     ItemStatus,
     JobStatus,
     MatchMethod,
+    MutationState,
     OrderingMode,
     Platform,
     TransferOperation,
@@ -291,6 +292,7 @@ class TransferItem:
     status: ItemStatus = ItemStatus.PENDING
     attempt_count: int = 0
     operation: TransferOperation = TransferOperation.NONE
+    mutation_state: MutationState = MutationState.NONE
     last_error: str | None = None
     last_failure_kind: str | None = None
     created_at: str = field(default_factory=utc_now)
@@ -310,6 +312,7 @@ class TransferItem:
         container_source_id: str | None = None,
         source_metadata: dict[str, Any] | None = None,
         operation: TransferOperation = TransferOperation.NONE,
+        mutation_state: MutationState = MutationState.NONE,
     ) -> TransferItem:
         """Create a pending item with a fresh identifier."""
 
@@ -325,6 +328,7 @@ class TransferItem:
             container_source_id=container_source_id,
             source_metadata=dict(source_metadata or {}),
             operation=operation,
+            mutation_state=mutation_state,
         )
 
     def touch(self) -> None:
@@ -404,6 +408,7 @@ class TransferItem:
             "match_score": self.match_score,
             "status": str(self.status),
             "operation": str(self.operation),
+            "mutation_state": str(self.mutation_state),
             "attempt_count": self.attempt_count,
             "last_error": self.last_error,
             "last_failure_kind": self.last_failure_kind,
@@ -438,6 +443,15 @@ class TransferItem:
                 EntityType.PLAYLIST_ITEM: TransferOperation.ADD_PLAYLIST_ITEM,
             }.get(entity_type, TransferOperation.NONE)
 
+        raw_mutation_state = value.get("mutation_state")
+        if raw_mutation_state:
+            try:
+                mutation_state = MutationState(str(raw_mutation_state))
+            except ValueError:
+                mutation_state = MutationState.NONE
+        else:
+            mutation_state = MutationState.NONE
+
         raw_write_position = value.get("write_position")
         write_position = int(raw_write_position) if raw_write_position is not None else None
 
@@ -458,6 +472,7 @@ class TransferItem:
             match_score=float(value.get("match_score", 0.0) or 0.0),
             status=ItemStatus(str(value.get("status", ItemStatus.PENDING))),
             operation=operation,
+            mutation_state=mutation_state,
             attempt_count=int(value.get("attempt_count", 0)),
             last_error=value.get("last_error"),
             last_failure_kind=value.get("last_failure_kind"),

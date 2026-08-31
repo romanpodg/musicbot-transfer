@@ -18,7 +18,13 @@ import logging
 from typing import Any
 
 from ..domain import TransferItem, TransferJob
-from ..enums import RETRYABLE_ITEM_STATUSES, TERMINAL_ITEM_STATUSES, ItemStatus, JobStatus
+from ..enums import (
+    RETRYABLE_ITEM_STATUSES,
+    TERMINAL_ITEM_STATUSES,
+    ItemStatus,
+    JobStatus,
+    MutationState,
+)
 from ..ports import DestinationState, TransferItemRepository
 
 _LOGGER = logging.getLogger("music_transfer.recovery")
@@ -75,7 +81,11 @@ class RecoveryService:
         if unsafe:
             raise ValueError(f"retry_status_not_retryable:{sorted(status.value for status in unsafe)}")
         stored = self._items.list_for_job(job_id)
-        return [item for item in stored if item.status in wanted]
+        return [
+            item
+            for item in stored
+            if item.status in wanted and item.mutation_state is not MutationState.IN_FLIGHT
+        ]
 
     def counters(self, job_id: str) -> dict[str, int]:
         """Return per-status counts, always including every known status."""

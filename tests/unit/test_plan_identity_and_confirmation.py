@@ -199,6 +199,141 @@ class PlanIdentityAndRevisioningTests(unittest.TestCase):
 
         self.assertNotEqual(plan_zero.plan_hash, plan_none.plan_hash)
 
+    def test_mutation_driving_playlist_metadata_changes_plan_hash(self) -> None:
+        item_a = TransferPlanItem(
+            entity_type=EntityType.PLAYLIST,
+            source_id="p1",
+            destination_id=None,
+            operation=TransferOperation.CREATE_PLAYLIST,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            source_metadata={"name": "My Playlist", "description": "Desc A"},
+        )
+        item_b = TransferPlanItem(
+            entity_type=EntityType.PLAYLIST,
+            source_id="p1",
+            destination_id=None,
+            operation=TransferOperation.CREATE_PLAYLIST,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            source_metadata={"name": "My Playlist", "description": "Desc B"},
+        )
+        item_c = TransferPlanItem(
+            entity_type=EntityType.PLAYLIST,
+            source_id="p1",
+            destination_id=None,
+            operation=TransferOperation.CREATE_PLAYLIST,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            source_metadata={"name": "Different Name", "description": "Desc A"},
+        )
+
+        plan_a = TransferPlan.create("job_1", revision=1, items=(item_a,))
+        plan_b = TransferPlan.create("job_1", revision=1, items=(item_b,))
+        plan_c = TransferPlan.create("job_1", revision=1, items=(item_c,))
+
+        self.assertNotEqual(plan_a.plan_hash, plan_b.plan_hash)
+        self.assertNotEqual(plan_a.plan_hash, plan_c.plan_hash)
+
+    def test_full_source_metadata_survives_plan_hash_roundtrip(self) -> None:
+        metadata = {
+            "title": "Song Title",
+            "artists": ["Artist 1", "Artist 2"],
+            "isrc": "USRC12345678",
+            "duration_ms": 240000,
+            "name": "Playlist Name",
+            "description": "Playlist Description",
+            "track_count": 42,
+        }
+        item = TransferPlanItem(
+            entity_type=EntityType.TRACK,
+            source_id="t1",
+            destination_id="d1",
+            operation=TransferOperation.SAVE_TRACK,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            source_metadata=metadata,
+        )
+        plan = TransferPlan.create("job_1", revision=1, items=(item,))
+        original_hash = plan.plan_hash
+
+        payload = plan.as_dict()
+        reloaded = TransferPlan.from_dict(payload)
+        reloaded.plan_hash = original_hash
+
+        self.assertTrue(reloaded.verify_integrity())
+        self.assertEqual(reloaded.compute_hash(), original_hash)
+        self.assertEqual(reloaded.items[0].source_metadata, metadata)
+
+    def test_nullable_identifier_values_do_not_canonicalize_to_same_intent(self) -> None:
+        item_none = TransferPlanItem(
+            entity_type=EntityType.TRACK,
+            source_id="t1",
+            destination_id=None,
+            operation=TransferOperation.NONE,
+            planned_status=ItemStatus.PENDING,
+            match_method=MatchMethod.NONE,
+            match_score=0.0,
+        )
+        item_empty = TransferPlanItem(
+            entity_type=EntityType.TRACK,
+            source_id="t1",
+            destination_id="",
+            operation=TransferOperation.NONE,
+            planned_status=ItemStatus.PENDING,
+            match_method=MatchMethod.NONE,
+            match_score=0.0,
+        )
+
+        self.assertNotEqual(item_none.intent_payload(), item_empty.intent_payload())
+        self.assertNotEqual(item_none.canonical_dict(), item_empty.canonical_dict())
+
+        plan_none = TransferPlan.create("job_1", revision=1, items=(item_none,))
+        plan_empty = TransferPlan.create("job_1", revision=1, items=(item_empty,))
+        self.assertNotEqual(plan_none.plan_hash, plan_empty.plan_hash)
+
+        # Test container identifiers as well
+        item_c_none = TransferPlanItem(
+            entity_type=EntityType.PLAYLIST_ITEM,
+            source_id="t1",
+            destination_id="d1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            container_source_id=None,
+            container_destination_id=None,
+        )
+        item_c_empty = TransferPlanItem(
+            entity_type=EntityType.PLAYLIST_ITEM,
+            source_id="t1",
+            destination_id="d1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            planned_status=ItemStatus.MATCHED,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            container_source_id="",
+            container_destination_id="",
+        )
+        self.assertNotEqual(item_c_none.intent_payload(), item_c_empty.intent_payload())
+        plan_c_none = TransferPlan.create("job_1", revision=1, items=(item_c_none,))
+        plan_c_empty = TransferPlan.create("job_1", revision=1, items=(item_c_empty,))
+        self.assertNotEqual(plan_c_none.plan_hash, plan_c_empty.plan_hash)
+
+    def test_invalid_explicit_plan_setting_fails_closed_during_integrity_validation(self) -> None:
+        plan = TransferPlan.create("job_1", revision=1, items=())
+        plan.metadata["settings"] = {"ordering": "corrupted_invalid_mode"}
+
+        with self.assertRaises(InvalidPersistedStateError):
+            plan.canonical_payload()
+
+        with self.assertRaises(InvalidPersistedStateError):
+            plan.compute_hash()
+
 
 class PlanConfirmationSafetyTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -794,6 +929,65 @@ class PlanIntegrityAndDriftTests(unittest.TestCase):
                 "expected": "present",
                 "section": "unknown_section",
             })
+
+    def test_playlist_name_metadata_drift_is_rejected_before_write(self) -> None:
+        src_pl = playlist("Original Name", [track("Track 1", identifier="t1")])
+        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,))
+        source = FakePlatformAdapter(playlists=[src_pl])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Mutate runtime playlist name before execution
+        items = self.service.items.list_for_job(job.id)
+        for it in items:
+            if it.entity_type is EntityType.PLAYLIST:
+                it.source_metadata["name"] = "Changed Name"
+                self.service.items.update(it)
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.created_playlists, [])
+
+    def test_playlist_description_metadata_drift_is_rejected_before_write(self) -> None:
+        src_pl = playlist(
+            "My Playlist",
+            [track("Track 1", identifier="t1")],
+            description="Original Description",
+        )
+        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,))
+        source = FakePlatformAdapter(playlists=[src_pl])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
+        # Mutate runtime playlist description before execution
+        items = self.service.items.list_for_job(job.id)
+        for it in items:
+            if it.entity_type is EntityType.PLAYLIST:
+                it.source_metadata["description"] = "Changed Description"
+                self.service.items.update(it)
+
+        with self.assertRaises(PlanStaleError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(destination.created_playlists, [])
+
 
 
 class ResumeAndCompatibilityTests(unittest.TestCase):

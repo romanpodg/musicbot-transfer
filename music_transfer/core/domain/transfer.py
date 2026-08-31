@@ -111,6 +111,54 @@ class TransferSettings:
             dry_run=bool(value.get("dry_run", False)),
         )
 
+    @classmethod
+    def from_plan_dict(cls, value: dict[str, Any] | None) -> TransferSettings:
+        """Strict settings parser for TransferPlan integrity verification.
+
+        Fails closed on explicitly invalid values or unrecognized enum members.
+        """
+        if value is None:
+            return cls()
+        if not isinstance(value, dict):
+            raise InvalidPersistedStateError(
+                "invalid_persisted_state", "Plan settings must be a dict"
+            )
+
+        raw_ordering = value.get("ordering")
+        if raw_ordering is not None:
+            try:
+                ordering = OrderingMode(str(raw_ordering))
+            except ValueError as err:
+                raise InvalidPersistedStateError(
+                    "invalid_persisted_state",
+                    f"Invalid ordering mode in plan settings: '{raw_ordering}'",
+                ) from err
+        else:
+            ordering = OrderingMode.SOURCE_ORDER
+
+        return cls(
+            ordering=ordering,
+            preserve_visible_order=bool(value.get("preserve_visible_order", False)),
+            allow_explicit_to_clean_fallback=bool(
+                value.get("allow_explicit_to_clean_fallback", False)
+            ),
+            allow_duplicates_in_playlists=bool(
+                value.get("allow_duplicates_in_playlists", True)
+            ),
+            skip_already_existing=bool(value.get("skip_already_existing", True)),
+            max_item_attempts=max(1, int(value.get("max_item_attempts", 3))),
+            dry_run=bool(value.get("dry_run", False)),
+        )
+
+
+def canonicalize_metadata(value: Any) -> Any:
+    """Deterministically normalize source metadata for canonical plan hashing and comparison."""
+    if isinstance(value, dict):
+        return {str(k): canonicalize_metadata(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [canonicalize_metadata(v) for v in value]
+    return value
+
 
 # --------------------------------------------------------------------------
 # Job
@@ -537,6 +585,23 @@ class TransferItem:
             updated_at=str(value.get("updated_at", utc_now())),
         )
 
+    def intent_payload(self) -> dict[str, Any]:
+        """Return the canonical execution intent dictionary matching TransferPlanItem."""
+        return {
+            "container_destination_id": self.container_destination_id,
+            "container_source_id": self.container_source_id,
+            "destination_id": self.destination_id,
+            "entity_type": self.entity_type.value,
+            "match_method": self.match_method.value,
+            "match_score": round(self.match_score, 4),
+            "operation": self.operation.value,
+            "original_position": self.original_position,
+            "planned_status": self.status.value,
+            "source_id": self.source_id,
+            "source_metadata": canonicalize_metadata(self.source_metadata),
+            "write_position": self.write_position,
+        }
+
 
 
 # --------------------------------------------------------------------------
@@ -646,18 +711,12 @@ class TransferPlanItem:
             source_metadata=dict(value.get("source_metadata") or {}),
         )
 
-    def canonical_dict(self) -> dict[str, Any]:
-        """Return the canonical dictionary used for deterministic integrity hashing."""
-        raw_meta = self.source_metadata
-        plan_meta: dict[str, Any] = {}
-        for k in ("title", "artists", "isrc", "name"):
-            if k in raw_meta and raw_meta[k] is not None:
-                plan_meta[k] = raw_meta[k]
-
+    def intent_payload(self) -> dict[str, Any]:
+        """Return the authoritative dictionary representing approved execution intent."""
         return {
-            "container_destination_id": self.container_destination_id or "",
-            "container_source_id": self.container_source_id or "",
-            "destination_id": self.destination_id or "",
+            "container_destination_id": self.container_destination_id,
+            "container_source_id": self.container_source_id,
+            "destination_id": self.destination_id,
             "entity_type": self.entity_type.value,
             "match_method": self.match_method.value,
             "match_score": round(self.match_score, 4),
@@ -665,9 +724,13 @@ class TransferPlanItem:
             "original_position": self.original_position,
             "planned_status": self.planned_status.value,
             "source_id": self.source_id,
-            "source_metadata": plan_meta,
+            "source_metadata": canonicalize_metadata(self.source_metadata),
             "write_position": self.write_position,
         }
+
+    def canonical_dict(self) -> dict[str, Any]:
+        """Return the canonical dictionary used for deterministic integrity hashing."""
+        return self.intent_payload()
 
 
 VALID_PRECONDITION_SECTIONS: frozenset[str] = frozenset(
@@ -812,11 +875,23 @@ class TransferPlan:
         full material settings/context, approved-order items, sorted preconditions.
         """
         raw_settings = self.metadata.get("settings")
-        if isinstance(raw_settings, dict):
-            settings_dict = TransferSettings.from_dict(raw_settings).as_dict()
+        if raw_settings is not None:
+            if not isinstance(raw_settings, dict):
+                raise InvalidPersistedStateError(
+                    "invalid_persisted_state", "Plan settings metadata must be a dictionary"
+                )
+            settings_dict = TransferSettings.from_plan_dict(raw_settings).as_dict()
         else:
+            raw_ordering = self.metadata.get("ordering", OrderingMode.SOURCE_ORDER.value)
+            try:
+                ordering = OrderingMode(str(raw_ordering))
+            except ValueError as err:
+                raise InvalidPersistedStateError(
+                    "invalid_persisted_state",
+                    f"Invalid ordering mode in plan metadata: '{raw_ordering}'",
+                ) from err
             settings_dict = {
-                "ordering": str(self.metadata.get("ordering", "source_order")),
+                "ordering": str(ordering),
                 "preserve_visible_order": bool(self.metadata.get("preserve_visible_order", False)),
                 "allow_explicit_to_clean_fallback": bool(self.metadata.get("allow_explicit_to_clean_fallback", False)),
                 "allow_duplicates_in_playlists": bool(self.metadata.get("allow_duplicates_in_playlists", True)),

@@ -487,18 +487,7 @@ class TransferService:
                     item_drift = True
                 else:
                     for pi, ci in zip(plan.items, current_items, strict=True):
-                        if (
-                            ci.entity_type != pi.entity_type
-                            or ci.source_id != pi.source_id
-                            or ci.destination_id != pi.destination_id
-                            or ci.operation != pi.operation
-                            or ci.status != pi.planned_status
-                            or ci.match_method != pi.match_method
-                            or ci.container_source_id != pi.container_source_id
-                            or ci.container_destination_id != pi.container_destination_id
-                            or ci.original_position != pi.original_position
-                            or ci.write_position != pi.write_position
-                        ):
+                        if pi.intent_payload() != ci.intent_payload():
                             item_drift = True
                             break
 

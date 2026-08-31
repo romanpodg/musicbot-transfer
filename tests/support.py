@@ -76,7 +76,11 @@ def track(
 
 
 def playlist(
-    title: str, items: list[Track], *, identifier: str | None = None
+    title: str,
+    items: list[Track],
+    *,
+    identifier: str | None = None,
+    description: str | None = None,
 ) -> Playlist:
     """Build a playlist whose item positions follow the given order."""
 
@@ -84,6 +88,7 @@ def playlist(
         source_platform=Platform.TIDAL,
         source_id=identifier or title.casefold().replace(" ", "-"),
         name=title,
+        description=description,
         tracks=[
             PlaylistItem(position=index, track=item)
             for index, item in enumerate(items, start=1)

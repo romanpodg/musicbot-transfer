@@ -26,7 +26,7 @@ from typing import Any
 
 from ...core.domain import Account, AccountProfile
 from ...core.enums import Platform
-from ...core.errors import AuthenticationError, UnsupportedCapabilityError
+from ...core.errors import UnsupportedCapabilityError
 from ...core.ports import AccountRepository, MusicPlatformAdapter
 from ...platforms.registry import PlatformRegistry, default_registry
 from ..dto import AccountStatus

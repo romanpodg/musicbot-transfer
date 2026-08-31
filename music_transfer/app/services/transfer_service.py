@@ -25,12 +25,15 @@ from ...core.domain import (
     TransferProgress,
     TransferReport,
     TransferSettings,
+    new_identifier,
+    utc_now,
 )
 from ...core.enums import (
     ContentType,
     EntityType,
     ItemStatus,
     JobStatus,
+    MutationState,
     Platform,
     TransferOperation,
     VerificationStatus,
@@ -40,7 +43,13 @@ from ...core.errors import (
     AuthorizationError,
     ConfirmationRequired,
     InvalidStateTransition,
+    PlanConfirmationMismatch,
+    PlanIntegrityError,
+    PlanStaleError,
+    PlanValidationUnavailableError,
+    TemporaryPlatformError,
     TransferConfigurationError,
+    UnsupportedCapabilityError,
 )
 from ...core.matching import MatchingPolicy, TrackMatcher
 from ...core.ports import MusicPlatformAdapter, TransferItemRepository, TransferJobRepository
@@ -56,6 +65,7 @@ from ...core.transfer import (
     status_after_execution,
     transition,
 )
+from ...infrastructure.persistence import JsonTransferPlanRepository
 
 _LOGGER = logging.getLogger("music_transfer.app.transfer")
 
@@ -87,7 +97,11 @@ class TransferService:
     ) -> None:
         self._jobs = jobs
         self._items = items
-        self._plans = plans_repository
+        if plans_repository is None and hasattr(jobs, "_root"):
+            root = jobs._root.parent
+            self._plans = JsonTransferPlanRepository(root)
+        else:
+            self._plans = plans_repository
         self._matcher = matcher or TrackMatcher()
         self._planner = planner or TransferPlanner(self._matcher, logger)
         self._logger = logger or _LOGGER
@@ -110,6 +124,12 @@ class TransferService:
         """Return the item repository, so interfaces can read durable progress."""
 
         return self._items
+
+    @property
+    def plans(self) -> Any:
+        """Return the plan repository."""
+
+        return self._plans
 
     # -- creation ----------------------------------------------------------
 
@@ -186,6 +206,14 @@ class TransferService:
                 confirmation.  The confirmation gate sits on :meth:`execute`.
         """
 
+        existing_items = self._items.list_for_job(job.id)
+        has_started_execution = any(
+            it.status is ItemStatus.TRANSFERRED or it.mutation_state is MutationState.IN_FLIGHT
+            for it in existing_items
+        )
+        if has_started_execution:
+            raise TransferConfigurationError("cannot_replan_after_writes_started")
+
         transition(job, JobStatus.AUTHENTICATING)
         self._jobs.update(job)
         transition(job, JobStatus.EXPORTING)
@@ -203,20 +231,100 @@ class TransferService:
         transition(job, JobStatus.PLANNING)
         self._jobs.update(job)
         result = self._planner.build(job, snapshot, destination)
-        self._items.add_many(result.items)
+        plan = result.plan
+
+        # Determine next revision from durable repository (Section 15)
+        next_revision = 1
         if self._plans is not None:
-            self._plans.save(result.plan)
+            latest = self._plans.get(job.id)
+            if latest is not None and latest.revision:
+                next_revision = latest.revision + 1
+
+        plan.plan_id = new_identifier("plan")
+        plan.revision = next_revision
+        plan.plan_hash = plan.compute_hash()
+
+        if hasattr(self._items, "replace_for_job"):
+            self._items.replace_for_job(job.id, result.items)
+        else:
+            self._items.add_many(result.items)
+        if self._plans is not None:
+            self._plans.save(plan)
+
+        # Update active plan identity on TransferJob and clear previous confirmation (Invariant D)
+        job.active_plan_id = plan.plan_id
+        job.active_plan_revision = plan.revision
+        job.active_plan_hash = plan.plan_hash
+        job.confirmed_plan_id = None
+        job.confirmed_plan_revision = None
+        job.confirmed_plan_hash = None
+        job.confirmed_at = None
+
         job.total_items = result.summary.total_items
         job.touch()
         transition(job, JobStatus.WAITING_CONFIRMATION)
         self._jobs.update(job)
+
+        self._logger.info(
+            "event=plan_created job_id=%s plan_id=%s revision=%d hash_prefix=%s",
+            job.id,
+            plan.plan_id,
+            plan.revision,
+            plan.plan_hash[:8] if plan.plan_hash else "",
+        )
+
         if snapshot.is_partial:
             self._logger.warning(
                 "event=plan_source_partial job_id=%s sections=%s",
                 job.id,
                 ",".join(snapshot.incomplete_sections),
             )
-        return result.plan
+        return plan
+
+    # -- confirmation ------------------------------------------------------
+
+    def confirm_plan(
+        self,
+        job: TransferJob,
+        *,
+        plan_id: str,
+        revision: int,
+        plan_hash: str,
+    ) -> None:
+        """Confirm an exact plan revision before execution.
+
+        Invariant C: A plan confirmation applies only to the exact plan_id + revision + plan_hash.
+        """
+        if self._plans is None:
+            raise PlanIntegrityError("plan_repository_unavailable")
+
+        # Load active plan
+        plan = self._plans.get_by_id(plan_id) or self._plans.get(job.id)
+        if plan is None or not plan.verify_integrity():
+            raise PlanIntegrityError("plan_integrity_compromised")
+
+        if (
+            job.active_plan_id != plan_id
+            or job.active_plan_revision != revision
+            or job.active_plan_hash != plan_hash
+        ):
+            raise PlanConfirmationMismatch("plan_confirmation_mismatch")
+
+        if plan.plan_id != plan_id or plan.revision != revision or plan.plan_hash != plan_hash:
+            raise PlanConfirmationMismatch("plan_confirmation_mismatch")
+
+        job.confirmed_plan_id = plan_id
+        job.confirmed_plan_revision = revision
+        job.confirmed_plan_hash = plan_hash
+        job.confirmed_at = utc_now()
+        self._jobs.update(job)
+
+        self._logger.info(
+            "event=plan_confirmed job_id=%s plan_id=%s revision=%d",
+            job.id,
+            plan_id,
+            revision,
+        )
 
     # -- execution ---------------------------------------------------------
 
@@ -234,7 +342,7 @@ class TransferService:
         Args:
             job: The job to run.
             destination: The destination adapter.
-            confirmed: Must be ``True``.  Confirmation is an interface concern,
+            confirmed: Must be ``True``. Confirmation is an interface concern,
                 but the service refuses to write without it so a forgotten UI
                 check cannot mutate a library.
             progress: Optional progress sink.
@@ -244,11 +352,169 @@ class TransferService:
             A dictionary with ``report``, ``verification``, and ``outcome``.
 
         Raises:
-            ConfirmationRequired: If ``confirmed`` is ``False``.
+            ConfirmationRequired: If ``confirmed`` is ``False`` or no durable confirmation exists.
+            PlanStaleError: If plan is stale or preconditions/intent drifted.
+            PlanIntegrityError: If plan failed integrity verification.
         """
 
         if not confirmed:
             raise ConfirmationRequired("transfer_confirmation_required")
+
+        current_items = self._items.list_for_job(job.id)
+        from ...core.transfer.planner import validate_plan_write_positions
+        validate_plan_write_positions(current_items)
+
+        # Check if execution already started (durable writes / in flight)
+        has_started_execution = any(
+            it.status is ItemStatus.TRANSFERRED or it.mutation_state is MutationState.IN_FLIGHT
+            for it in current_items
+        )
+
+        # ---------------------------------------------------------------------
+        # Preflight Safety Checks (Section 25-39, 44, Invariants A, B, C, F, H, I, K, L)
+        # ---------------------------------------------------------------------
+        # Section 44: Narrow backward-compatible resume policy for legacy jobs
+        # that were already IMPORTING before Phase 1.3B with confirmed evidence
+        # of started execution (TRANSFERRED or IN_FLIGHT items).
+        is_legacy_resuming_job = (
+            job.status is JobStatus.IMPORTING
+            and has_started_execution
+            and not job.confirmed_plan_id
+        )
+
+        if is_legacy_resuming_job:
+            self._logger.info(
+                "event=legacy_resume_mode job_id=%s reason=confirmed_prior_execution",
+                job.id,
+            )
+            plan = None
+        else:
+            # Check durable confirmation exists (Invariant A)
+            if not job.confirmed_plan_id:
+                raise ConfirmationRequired("transfer_confirmation_required")
+
+            # Confirmation must match active plan identity
+            if (
+                job.confirmed_plan_id != job.active_plan_id
+                or job.confirmed_plan_revision != job.active_plan_revision
+                or job.confirmed_plan_hash != job.active_plan_hash
+            ):
+                job.confirmed_plan_id = None
+                job.confirmed_plan_revision = None
+                job.confirmed_plan_hash = None
+                job.confirmed_at = None
+                job.error_code = "plan_stale"
+                self._jobs.update(job)
+                self._logger.warning("event=plan_stale reason=active_plan_mismatch job_id=%s", job.id)
+                raise PlanStaleError("plan_stale")
+
+            # Load plan from repository and verify integrity (Invariant F)
+            if self._plans is None:
+                raise PlanIntegrityError("plan_repository_unavailable")
+
+            plan = self._plans.get_by_id(job.confirmed_plan_id)
+            if plan is None:
+                plan = self._plans.get(job.id)
+
+            if plan is None or not plan.verify_integrity():
+                raise PlanIntegrityError("plan_integrity_compromised")
+
+            # Legacy unversioned plan check (Section 42-43)
+            if not plan.plan_id or not plan.plan_hash or plan.revision <= 0:
+                raise ConfirmationRequired("transfer_confirmation_required")
+
+            # Verify plan matches job confirmation
+            if (
+                plan.plan_id != job.confirmed_plan_id
+                or plan.revision != job.confirmed_plan_revision
+                or plan.plan_hash != job.confirmed_plan_hash
+            ):
+                raise PlanStaleError("plan_stale")
+
+            # Execution item drift check (Invariant H, Section 27-28)
+            if not has_started_execution and plan.items:
+                # Build map of plan items by (entity_type, container_source_id or "", original_position or 0, source_id)
+                # Compare plan-critical fields
+                plan_item_map = {
+                    (it.entity_type, it.container_source_id or "", it.original_position or 0, it.source_id): it
+                    for it in plan.items
+                }
+                drift_detected = False
+                for ci in current_items:
+                    key = (ci.entity_type, ci.container_source_id or "", ci.original_position or 0, ci.source_id)
+                    pi = plan_item_map.get(key)
+                    if pi is None:
+                        drift_detected = True
+                        break
+                    if (
+                        ci.destination_id != pi.destination_id
+                        or ci.operation != pi.operation
+                        or ci.write_position != pi.write_position
+                        or ci.container_destination_id != pi.container_destination_id
+                    ):
+                        drift_detected = True
+                        break
+
+                if drift_detected:
+                    job.confirmed_plan_id = None
+                    job.confirmed_plan_revision = None
+                    job.confirmed_plan_hash = None
+                    job.confirmed_at = None
+                    job.error_code = "plan_stale"
+                    self._jobs.update(job)
+                    self._logger.warning("event=plan_stale reason=execution_intent_drift job_id=%s", job.id)
+                    raise PlanStaleError("plan_stale")
+
+            # Destination precondition drift check (Invariant I, K, M, Section 30-39)
+            if not has_started_execution and plan.preconditions:
+                try:
+                    dest_state = destination.get_destination_state()
+                except (AuthenticationError, AuthorizationError) as err:
+                    # Fatal auth error (Invariant K, Section 38)
+                    transition(job, JobStatus.FAILED)
+                    job.error_code = err.code
+                    job.verification_status = VerificationStatus.NOT_RUN
+                    job.finished_at = job.updated_at
+                    self._jobs.update(job)
+                    raise
+                except TemporaryPlatformError as err:
+                    raise PlanValidationUnavailableError("plan_validation_unavailable") from err
+                except UnsupportedCapabilityError:
+                    dest_state = None
+
+                if dest_state is not None:
+                    for pre in plan.preconditions:
+                        if not dest_state.is_trustworthy(pre.section):
+                            continue
+                        if pre.section == "tracks":
+                            actual = dest_state.has_track(pre.destination_id)
+                        elif pre.section == "albums":
+                            actual = pre.destination_id in dest_state.album_ids
+                        elif pre.section == "artists":
+                            actual = pre.destination_id in dest_state.artist_ids
+                        elif pre.section == "playlists":
+                            actual = pre.destination_id in dest_state.playlist_ids
+                        else:
+                            continue
+
+                        expected = (pre.expected == "present")
+                        if actual != expected:
+                            job.confirmed_plan_id = None
+                            job.confirmed_plan_revision = None
+                            job.confirmed_plan_hash = None
+                            job.confirmed_at = None
+                            job.error_code = "plan_stale"
+                            self._jobs.update(job)
+                            self._logger.warning(
+                                "event=plan_stale reason=destination_drift job_id=%s destination_id=%s expected=%s actual=%s",
+                                job.id,
+                                pre.destination_id,
+                                expected,
+                                actual,
+                            )
+                            raise PlanStaleError("plan_stale")
+
+
         if job.status is not JobStatus.IMPORTING:
             transition(job, JobStatus.IMPORTING)
         if job.started_at is None:

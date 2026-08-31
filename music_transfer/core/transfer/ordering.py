@@ -17,7 +17,8 @@ callables so this module never learns what a Track is.
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable, Sequence, TypeVar
+from collections.abc import Callable, Iterable, Sequence
+from typing import Any, TypeVar
 
 from ..enums import InsertionBehavior, OrderingMode
 

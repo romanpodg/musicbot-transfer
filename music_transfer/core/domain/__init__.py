@@ -15,9 +15,11 @@ from .matching import MatchResult, ScoredCandidate
 from .playlist import Playlist, PlaylistItem
 from .track import Track
 from .transfer import (
+    PlanPrecondition,
     TransferItem,
     TransferJob,
     TransferPlan,
+    TransferPlanItem,
     TransferPlanSummary,
     TransferProgress,
     TransferReport,
@@ -35,6 +37,7 @@ __all__ = [
     "LibraryRecord",
     "LibrarySnapshot",
     "MatchResult",
+    "PlanPrecondition",
     "Playlist",
     "PlaylistItem",
     "ScoredCandidate",
@@ -43,6 +46,7 @@ __all__ = [
     "TransferItem",
     "TransferJob",
     "TransferPlan",
+    "TransferPlanItem",
     "TransferPlanSummary",
     "TransferProgress",
     "TransferReport",

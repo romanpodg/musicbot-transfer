@@ -70,6 +70,12 @@ class PlannedJob:
             content=(ContentType.LIKED_TRACKS,),
         )
         self.plan = service.analyze(self.job, self.source, self.destination)
+        service.confirm_plan(
+            self.job,
+            plan_id=self.plan.plan_id,
+            revision=self.plan.revision,
+            plan_hash=self.plan.plan_hash,
+        )
 
 
 class ResumeDoesNotRepeatWork(unittest.TestCase):
@@ -332,6 +338,12 @@ class IdempotentPlaylistWrites(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
         self.service.execute(job, destination, confirmed=True)
 
         created = [item for item in destination.playlists if item.source_id.startswith("dst-")]
@@ -361,26 +373,23 @@ class IdempotentPlaylistWrites(unittest.TestCase):
             Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
         )
         source = FakePlatformAdapter(display_name="source", playlists=[source_playlist])
-        # Make "unmatched_gap" unresolvable by rejecting search on it
+        # Make "unmatched_gap" unresolvable by not including it in destination tracks
         destination = FakePlatformAdapter(
             display_name="destination",
-            fail_on={"search_tracks"},  # won't match if searched or we can mark it directly
+            tracks=[
+                track("A", identifier="dst-a"),
+                track("B", identifier="dst-b"),
+                track("C", identifier="dst-c"),
+            ],
         )
+        destination.can_reuse_identifier = lambda et, sp: False
         self.service.analyze(job, source, destination)
-
-        # Explicitly mark "unmatched_gap" as NOT_FOUND to create a gap in the planned items
-        planned_items = self.service.items.list_for_job(job.id)
-        for pi in planned_items:
-            if pi.source_id == "unmatched_gap":
-                pi.mark(ItemStatus.NOT_FOUND)
-                pi.write_position = None
-                self.service.items.update(pi)
-            elif pi.source_id == "b":
-                pi.write_position = 1
-                self.service.items.update(pi)
-            elif pi.source_id == "c":
-                pi.write_position = 2
-                self.service.items.update(pi)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         original = destination.add_playlist_item
         counter = {"writes": 0}
@@ -394,7 +403,7 @@ class IdempotentPlaylistWrites(unittest.TestCase):
         destination.add_playlist_item = crash_after_first_entry  # type: ignore[method-assign]
         with self.assertRaises(KeyboardInterrupt):
             self.service.execute(job, destination, confirmed=True)
-        self.assertEqual(destination.playlist_item_ids("dst-mixed"), ["a"])
+        self.assertEqual(destination.playlist_item_ids("dst-mixed"), ["dst-a"])
 
         reloaded = self.service.jobs.get(job.id)
         assert reloaded is not None
@@ -410,7 +419,7 @@ class IdempotentPlaylistWrites(unittest.TestCase):
         self.assertEqual(len(new_item_writes), 2)
         created = [item for item in destination.playlists if item.source_id == "dst-mixed"]
         self.assertEqual(len(created), 1, "the playlist must not be created twice")
-        self.assertEqual(destination.playlist_item_ids("dst-mixed"), ["a", "b", "c"])
+        self.assertEqual(destination.playlist_item_ids("dst-mixed"), ["dst-a", "dst-b", "dst-c"])
 
 
 if __name__ == "__main__":

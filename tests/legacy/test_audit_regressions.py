@@ -8,17 +8,17 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import requests
 from core.auth import PaginationIntegrityError, TidalLibraryClient, UnsupportedOperationError
+from core.backup import BACKUP_FORMAT, BACKUP_VERSION, BackupFormatError, BackupService, _checksum
 from core.cleanup import CleanupManager, CleanupScope, DeleteQueue, DeleteQueueStore
 from core.models import AccountProfile, LibrarySnapshot, TransferReport
-from core.sorting import SortOrder, sort_items
-from core.state import TransferState, TransferStateStore
-from core.transfer import TransferOptions, TransferService
-from core.verification import VerificationService
 from core.retry import RetryExecutor, RetryPolicy
-import requests
-from core.backup import BACKUP_FORMAT, BACKUP_VERSION, BackupFormatError, BackupService, _checksum
-from core.state import atomic_write_json
+from core.sorting import SortOrder, sort_items
+from core.state import TransferState, TransferStateStore, atomic_write_json
+from core.verification import VerificationService
+
+from core.transfer import TransferOptions, TransferService
 
 
 class PaginationTests(unittest.TestCase):
@@ -30,9 +30,9 @@ class PaginationTests(unittest.TestCase):
             objects = [SimpleNamespace(id=str(index)) for index in range(count)]
             calls: list[int] = []
 
-            def getter(*, limit: int, offset: int):
-                calls.append(offset)
-                return objects[offset : offset + limit]
+            def getter(*, limit: int, offset: int, current_objects=objects, current_calls=calls):
+                current_calls.append(offset)
+                return current_objects[offset : offset + limit]
 
             result = self._client()._paginate_offset(getter, operation="test", unique_ids=True)
             self.assertEqual([item.id for item in result], [str(index) for index in range(count)])

@@ -59,6 +59,7 @@ TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
     JobStatus.WAITING_CONFIRMATION: frozenset(
         {
             JobStatus.IMPORTING,
+            JobStatus.AUTHENTICATING,
             JobStatus.PLANNING,
             JobStatus.CANCELLED,
             JobStatus.FAILED,

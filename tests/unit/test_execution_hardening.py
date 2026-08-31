@@ -22,7 +22,12 @@ import unittest
 from pathlib import Path
 
 from music_transfer.app.services import TransferService
-from music_transfer.core.domain import TransferItem
+from music_transfer.core.domain import (
+    TransferItem,
+    TransferJob,
+    TransferPlan,
+    TransferPlanItem,
+)
 from music_transfer.core.enums import (
     ContentType,
     EntityType,
@@ -36,6 +41,7 @@ from music_transfer.core.transfer import scrub_credentials
 from music_transfer.infrastructure.persistence import (
     JsonTransferItemRepository,
     JsonTransferJobRepository,
+    JsonTransferPlanRepository,
 )
 
 from tests.support import FakePlatformAdapter
@@ -43,7 +49,9 @@ from tests.support import FakePlatformAdapter
 
 def build_service(root: Path) -> TransferService:
     return TransferService(
-        JsonTransferJobRepository(root), JsonTransferItemRepository(root)
+        JsonTransferJobRepository(root),
+        JsonTransferItemRepository(root),
+        plans_repository=JsonTransferPlanRepository(root),
     )
 
 
@@ -63,6 +71,40 @@ class ExecutionHardeningTests(unittest.TestCase):
                 return it
         raise KeyError(f"Item not found: {item_id}")
 
+    def _confirm_items(self, job: TransferJob, items: list[TransferItem]) -> None:
+        self.service.items.add_many(items)
+        plan_items = tuple(
+            TransferPlanItem(
+                entity_type=it.entity_type,
+                source_id=it.source_id,
+                destination_id=it.destination_id,
+                operation=it.operation,
+                planned_status=it.status,
+                match_method=it.match_method,
+                match_score=it.match_score,
+                container_source_id=it.container_source_id,
+                container_destination_id=it.container_destination_id,
+                original_position=it.original_position,
+                write_position=it.write_position,
+                source_metadata=dict(it.source_metadata),
+            )
+            for it in items
+        )
+        plan = TransferPlan.create(job.id, revision=1, items=plan_items)
+        assert self.service.plans is not None
+        self.service.plans.save(plan)
+        job.active_plan_id = plan.plan_id
+        job.active_plan_revision = plan.revision
+        job.active_plan_hash = plan.plan_hash
+        job.status = JobStatus.WAITING_CONFIRMATION
+        self.service.jobs.update(job)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
+
     def test_ambiguous_item_is_never_executed(self) -> None:
         """AMBIGUOUS items must not trigger destination writes or be rewritten as NOT_FOUND."""
         job = self.service.create_job(Platform.TIDAL, Platform.TIDAL)
@@ -77,10 +119,7 @@ class ExecutionHardeningTests(unittest.TestCase):
             operation=TransferOperation.SAVE_TRACK,
         )
         item.mark(ItemStatus.AMBIGUOUS, error="search_ambiguous")
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         outcome = self.service.execute(job, destination, confirmed=True)["outcome"]
         self.assertEqual(outcome.skipped, 1)
@@ -105,10 +144,7 @@ class ExecutionHardeningTests(unittest.TestCase):
             operation=TransferOperation.SAVE_TRACK,
         )
         item.mark(ItemStatus.NOT_FOUND, error="track_not_found")
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         outcome = self.service.execute(job, destination, confirmed=True)["outcome"]
         self.assertEqual(outcome.skipped, 1)
@@ -133,10 +169,7 @@ class ExecutionHardeningTests(unittest.TestCase):
             operation=TransferOperation.SAVE_TRACK,
         )
         item.mark(ItemStatus.UNAVAILABLE, error="rights_restriction")
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         outcome = self.service.execute(job, destination, confirmed=True)["outcome"]
         self.assertEqual(outcome.skipped, 1)
@@ -162,10 +195,7 @@ class ExecutionHardeningTests(unittest.TestCase):
         )
         item.destination_id = "dst-existing"
         item.mark(ItemStatus.ALREADY_EXISTS)
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         outcome = self.service.execute(job, destination, confirmed=True)["outcome"]
         self.assertEqual(outcome.skipped, 1)
@@ -190,10 +220,7 @@ class ExecutionHardeningTests(unittest.TestCase):
         )
         item.destination_id = "dst-done"
         item.mark(ItemStatus.TRANSFERRED)
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         outcome = self.service.execute(job, destination, confirmed=True)["outcome"]
         self.assertEqual(outcome.skipped, 1)
@@ -218,10 +245,7 @@ class ExecutionHardeningTests(unittest.TestCase):
         )
         item.destination_id = "dst-1"
         item.mark(ItemStatus.MATCHED)
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         outcome = self.service.execute(job, destination, confirmed=True)["outcome"]
         self.assertEqual(outcome.succeeded, 1)
@@ -248,10 +272,7 @@ class ExecutionHardeningTests(unittest.TestCase):
             source_metadata={"name": "My Favorites"},
             operation=TransferOperation.CREATE_PLAYLIST,
         )
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         outcome = self.service.execute(job, destination, confirmed=True)["outcome"]
         self.assertEqual(outcome.succeeded, 1)
@@ -279,10 +300,7 @@ class ExecutionHardeningTests(unittest.TestCase):
         )
         item.destination_id = "dst-auth-fail"
         item.mark(ItemStatus.MATCHED)
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         result = self.service.execute(job, destination, confirmed=True)
         outcome = result["outcome"]
@@ -315,10 +333,7 @@ class ExecutionHardeningTests(unittest.TestCase):
         )
         item.destination_id = "dst-authz-fail"
         item.mark(ItemStatus.MATCHED)
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         result = self.service.execute(job, destination, confirmed=True)
         outcome = result["outcome"]
@@ -360,10 +375,7 @@ class ExecutionHardeningTests(unittest.TestCase):
             item.mark(ItemStatus.MATCHED)
             items.append(item)
 
-        self.service.items.add_many(items)
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, items)
 
         result = self.service.execute(job, destination, confirmed=True)
         outcome = result["outcome"]
@@ -401,10 +413,7 @@ class ExecutionHardeningTests(unittest.TestCase):
         )
         item.destination_id = "dst-fatal"
         item.mark(ItemStatus.MATCHED)
-        self.service.items.add_many([item])
-
-        job.status = JobStatus.WAITING_CONFIRMATION
-        self.service.jobs.update(job)
+        self._confirm_items(job, [item])
 
         result = self.service.execute(job, destination, confirmed=True)
         report = result["report"]

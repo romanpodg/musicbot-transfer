@@ -26,6 +26,7 @@ from music_transfer.core.domain import (
     TransferJob,
 )
 from music_transfer.core.enums import ContentType, EntityType, Platform
+from music_transfer.core.errors import MusicTransferError
 from music_transfer.platforms.tidal.mapper import (
     album_from_tidal,
     artist_from_tidal,
@@ -36,6 +37,7 @@ from music_transfer.platforms.tidal.mapper import (
     text_value,
     track_from_tidal,
 )
+
 from tests.support import album, artist, playlist, track
 
 
@@ -233,7 +235,7 @@ class TidalMappingTests(unittest.TestCase):
     def test_missing_id_is_rejected(self) -> None:
         """An object without an id cannot become a transfer item."""
 
-        with self.assertRaises(Exception):
+        with self.assertRaises(MusicTransferError):
             track_from_tidal(FakeTidal(name="No Id"))
 
 

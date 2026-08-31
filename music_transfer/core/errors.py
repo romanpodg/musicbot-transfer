@@ -182,6 +182,34 @@ class ConfirmationRequired(MusicTransferError):
     retryable = False
 
 
+class PlanIntegrityError(MusicTransferError):
+    """A transfer plan failed cryptographic integrity or repository verification."""
+
+    code = "plan_integrity_compromised"
+    retryable = False
+
+
+class PlanStaleError(MusicTransferError):
+    """A transfer plan or confirmation is stale, drifted, or invalidated."""
+
+    code = "plan_stale"
+    retryable = False
+
+
+class PlanConfirmationMismatch(PlanStaleError):
+    """Provided confirmation does not match the active plan identity."""
+
+    code = "plan_confirmation_mismatch"
+    retryable = False
+
+
+class PlanValidationUnavailableError(MusicTransferError):
+    """Destination preconditions cannot be verified due to temporary platform errors."""
+
+    code = "plan_validation_unavailable"
+    retryable = True
+
+
 class PaginationError(MusicTransferError):
     """A paginated read stopped making progress or exceeded its safety bound."""
 

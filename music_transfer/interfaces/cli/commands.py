@@ -18,15 +18,14 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ...app.dto import plan_view, report_view, verification_views
 from ...core.domain import TransferSettings
-from ...core.enums import ContentType, JobStatus, OrderingMode, Platform
+from ...core.enums import ContentType, OrderingMode, Platform
 from ...core.errors import (
     ConfirmationRequired,
     MusicTransferError,
     TransferConfigurationError,
 )
-from ...core.transfer.lifecycle import can_transition
-from ...app.dto import plan_view, report_view, verification_views
 from .context import CliContext
 
 #: Maps CLI-friendly content names onto the typed enum.
@@ -112,6 +111,12 @@ def command_transfer(context: CliContext, arguments: Any) -> int:
         context.console.message("plan.cancelled", style="warning")
         return 1
     try:
+        context.transfers.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
         result = context.transfers.execute(
             job, destination_adapter, confirmed=True, progress=_progress(context)
         )

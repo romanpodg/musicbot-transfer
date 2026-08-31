@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from music_transfer.core.domain import Playlist, Track
 from music_transfer.core.enums import InsertionBehavior, OrderingMode
@@ -25,6 +25,7 @@ from music_transfer.core.transfer.ordering import (
     restore_positions,
     to_write_order,
 )
+
 from tests.support import album, artist, playlist, track
 
 
@@ -41,7 +42,7 @@ class Row:
 def _at(day: int) -> datetime:
     """Return a fixed UTC timestamp for ``day``."""
 
-    return datetime(2024, 1, day, tzinfo=timezone.utc)
+    return datetime(2024, 1, day, tzinfo=UTC)
 
 
 ACCESSORS = {

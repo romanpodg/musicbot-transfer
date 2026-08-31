@@ -21,8 +21,8 @@ from pathlib import Path
 from typing import Any
 
 from ...core.domain import Account, TransferItem, TransferJob, TransferPlan
-from ...core.enums import ItemStatus, JobStatus, Platform
-from ...core.errors import PersistenceError
+from ...core.enums import ItemStatus, JobStatus
+from ...core.errors import PersistenceError, PlanIntegrityError
 from ...core.ports import (
     AccountRepository,
     TransferItemRepository,
@@ -150,6 +150,10 @@ class JsonTransferItemRepository(TransferItemRepository):
         self._store(job_id, merged)
         return items
 
+    def replace_for_job(self, job_id: str, items: list[TransferItem]) -> list[TransferItem]:
+        self._store(job_id, list(items))
+        return items
+
     def update(self, item: TransferItem) -> TransferItem:
         items = self.load(item.job_id)
         replaced = False
@@ -180,33 +184,103 @@ class JsonTransferItemRepository(TransferItemRepository):
 
 
 class JsonTransferPlanRepository(TransferPlanRepository):
-    """Store the latest plan for each job."""
+    """Store transfer plans with revision history and immutability checks."""
 
     def __init__(self, root: Path, logger: logging.Logger | None = None) -> None:
         self._root = root / "plans"
         ensure_directories(root, "plans")
         self._logger = logger or _LOGGER
 
+    def _revision_path(self, job_id: str, revision: int, plan_id: str) -> Path:
+        return self._root / f"{job_id}_rev{revision}_{plan_id}.json"
+
+    def _latest_path(self, job_id: str) -> Path:
+        return self._root / f"{job_id}.json"
+
     def save(self, plan: TransferPlan) -> TransferPlan:
-        atomic_write_json(self._root / f"{plan.job_id}.json", plan.as_dict())
+        # Invariant: Persisted plan revisions must never be silently overwritten with different content
+        if plan.plan_id:
+            # Check if this exact plan_id or revision already exists
+            pattern = f"{plan.job_id}_rev{plan.revision}_*.json"
+            existing_rev_files = list(self._root.glob(pattern))
+            for p in existing_rev_files:
+                existing = self._load_file(p)
+                if existing is not None:
+                    if existing.plan_id != plan.plan_id:
+                        raise PlanIntegrityError(
+                            f"plan_integrity_compromised: duplicate revision {plan.revision} with different plan_id '{existing.plan_id}' vs '{plan.plan_id}'"
+                        )
+                    if existing.plan_hash != plan.plan_hash or existing.compute_hash() != plan.compute_hash():
+                        raise PlanIntegrityError(
+                            f"plan_integrity_compromised: plan revision {plan.revision} already exists with different hash"
+                        )
+
+            # Check if plan_id exists under any revision
+            id_pattern = f"*_rev*_{plan.plan_id}.json"
+            for p in self._root.glob(id_pattern):
+                existing = self._load_file(p)
+                if existing is not None:
+                    if existing.job_id != plan.job_id:
+                        raise PlanIntegrityError(
+                            f"plan_integrity_compromised: plan {plan.plan_id} already exists for different job {existing.job_id}"
+                        )
+                    if existing.plan_hash != plan.plan_hash:
+                        raise PlanIntegrityError(
+                            f"plan_integrity_compromised: plan {plan.plan_id} already exists with different hash"
+                        )
+
+            rev_path = self._revision_path(plan.job_id, plan.revision, plan.plan_id)
+            atomic_write_json(rev_path, plan.as_dict())
+
+        # Update latest pointer
+        atomic_write_json(self._latest_path(plan.job_id), plan.as_dict())
         return plan
 
-    def get(self, job_id: str) -> TransferPlan | None:
-        path = self._root / f"{job_id}.json"
+    def _load_file(self, path: Path) -> TransferPlan | None:
         if not path.is_file():
             return None
         payload = read_json(path)
-        return TransferPlan(
-            job_id=str(payload.get("job_id", job_id)),
-            source_platform=Platform(str(payload.get("source_platform"))),
-            destination_platform=Platform(str(payload.get("destination_platform"))),
-            created_at=str(payload.get("created_at", "")),
-            items=[TransferItem.from_dict(item) for item in (payload.get("items") or [])],
-            warnings=[str(value) for value in (payload.get("warnings") or [])],
-            source_incomplete=bool(payload.get("source_incomplete", False)),
-            destination_incomplete=bool(payload.get("destination_incomplete", False)),
-            metadata=dict(payload.get("metadata") or {}),
-        )
+        return TransferPlan.from_dict(payload)
+
+    def get(self, job_id: str) -> TransferPlan | None:
+        return self._load_file(self._latest_path(job_id))
+
+    def get_by_id(self, plan_id: str) -> TransferPlan | None:
+        if not plan_id:
+            return None
+        # Check files matching pattern
+        for path in self._root.glob(f"*_rev*_{plan_id}.json"):
+            loaded = self._load_file(path)
+            if loaded is not None and loaded.plan_id == plan_id:
+                return loaded
+        # Check latest pointers as fallback
+        for path in self._root.glob("*.json"):
+            if "_rev" not in path.name:
+                loaded = self._load_file(path)
+                if loaded is not None and loaded.plan_id == plan_id:
+                    return loaded
+        return None
+
+    def get_revision(self, job_id: str, revision: int) -> TransferPlan | None:
+        matches = list(self._root.glob(f"{job_id}_rev{revision}_*.json"))
+        if matches:
+            return self._load_file(matches[0])
+        latest = self.get(job_id)
+        if latest is not None and latest.revision == revision:
+            return latest
+        return None
+
+    def list_for_job(self, job_id: str) -> list[TransferPlan]:
+        plans: dict[int, TransferPlan] = {}
+        for path in self._root.glob(f"{job_id}_rev*.json"):
+            loaded = self._load_file(path)
+            if loaded is not None and loaded.job_id == job_id:
+                plans[loaded.revision] = loaded
+        if not plans:
+            latest = self.get(job_id)
+            if latest is not None and latest.job_id == job_id:
+                plans[latest.revision] = latest
+        return [plans[k] for k in sorted(plans.keys())]
 
 
 class JsonAccountRepository(AccountRepository):

@@ -143,6 +143,59 @@ write calls against a recording adapter.
 
 ---
 
+## 5.1 Plan Identity, Deterministic Hashing, and Exact Confirmation (Phase 1.3B)
+
+Destination mutations must be authorized by one exact persisted `TransferPlan` identified by:
+* `plan_id`: Unique identifier of an immutable plan snapshot.
+* `revision`: Monotonically increasing revision number within a job (1, 2, ...).
+* `plan_hash`: Deterministic SHA-256 integrity digest of canonical plan intent.
+
+```text
+ANALYZE
+  ↓
+PLAN revision N
+  ↓
+persist immutable plan
+  ↓
+WAITING_CONFIRMATION
+  ↓
+confirm exact (plan_id + revision + plan_hash)
+  ↓
+preflight integrity validation
+  ↓
+destination-precondition validation
+  ↓
+IMPORTING
+```
+
+### Invariants:
+1. **Boolean confirmation alone never authorizes writes**: Calling `execute(..., confirmed=True)` without matching durable confirmation stored on the job fails closed (`ConfirmationRequired`), issuing zero destination writes.
+2. **Deterministic Plan Hash**: Computed using SHA-256 over a sorted canonical JSON representation of plan intent (entity types, source IDs, destination IDs, operations, positions, match metadata, context settings). Excludes runtime fields (`status`, `attempt_count`, `mutation_state`, error details, runtime timestamps).
+   > **Note on Cryptographic Semantics**: The plan SHA-256 hash protects **integrity** against accidental drift, tampering, or stale execution — it is an integrity digest, not a cryptographic authentication signature.
+3. **Re-planning invalidates previous confirmation**:
+   ```text
+   re-plan
+     → revision N+1
+     → previous confirmation for revision N is invalidated
+     → zero destination writes until revision N+1 is explicitly confirmed
+   ```
+4. **Re-planning lifecycle**: Allowed from `WAITING_CONFIRMATION` while no writes have started. Re-planning after writes have entered execution is blocked.
+
+---
+
+## 5.2 Execution Preflight Checks
+
+Before the **first destination mutation**, the service performs strict preflight validation:
+1. **Active Plan Exists**: The job's `active_plan_id` must be present in durable storage.
+2. **Identity Agrees**: The persisted plan must match `active_plan_id`, `active_plan_revision`, and `active_plan_hash`.
+3. **Integrity Validation**: Recomputes the plan hash from canonical payload and asserts equality with stored `plan_hash`.
+4. **Exact Confirmation Exists**: `confirmed_plan_id`, `confirmed_plan_revision`, and `confirmed_plan_hash` must match the active plan.
+5. **Execution Item Intent Match**: Pre-execution `TransferItem` records must match approved plan intent (`destination_id`, `operation`, `write_position`, container IDs).
+6. **Destination Drift Preconditions**: Verifies captured trustworthy preconditions against destination state (e.g. absent items remain absent, already existing items remain present). If drift is detected, the plan is marked stale (`PlanStaleError`), confirmation is cleared, and zero writes occur.
+7. **Preflight Failure Policy**: Temporary destination read errors fail closed (`PlanValidationUnavailableError`), while `AuthenticationError` / `AuthorizationError` transition the job to `FAILED` with `verification_status = NOT_RUN`.
+
+---
+
 ## 6. Execution
 
 `TransferExecutor.execute()` walks items in a computed write order and

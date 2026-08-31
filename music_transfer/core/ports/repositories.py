@@ -74,6 +74,10 @@ class TransferItemRepository(ABC):
     def count_by_status(self, job_id: str) -> dict[str, int]:
         """Return per-status counts for a job."""
 
+    def replace_for_job(self, job_id: str, items: list[TransferItem]) -> list[TransferItem]:
+        """Replace all items for a job (e.g. during clean re-planning before writes)."""
+        return self.add_many(items)
+
 
 class TransferPlanRepository(ABC):
     """Durable storage for transfer plans (useful for audit and resume)."""
@@ -85,6 +89,18 @@ class TransferPlanRepository(ABC):
     @abstractmethod
     def get(self, job_id: str) -> TransferPlan | None:
         """Return the latest plan for a job, or ``None``."""
+
+    @abstractmethod
+    def get_by_id(self, plan_id: str) -> TransferPlan | None:
+        """Return a plan by its unique plan_id, or ``None``."""
+
+    @abstractmethod
+    def get_revision(self, job_id: str, revision: int) -> TransferPlan | None:
+        """Return a specific revision of a job's plan, or ``None``."""
+
+    @abstractmethod
+    def list_for_job(self, job_id: str) -> list[TransferPlan]:
+        """Return all historical revisions of a job's plan sorted by revision."""
 
 
 class AccountRepository(ABC):

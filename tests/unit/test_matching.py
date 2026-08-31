@@ -21,6 +21,7 @@ from music_transfer.core.matching.normalization import (
     split_artists,
     strip_version_qualifiers,
 )
+
 from tests.support import album, artist, track
 
 

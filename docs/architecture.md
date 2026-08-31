@@ -167,6 +167,8 @@ These are the rules the test suite enforces. Breaking one fails a test.
 | I | Unsupported capabilities are explicit, never silently true | `UnsupportedCapabilityError` |
 | J | No token or password ever reaches a log | `SecretRedactionFilter` |
 | K | Original metadata survives normalization | `normalize_text` returns a key, never mutates |
+| L | Writes require exact durable plan confirmation (`plan_id + revision + plan_hash`) | `TransferService`, `tests/unit/test_plan_identity_and_confirmation.py` |
+| M | Re-planning creates a new revision and invalidates old confirmation; destination drift produces zero writes | `TransferService`, `tests/unit/test_plan_identity_and_confirmation.py` |
 
 ---
 

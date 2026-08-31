@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ...app.dto import AccountStatus
 from ...app.services import (
     AccountService,
     DiagnosticsService,
@@ -21,7 +20,7 @@ from ...app.services import (
 from ...config import Settings, ensure_data_directories, load_dotenv
 from ...core.enums import Platform
 from ...core.matching import MatchingPolicy, TrackMatcher
-from ...core.transfer import RecoveryService, TransferPlanner, TransferVerifier
+from ...core.transfer import TransferPlanner
 from ...infrastructure.http import RetryPolicy
 from ...infrastructure.logging import configure_logging
 from ...infrastructure.persistence import (

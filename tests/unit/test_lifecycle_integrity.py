@@ -27,6 +27,8 @@ from music_transfer.core.domain import (
     Account,
     TransferItem,
     TransferJob,
+    TransferPlan,
+    TransferPlanItem,
     TransferSettings,
     VerificationResult,
 )
@@ -70,6 +72,38 @@ def new_account(identifier: str = "acc-1") -> Account:
     return Account.create(Platform.TIDAL, identifier, "Test Account")
 
 
+def confirm_job_items(service: TransferService, job: TransferJob) -> None:
+    items = service.items.list_for_job(job.id)
+    plan_items = tuple(
+        TransferPlanItem(
+            entity_type=it.entity_type,
+            source_id=it.source_id,
+            destination_id=it.destination_id,
+            operation=it.operation,
+            planned_status=it.status,
+            match_method=it.match_method,
+            match_score=it.match_score,
+            container_source_id=it.container_source_id,
+            container_destination_id=it.container_destination_id,
+            original_position=it.original_position,
+            write_position=it.write_position,
+        )
+        for it in items
+    )
+    plan = TransferPlan.create(job.id, revision=1, items=plan_items)
+    service.plans.save(plan)
+    job.active_plan_id = plan.plan_id
+    job.active_plan_revision = plan.revision
+    job.active_plan_hash = plan.plan_hash
+    service.jobs.update(job)
+    service.confirm_plan(
+        job,
+        plan_id=plan.plan_id,
+        revision=plan.revision,
+        plan_hash=plan.plan_hash,
+    )
+
+
 class LifecycleIntegrityServiceTests(unittest.TestCase):
     """Application-level lifecycle transition enforcement in TransferService."""
 
@@ -95,6 +129,12 @@ class LifecycleIntegrityServiceTests(unittest.TestCase):
         sample_tracks = tracks or [track("Song 1", identifier="s1")]
         source = FakePlatformAdapter(tracks=sample_tracks)
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
         return job, destination
 
     # -- Section 25: Terminal state & transition enforcement -------------------
@@ -380,8 +420,35 @@ class VerificationSemanticsTests(unittest.TestCase):
             item.mark(ItemStatus.MATCHED)
             items.append(item)
         self.service.items.add_many(items)
+        plan_items = tuple(
+            TransferPlanItem(
+                entity_type=it.entity_type,
+                source_id=it.source_id,
+                destination_id=it.destination_id,
+                operation=it.operation,
+                planned_status=it.status,
+                match_method=it.match_method,
+                match_score=it.match_score,
+                container_source_id=it.container_source_id,
+                container_destination_id=it.container_destination_id,
+                original_position=it.original_position,
+                write_position=it.write_position,
+            )
+            for it in items
+        )
+        plan = TransferPlan.create(job.id, revision=1, items=plan_items)
+        self.service.plans.save(plan)
+        job.active_plan_id = plan.plan_id
+        job.active_plan_revision = plan.revision
+        job.active_plan_hash = plan.plan_hash
         job.status = JobStatus.WAITING_CONFIRMATION
         self.service.jobs.update(job)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
         return job, destination
 
     # -- Section 27: Verification status outcomes -----------------------------
@@ -472,8 +539,36 @@ class VerificationSemanticsTests(unittest.TestCase):
         item_b.mark(ItemStatus.MATCHED)
 
         self.service.items.add_many([container_item, item_a, item_b])
+        plan_items = tuple(
+            TransferPlanItem(
+                entity_type=it.entity_type,
+                source_id=it.source_id,
+                destination_id=it.destination_id,
+                operation=it.operation,
+                planned_status=it.status,
+                match_method=it.match_method,
+                match_score=it.match_score,
+                container_source_id=it.container_source_id,
+                container_destination_id=it.container_destination_id,
+                original_position=it.original_position,
+                write_position=it.write_position,
+                source_metadata=dict(it.source_metadata),
+            )
+            for it in [container_item, item_a, item_b]
+        )
+        plan = TransferPlan.create(job.id, revision=1, items=plan_items)
+        self.service.plans.save(plan)
+        job.active_plan_id = plan.plan_id
+        job.active_plan_revision = plan.revision
+        job.active_plan_hash = plan.plan_hash
         job.status = JobStatus.WAITING_CONFIRMATION
         self.service.jobs.update(job)
+        self.service.confirm_plan(
+            job,
+            plan_id=plan.plan_id,
+            revision=plan.revision,
+            plan_hash=plan.plan_hash,
+        )
 
         # Make destination playlist return inverted order during verification: [dst-track-b, dst-track-a]
         original_playlist_item_ids = destination.playlist_item_ids
@@ -648,6 +743,7 @@ class VerificationSemanticsTests(unittest.TestCase):
         self.service.items.add_many([item])
         job.status = JobStatus.WAITING_CONFIRMATION
         self.service.jobs.update(job)
+        confirm_job_items(self.service, job)
 
         result = self.service.execute(job, destination, confirmed=True)
 
@@ -699,6 +795,7 @@ class VerificationSemanticsTests(unittest.TestCase):
         self.service.items.add_many([item])
         job.status = JobStatus.WAITING_CONFIRMATION
         self.service.jobs.update(job)
+        confirm_job_items(self.service, job)
 
         result = self.service.execute(job, destination, confirmed=True)
         self.assertEqual(job.status, JobStatus.FAILED)
@@ -883,6 +980,7 @@ class VerificationSemanticsTests(unittest.TestCase):
         self.service.items.add_many([item])
         job.status = JobStatus.WAITING_CONFIRMATION
         self.service.jobs.update(job)
+        confirm_job_items(self.service, job)
 
         destination = FakePlatformAdapter()
         result = self.service.execute(job, destination, confirmed=True)
@@ -922,6 +1020,7 @@ class VerificationSemanticsTests(unittest.TestCase):
         self.service.items.add_many([item])
         job.status = JobStatus.WAITING_CONFIRMATION
         self.service.jobs.update(job)
+        confirm_job_items(self.service, job)
 
         # Destination contains the item
         destination = FakePlatformAdapter(

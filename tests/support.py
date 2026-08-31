@@ -228,6 +228,10 @@ class FakePlatformAdapter(MusicPlatformAdapter):
 
     def get_destination_state(self, sections=None) -> DestinationState:
         """Return the current contents, used for resume reconciliation."""
+        if "get_destination_state" in self.fail_on:
+            if self.error_factory is not None:
+                raise self.error_factory()
+            raise RuntimeError("simulated failure in get_destination_state")
 
         return DestinationState(
             platform=self._platform,

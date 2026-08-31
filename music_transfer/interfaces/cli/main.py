@@ -23,10 +23,9 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any
 
-from ...core.errors import MusicTransferError
 from ...core.enums import Platform
+from ...core.errors import MusicTransferError
 from . import commands
 from .context import build_context
 

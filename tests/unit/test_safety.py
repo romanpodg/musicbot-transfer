@@ -19,13 +19,18 @@ from __future__ import annotations
 import logging
 import unittest
 
-from music_transfer.core.domain import TransferSettings
-from music_transfer.core.enums import ContentType, EntityType, ItemStatus, Platform
+from music_transfer.core.domain import (
+    AccountProfile,
+    LibrarySnapshot,
+    TransferJob,
+    TransferSettings,
+)
+from music_transfer.core.enums import ContentType, OperationKind, Platform
 from music_transfer.core.errors import (
     ConfirmationRequired,
     UnsupportedCapabilityError,
 )
-from music_transfer.core.enums import OperationKind
+from music_transfer.core.matching import TrackMatcher
 from music_transfer.core.ports import (
     MusicPlatformAdapter,
     PlatformCapabilities,
@@ -33,12 +38,9 @@ from music_transfer.core.ports import (
     operation_kind,
 )
 from music_transfer.core.transfer import TransferPlanner
-from music_transfer.platforms.registry import PlatformRegistry, default_registry
+from music_transfer.platforms.registry import default_registry
+
 from tests.support import FakePlatformAdapter, track
-from tests.support import artist
-from music_transfer.core.domain import LibrarySnapshot, AccountProfile
-from music_transfer.core.domain import TransferJob
-from music_transfer.core.matching import TrackMatcher
 
 
 def new_account(identifier: str):
@@ -241,6 +243,12 @@ class ConfirmationGate(unittest.TestCase):
             settings=TransferSettings(dry_run=True),
         )
         service.analyze(job, FakePlatformAdapter(tracks=[track("A", identifier="a")]), destination)
+        service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
         service.execute(job, destination, confirmed=True)
         self.assertEqual(destination.write_calls, [])
 

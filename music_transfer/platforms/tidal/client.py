@@ -58,7 +58,7 @@ from .mapper import (
     record_from_tidal,
     track_from_tidal,
 )
-from .pagination import PLAYLIST_POLICY, DEFAULT_POLICY, PaginationPolicy, fetch_all
+from .pagination import DEFAULT_POLICY, PLAYLIST_POLICY, PaginationPolicy, fetch_all
 
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -533,7 +533,7 @@ def _track_model() -> Any:
     import importlib
 
     tidalapi = importlib.import_module("tidalapi")
-    return getattr(tidalapi, "Track", None) or getattr(tidalapi.media, "Track")
+    return getattr(tidalapi, "Track", None) or tidalapi.media.Track
 
 
 __all__ = [

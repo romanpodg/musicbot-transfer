@@ -409,6 +409,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         self.service.execute(job, destination, confirmed=True)
         self.assertEqual(destination.playlist_item_ids("dst-pl1"), ["a1", "b", "a2"])
@@ -491,6 +497,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         orig_add = destination.add_playlist_item
 
@@ -527,6 +539,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         def timeout_without_commit(p_id: str, t_id: str) -> None:
             # Does not add item, raises timeout directly
@@ -560,6 +578,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         query_calls = {"count": 0}
 
@@ -605,6 +629,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         # Pre-populate destination with diverged content: [A, Foreign]
         destination.playlists.append(
@@ -673,21 +703,18 @@ class PlaylistRecoveryTests(unittest.TestCase):
         source = FakePlatformAdapter(
             display_name="source", playlists=[playlist("Pl1", tracks)]
         )
-        destination = FakePlatformAdapter(display_name="destination")
+        destination = FakePlatformAdapter(
+            display_name="destination",
+            tracks=[track("A", identifier="dst-a"), track("B", identifier="dst-b")],
+        )
+        destination.can_reuse_identifier = lambda et, sp: False
         self.service.analyze(job, source, destination)
-
-        items = self.service.items.list_for_job(job.id)
-        for item in items:
-            if item.source_id == "x":
-                item.mark(ItemStatus.NOT_FOUND)
-                item.write_position = None
-            elif item.source_id == "a":
-                item.destination_id = "dst-a"
-                item.write_position = 0
-            elif item.source_id == "b":
-                item.destination_id = "dst-b"
-                item.write_position = 1
-            self.service.items.update(item)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         self.service.execute(job, destination, confirmed=True)
         self.assertEqual(destination.playlist_item_ids("dst-pl1"), ["dst-a", "dst-b"])
@@ -772,6 +799,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         source = FakePlatformAdapter(display_name="source", playlists=[pl1, pl2])
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         items = self.service.items.list_for_job(job.id)
         pl1_items = [
@@ -873,6 +906,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         # Make B fail when attempting to write
         orig_add = destination.add_playlist_item
@@ -934,6 +973,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         # Container and item A are transferred
         items = self.service.items.list_for_job(job.id)
@@ -1010,6 +1055,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         mutation_calls = 0
 
@@ -1179,6 +1230,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         orig_add = destination.add_playlist_item
 
@@ -1232,6 +1289,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         orig_add = destination.add_playlist_item
 
@@ -1279,6 +1342,12 @@ class PlaylistRecoveryTests(unittest.TestCase):
         )
         destination = FakePlatformAdapter(display_name="destination")
         self.service.analyze(job, source, destination)
+        self.service.confirm_plan(
+            job,
+            plan_id=job.active_plan_id,
+            revision=job.active_plan_revision,
+            plan_hash=job.active_plan_hash,
+        )
 
         items = self.service.items.list_for_job(job.id)
         item_a = next(it for it in items if it.source_id == "a")

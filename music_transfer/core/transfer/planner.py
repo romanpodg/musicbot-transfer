@@ -28,11 +28,13 @@ from typing import Any
 
 from ..domain import (
     LibrarySnapshot,
+    PlanPrecondition,
     Playlist,
     Track,
     TransferItem,
     TransferJob,
     TransferPlan,
+    TransferPlanItem,
     TransferPlanSummary,
 )
 from ..enums import (
@@ -152,26 +154,90 @@ class TransferPlanner:
             )
         self._validate_plan(items)
         summary = self._summarize(items, source, state)
+
+        # Build immutable TransferPlanItem snapshots (Invariant G)
+        plan_items = tuple(
+            TransferPlanItem(
+                entity_type=it.entity_type,
+                source_id=it.source_id,
+                destination_id=it.destination_id,
+                operation=it.operation,
+                planned_status=it.status,
+                match_method=it.match_method,
+                match_score=it.match_score,
+                container_source_id=it.container_source_id,
+                container_destination_id=it.container_destination_id,
+                original_position=it.original_position,
+                write_position=it.write_position,
+                source_metadata=dict(it.source_metadata),
+            )
+            for it in items
+        )
+
+        # Build trustworthy destination preconditions (Invariants I, J)
+        preconditions: list[PlanPrecondition] = []
+        if state is not None:
+            for it in items:
+                if not it.destination_id:
+                    continue
+                # Determine section
+                if it.entity_type is EntityType.TRACK:
+                    section = "tracks"
+                elif it.entity_type is EntityType.ALBUM:
+                    section = "albums"
+                elif it.entity_type is EntityType.ARTIST:
+                    section = "artists"
+                elif it.entity_type is EntityType.PLAYLIST:
+                    section = "playlists"
+                else:
+                    continue
+
+                if not state.is_trustworthy(section):
+                    continue
+
+                if it.status is ItemStatus.ALREADY_EXISTS:
+                    preconditions.append(
+                        PlanPrecondition(
+                            entity_type=it.entity_type,
+                            destination_id=it.destination_id,
+                            expected="present",
+                            section=section,
+                        )
+                    )
+                elif it.status is ItemStatus.MATCHED and it.operation != TransferOperation.NONE:
+                    preconditions.append(
+                        PlanPrecondition(
+                            entity_type=it.entity_type,
+                            destination_id=it.destination_id,
+                            expected="absent",
+                            section=section,
+                        )
+                    )
+
         plan = TransferPlan(
             job_id=job.id,
             source_platform=job.source_platform,
             destination_platform=job.destination_platform,
-            items=items,
+            items=plan_items,
             summary=summary,
+            preconditions=tuple(preconditions),
             warnings=warnings,
             source_incomplete=source.is_partial,
             metadata={
                 "destination_state": state.as_dict() if state is not None else None,
                 "ordering": str(job.settings.ordering),
+                "source_account_id": job.source_account_id,
+                "destination_account_id": job.destination_account_id,
             },
         )
         self._logger.info(
-            "event=plan_built job_id=%s items=%d matched=%d ambiguous=%d not_found=%d",
+            "event=plan_built job_id=%s items=%d matched=%d ambiguous=%d not_found=%d preconditions=%d",
             job.id,
             summary.total_items,
             summary.matched_items,
             summary.ambiguous_items,
             summary.not_found_items,
+            len(preconditions),
         )
         return PlannerResult(plan=plan, items=items)
 

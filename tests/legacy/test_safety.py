@@ -12,10 +12,11 @@ from core.cleanup import CleanupPlan, CleanupScope, CleanupService
 from core.models import AccountProfile, LibrarySnapshot
 from core.sorting import SortOrder, sort_items
 from core.state import SecretRedactionFilter, TransferState, TransferStateStore
-from core.transfer import ConfirmationRequired, TransferOptions, TransferService
 from localization.manager import LocalizationManager, _leaf_keys
 from ui.progress import Console
 from ui.prompts import Prompts
+
+from core.transfer import ConfirmationRequired, TransferOptions, TransferService
 
 
 class FakeDestination:

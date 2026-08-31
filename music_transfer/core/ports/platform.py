@@ -23,7 +23,7 @@ be rewritten, and it keeps the core free of any asyncio dependency.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from ..domain import (
@@ -429,7 +429,7 @@ class MusicPlatformAdapter(ABC):
         return False
 
 
-class LibraryMaintenanceAdapter(ABC):
+class LibraryMaintenanceAdapter:
     """Destructive library operations, deliberately kept out of transfers.
 
     A transfer never calls these.  They exist only for the separate library

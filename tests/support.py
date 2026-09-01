@@ -29,24 +29,40 @@ from music_transfer.core.ports import (
 )
 
 
-def artist(name: str, identifier: str | None = None) -> Artist:
+def artist(
+    name: str, identifier: str | None = None, platform: Platform = Platform.TIDAL
+) -> Artist:
     """Build an artist, defaulting the id to the lowercased name."""
 
     return Artist(
-        source_platform=Platform.TIDAL,
+        source_platform=platform,
         source_id=identifier or name.casefold(),
         name=name,
     )
 
 
-def album(title: str, artists: tuple[Artist, ...] = (), identifier: str | None = None) -> Album:
-    """Build an album with an optional artist tuple."""
+def album(
+    title: str,
+    artists: tuple[Artist, ...] | list[Artist] | list[str] = (),
+    identifier: str | None = None,
+    platform: Platform = Platform.TIDAL,
+    upc: str | None = None,
+) -> Album:
+    """Build an album with an optional artist list or tuple."""
+
+    if artists and isinstance(artists[0], str):
+        artist_objs = tuple(artist(a, platform=platform) for a in artists)
+    elif artists:
+        artist_objs = tuple(artists)
+    else:
+        artist_objs = (artist("Unknown", platform=platform),)
 
     return Album(
-        source_platform=Platform.TIDAL,
+        source_platform=platform,
         source_id=identifier or title.casefold().replace(" ", "-"),
         title=title,
-        artists=artists or (artist("Unknown"),),
+        artists=artist_objs,
+        upc=upc,
     )
 
 
@@ -97,13 +113,21 @@ def playlist(
     )
 
 
-def snapshot(*, playlists: tuple[Playlist, ...] = (), tracks: tuple[Track, ...] = ()) -> LibrarySnapshot:
+def snapshot(
+    *,
+    playlists: tuple[Playlist, ...] = (),
+    tracks: tuple[Track, ...] = (),
+    albums: tuple[Album, ...] = (),
+    artists: tuple[Artist, ...] = (),
+) -> LibrarySnapshot:
     """Build a minimal library snapshot for planning tests."""
 
     return LibrarySnapshot(
         account=AccountProfile("1", "test", Platform.TIDAL),
         platform=Platform.TIDAL,
         tracks=list(tracks),
+        albums=list(albums),
+        artists=list(artists),
         playlists=list(playlists),
     )
 
@@ -129,6 +153,8 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         create_playlists=True,
         write_playlist_items=True,
         search_tracks=True,
+        search_albums=True,
+        search_artists=True,
         supports_already_exists_detection=True,
         supports_playlist_duplicates=True,
         exposes_isrc=True,
@@ -141,17 +167,27 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         display_name: str = "fake",
         account_id: str = "fake-1",
         tracks: list[Track] | None = None,
+        albums: list[Album] | None = None,
+        artists: list[Artist] | None = None,
         playlists: list[Playlist] | None = None,
+        catalog_tracks: list[Track] | None = None,
+        catalog_albums: list[Album] | None = None,
+        catalog_artists: list[Artist] | None = None,
+        capabilities: PlatformCapabilities | None = None,
         fail_on: set[str] | None = None,
         error_factory: Any = None,
     ) -> None:
         self._platform = platform
         self._display_name = display_name
         self._account_id = account_id
+        self._capabilities = capabilities or self.CAPABILITIES
         self.tracks = list(tracks or [])
-        self.albums: list[Album] = []
-        self.artists: list[Artist] = []
+        self.albums: list[Album] = list(albums or [])
+        self.artists: list[Artist] = list(artists or [])
         self.playlists: list[Playlist] = list(playlists or [])
+        self.catalog_tracks = list(catalog_tracks) if catalog_tracks is not None else None
+        self.catalog_albums = list(catalog_albums) if catalog_albums is not None else None
+        self.catalog_artists = list(catalog_artists) if catalog_artists is not None else None
         self.saved_tracks: list[str] = []
         self.saved_albums: list[str] = []
         self.followed_artists: list[str] = []
@@ -174,7 +210,7 @@ class FakePlatformAdapter(MusicPlatformAdapter):
     def capabilities(self) -> PlatformCapabilities:
         """Return the capability declaration."""
 
-        return self.CAPABILITIES
+        return self._capabilities
 
     def get_profile(self) -> AccountProfile:
         """Return a safe display profile."""
@@ -261,10 +297,18 @@ class FakePlatformAdapter(MusicPlatformAdapter):
             ]
             complete.add("tracks")
         if "albums" in wanted:
-            album_ids = [item.source_id for item in self.albums]
+            album_ids = [item.source_id for item in self.albums] + [
+                identifier
+                for identifier in self.saved_albums
+                if identifier not in {item.source_id for item in self.albums}
+            ]
             complete.add("albums")
         if "artists" in wanted:
-            artist_ids = [item.source_id for item in self.artists]
+            artist_ids = [item.source_id for item in self.artists] + [
+                identifier
+                for identifier in self.followed_artists
+                if identifier not in {item.source_id for item in self.artists}
+            ]
             complete.add("artists")
         if "playlists" in wanted:
             playlist_ids = [item.source_id for item in self.playlists]
@@ -279,14 +323,42 @@ class FakePlatformAdapter(MusicPlatformAdapter):
             complete_sections=frozenset(complete),
         )
 
-
     def search_track(self, query: Track, limit: int = 5) -> list[Track]:
         """Return candidates by exact title, then by normalized title."""
 
         from music_transfer.core.matching import normalize_text
 
+        pool = self.catalog_tracks if self.catalog_tracks is not None else self.tracks
         wanted = normalize_text(query.title)
-        exact = [item for item in self.tracks if normalize_text(item.title) == wanted]
+        exact = [item for item in pool if normalize_text(item.title) == wanted]
+        return exact[:limit]
+
+    def search_album(self, query: Album, limit: int = 5) -> list[Album]:
+        """Return album candidates by UPC or exact/normalized title."""
+
+        from music_transfer.core.matching import normalize_text
+
+        pool = self.catalog_albums if self.catalog_albums is not None else self.albums
+        if query.upc:
+            clean_upc = str(query.upc).strip()
+            upc_matches = [
+                item for item in pool if item.upc and str(item.upc).strip() == clean_upc
+            ]
+            if upc_matches:
+                return upc_matches[:limit]
+
+        wanted = normalize_text(query.title)
+        exact = [item for item in pool if normalize_text(item.title) == wanted]
+        return exact[:limit]
+
+    def search_artist(self, query: Artist, limit: int = 5) -> list[Artist]:
+        """Return artist candidates by exact normalized name."""
+
+        from music_transfer.core.matching import normalize_text
+
+        pool = self.catalog_artists if self.catalog_artists is not None else self.artists
+        wanted = normalize_text(query.name)
+        exact = [item for item in pool if normalize_text(item.name) == wanted]
         return exact[:limit]
 
     # -- writes ------------------------------------------------------------

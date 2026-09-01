@@ -7,7 +7,7 @@ specific music platform.
 
 from __future__ import annotations
 
-from .matcher import MatchingPolicy, TrackMatcher
+from .matcher import AlbumMatcher, ArtistMatcher, MatchingPolicy, TrackMatcher
 from .normalization import (
     NormalizedTrack,
     detect_explicit_flag,
@@ -36,6 +36,8 @@ from .scoring import (
 __all__ = [
     "DURATION_EXACT_TOLERANCE_MS",
     "DURATION_MISMATCH_MS",
+    "AlbumMatcher",
+    "ArtistMatcher",
     "MatchingPolicy",
     "NormalizedTrack",
     "ScoreBreakdown",

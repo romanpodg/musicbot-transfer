@@ -153,6 +153,14 @@ class MatchOutcome(StrEnum):
     NOT_FOUND = "not_found"
 
 
+class IdentifierResolutionPolicy(StrEnum):
+    """How destination identifiers are resolved during transfer planning."""
+
+    REUSE_OR_SEARCH = "reuse_or_search"
+    REUSE_ONLY = "reuse_only"
+    CONTAINER_CREATE = "container_create"
+
+
 class OrderingMode(StrEnum):
     """The logical order a user asks for, independent of any platform."""
 

@@ -20,9 +20,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..domain import MatchResult, Track
+from ..domain import (
+    Album,
+    AlbumMatchResult,
+    Artist,
+    ArtistMatchResult,
+    MatchResult,
+    Track,
+)
 from ..enums import MatchMethod, MatchOutcome
-from .normalization import NormalizedTrack, normalize_track
+from .normalization import (
+    NormalizedTrack,
+    normalize_text,
+    normalize_track,
+    strip_version_qualifiers,
+)
 from .scoring import ScoreBreakdown, ScoreWeights, method_for, score_candidate
 
 
@@ -217,3 +229,310 @@ def _is_fuzzy_only(source: NormalizedTrack, candidate: NormalizedTrack) -> bool:
     if source.title and candidate.title and source.title == candidate.title:
         return False
     return not (source.base_title and candidate.base_title and source.base_title == candidate.base_title)
+
+
+class AlbumMatcher:
+    """Match source albums against destination candidates."""
+
+    def __init__(self, policy: MatchingPolicy | None = None) -> None:
+        self._policy = policy or MatchingPolicy()
+
+    @property
+    def policy(self) -> MatchingPolicy:
+        """Return the immutable policy in use."""
+
+        return self._policy
+
+    def match_by_direct_identifier(
+        self, source: Album, destination_id: str | None
+    ) -> AlbumMatchResult | None:
+        """Strategy 1: direct identifier reuse."""
+
+        if not destination_id:
+            return None
+        from dataclasses import replace
+
+        return AlbumMatchResult(
+            source=source,
+            destination=replace(source, source_id=destination_id),
+            score=1.0,
+            method=MatchMethod.DIRECT_ID,
+            outcome=MatchOutcome.MATCHED,
+            reasons=("direct_identifier_reused",),
+        )
+
+    def match_by_upc(
+        self, source: Album, candidates: list[Album]
+    ) -> AlbumMatchResult | None:
+        """Strategy 2: strong portable identifier (UPC)."""
+
+        if not source.upc:
+            return None
+        clean_source_upc = str(source.upc).strip()
+        if not clean_source_upc:
+            return None
+        upc_matches = [
+            c for c in candidates if c.upc and str(c.upc).strip() == clean_source_upc
+        ]
+        if not upc_matches:
+            return None
+        if len(upc_matches) == 1:
+            return AlbumMatchResult(
+                source=source,
+                destination=upc_matches[0],
+                score=1.0,
+                method=MatchMethod.EXACT_METADATA,
+                outcome=MatchOutcome.MATCHED,
+                reasons=("upc_equal",),
+                candidates=tuple(upc_matches),
+            )
+        source_title_norm = normalize_text(source.title)
+        exact_title_matches = [
+            c for c in upc_matches if normalize_text(c.title) == source_title_norm
+        ]
+        if len(exact_title_matches) == 1:
+            return AlbumMatchResult(
+                source=source,
+                destination=exact_title_matches[0],
+                score=1.0,
+                method=MatchMethod.EXACT_METADATA,
+                outcome=MatchOutcome.MATCHED,
+                reasons=("upc_equal", "exact_title"),
+                candidates=tuple(upc_matches),
+            )
+        return AlbumMatchResult(
+            source=source,
+            destination=None,
+            score=1.0,
+            method=MatchMethod.EXACT_METADATA,
+            outcome=MatchOutcome.AMBIGUOUS,
+            reasons=("upc_equal", "multiple_exact_candidates"),
+            candidates=tuple(upc_matches),
+        )
+
+    def match_by_metadata(
+        self, source: Album, candidates: list[Album]
+    ) -> AlbumMatchResult:
+        """Strategies 3-4: exact, then normalized title and artist comparison."""
+
+        if not candidates:
+            return AlbumMatchResult(
+                source=source,
+                outcome=MatchOutcome.NOT_FOUND,
+                method=MatchMethod.NONE,
+                reasons=("no_candidates",),
+            )
+
+        source_norm_title = normalize_text(source.title)
+        source_base_title = strip_version_qualifiers(source.title)
+        source_artists = [normalize_text(name) for name in source.artist_names if name]
+        source_primary = source_artists[0] if source_artists else ""
+
+        scored: list[tuple[Album, float, MatchMethod, list[str]]] = []
+        for candidate in candidates[: self._policy.max_candidates]:
+            cand_norm_title = normalize_text(candidate.title)
+            cand_base_title = strip_version_qualifiers(candidate.title)
+            cand_artists = [normalize_text(name) for name in candidate.artist_names if name]
+            cand_primary = cand_artists[0] if cand_artists else ""
+
+            artists_exact = False
+            artist_overlap = False
+            if source_primary and cand_primary:
+                if source_primary == cand_primary:
+                    artists_exact = True
+                elif any(a in cand_artists for a in source_artists) or any(
+                    a in source_artists for a in cand_artists
+                ):
+                    artist_overlap = True
+            elif not source_primary and not cand_primary:
+                artists_exact = True
+            else:
+                artist_overlap = True
+
+            if source_norm_title and cand_norm_title and source_norm_title == cand_norm_title:
+                if artists_exact:
+                    scored.append(
+                        (candidate, 1.0, MatchMethod.EXACT_METADATA, ["exact_title_and_artist"])
+                    )
+                elif artist_overlap:
+                    scored.append(
+                        (
+                            candidate,
+                            0.95,
+                            MatchMethod.NORMALIZED_METADATA,
+                            ["exact_title_artist_overlap"],
+                        )
+                    )
+            elif (
+                source_base_title
+                and cand_base_title
+                and source_base_title == cand_base_title
+            ):
+                if artists_exact:
+                    scored.append(
+                        (
+                            candidate,
+                            0.90,
+                            MatchMethod.NORMALIZED_METADATA,
+                            ["base_title_and_artist"],
+                        )
+                    )
+                elif artist_overlap:
+                    scored.append(
+                        (
+                            candidate,
+                            0.85,
+                            MatchMethod.NORMALIZED_METADATA,
+                            ["base_title_artist_overlap"],
+                        )
+                    )
+
+        if not scored:
+            return AlbumMatchResult(
+                source=source,
+                outcome=MatchOutcome.NOT_FOUND,
+                method=MatchMethod.NONE,
+                reasons=("no_matching_candidates",),
+            )
+
+        scored.sort(key=lambda item: item[1], reverse=True)
+        best_album, best_score, best_method, best_reasons = scored[0]
+        outcome = self._policy.outcome_for(best_score)
+        chosen = best_album if outcome is MatchOutcome.MATCHED else None
+
+        if len(scored) > 1:
+            runner_up_score = scored[1][1]
+            if outcome is MatchOutcome.MATCHED and best_score - runner_up_score < 0.02:
+                outcome = MatchOutcome.AMBIGUOUS
+                chosen = None
+                best_reasons = list(best_reasons) + ["ambiguous_candidates"]
+
+        return AlbumMatchResult(
+            source=source,
+            destination=chosen,
+            score=best_score,
+            method=best_method,
+            outcome=outcome,
+            reasons=tuple(best_reasons),
+            candidates=tuple(album for album, _, _, _ in scored[:3]),
+        )
+
+    def match(
+        self,
+        source: Album,
+        candidates: list[Album],
+        *,
+        reusable_destination_id: str | None = None,
+    ) -> AlbumMatchResult:
+        """Match one source album trying strategies in order of confidence."""
+
+        direct = self.match_by_direct_identifier(source, reusable_destination_id)
+        if direct is not None:
+            return direct
+        by_upc = self.match_by_upc(source, candidates)
+        if by_upc is not None:
+            return by_upc
+        return self.match_by_metadata(source, candidates)
+
+
+class ArtistMatcher:
+    """Match source artists against destination candidates."""
+
+    def __init__(self, policy: MatchingPolicy | None = None) -> None:
+        self._policy = policy or MatchingPolicy()
+
+    @property
+    def policy(self) -> MatchingPolicy:
+        """Return the immutable policy in use."""
+
+        return self._policy
+
+    def match_by_direct_identifier(
+        self, source: Artist, destination_id: str | None
+    ) -> ArtistMatchResult | None:
+        """Strategy 1: direct identifier reuse."""
+
+        if not destination_id:
+            return None
+        from dataclasses import replace
+
+        return ArtistMatchResult(
+            source=source,
+            destination=replace(source, source_id=destination_id),
+            score=1.0,
+            method=MatchMethod.DIRECT_ID,
+            outcome=MatchOutcome.MATCHED,
+            reasons=("direct_identifier_reused",),
+        )
+
+    def match_by_name(
+        self, source: Artist, candidates: list[Artist]
+    ) -> ArtistMatchResult:
+        """Strategy 2: exact normalized artist name comparison."""
+
+        if not candidates:
+            return ArtistMatchResult(
+                source=source,
+                outcome=MatchOutcome.NOT_FOUND,
+                method=MatchMethod.NONE,
+                reasons=("no_candidates",),
+            )
+
+        source_norm = normalize_text(source.name)
+        if not source_norm:
+            return ArtistMatchResult(
+                source=source,
+                outcome=MatchOutcome.NOT_FOUND,
+                method=MatchMethod.NONE,
+                reasons=("empty_source_name",),
+            )
+
+        exact_matches: list[Artist] = []
+        for candidate in candidates[: self._policy.max_candidates]:
+            cand_norm = normalize_text(candidate.name)
+            if cand_norm == source_norm:
+                exact_matches.append(candidate)
+
+        if not exact_matches:
+            return ArtistMatchResult(
+                source=source,
+                outcome=MatchOutcome.NOT_FOUND,
+                method=MatchMethod.NONE,
+                reasons=("name_mismatch",),
+            )
+
+        if len(exact_matches) == 1:
+            return ArtistMatchResult(
+                source=source,
+                destination=exact_matches[0],
+                score=1.0,
+                method=MatchMethod.EXACT_METADATA,
+                outcome=MatchOutcome.MATCHED,
+                reasons=("exact_name",),
+                candidates=tuple(exact_matches),
+            )
+
+        # Name collision: multiple destination candidates share the same normalized name
+        return ArtistMatchResult(
+            source=source,
+            destination=None,
+            score=1.0,
+            method=MatchMethod.EXACT_METADATA,
+            outcome=MatchOutcome.AMBIGUOUS,
+            reasons=("multiple_exact_name_candidates",),
+            candidates=tuple(exact_matches),
+        )
+
+    def match(
+        self,
+        source: Artist,
+        candidates: list[Artist],
+        *,
+        reusable_destination_id: str | None = None,
+    ) -> ArtistMatchResult:
+        """Match one source artist trying strategies in order of confidence."""
+
+        direct = self.match_by_direct_identifier(source, reusable_destination_id)
+        if direct is not None:
+            return direct
+        return self.match_by_name(source, candidates)

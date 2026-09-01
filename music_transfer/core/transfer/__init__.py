@@ -38,6 +38,7 @@ from .planner import (
     TransferPlanner,
     content_sections,
     require_transfer_content_spec,
+    validate_plan_set_like_items,
     validate_transfer_content_support,
 )
 from .recovery import RecoveryService
@@ -65,7 +66,6 @@ __all__ = [
     "content_sections",
     "is_terminal",
     "require_transfer_content_spec",
-
     "restore_positions",
     "resume_target",
     "scrub_credentials",
@@ -74,5 +74,6 @@ __all__ = [
     "status_after_execution",
     "to_write_order",
     "transition",
+    "validate_plan_set_like_items",
     "validate_transfer_content_support",
 ]

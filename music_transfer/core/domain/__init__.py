@@ -11,7 +11,13 @@ from .account import Account, AccountProfile
 from .album import Album
 from .artist import Artist, artist_names
 from .library import LibraryRecord, LibrarySnapshot
-from .matching import MatchResult, ScoredCandidate
+from .matching import (
+    AlbumMatchResult,
+    ArtistMatchResult,
+    IdentifierResolution,
+    MatchResult,
+    ScoredCandidate,
+)
 from .playlist import Playlist, PlaylistItem
 from .track import Track
 from .transfer import (
@@ -33,7 +39,10 @@ __all__ = [
     "Account",
     "AccountProfile",
     "Album",
+    "AlbumMatchResult",
     "Artist",
+    "ArtistMatchResult",
+    "IdentifierResolution",
     "LibraryRecord",
     "LibrarySnapshot",
     "MatchResult",

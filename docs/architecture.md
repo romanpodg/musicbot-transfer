@@ -130,6 +130,17 @@ must not be retried blindly, and "rate limited" is worth retrying.
 Resume never replays item 1..N from a saved position. Every item carries its own
 status, persisted after each write. See [transfer-lifecycle.md](transfer-lifecycle.md).
 
+### 3.6 Declarative Identifier Resolution (Phase 1.5A)
+
+A transfer item is never emitted in an executable state with a missing destination
+identifier. The planner resolves identifiers following an explicit order:
+
+1. Direct portable identifier reuse (`can_reuse_identifier`) without unnecessary search calls.
+2. Conservative catalog search (`search_tracks`, `search_albums`, `search_artists`) when search capability is declared and supported.
+3. Explicit classification as non-executable (`NOT_FOUND` with `destination_resolution_unavailable` or `not_found`, or `AMBIGUOUS` with `ambiguous`).
+
+Destination presence queries and preflight preconditions are evaluated strictly on resolved non-empty destination identifiers.
+
 ---
 
 ## 4. Package contents
@@ -169,6 +180,7 @@ These are the rules the test suite enforces. Breaking one fails a test.
 | K | Original metadata survives normalization | `normalize_text` returns a key, never mutates |
 | L | Writes require exact durable plan confirmation (`plan_id + revision + plan_hash`) | `TransferService`, `tests/unit/test_plan_identity_and_confirmation.py` |
 | M | Re-planning creates a new revision and invalidates old confirmation; destination drift produces zero writes | `TransferService`, `tests/unit/test_plan_identity_and_confirmation.py` |
+| N | A transfer item must never become executable without a resolved destination identifier or explicit non-executable classification | `TransferPlanner`, `validate_plan_set_like_items`, `tests/unit/test_identifier_resolution.py` |
 
 ---
 

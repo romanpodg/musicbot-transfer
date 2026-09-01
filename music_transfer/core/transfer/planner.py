@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..domain import (
+    IdentifierResolution,
     LibrarySnapshot,
     PlanPrecondition,
     Playlist,
@@ -42,9 +43,11 @@ from ..enums import (
     ContentType,
     DestinationPresence,
     EntityType,
+    IdentifierResolutionPolicy,
     ItemStatus,
     MatchMethod,
     MatchOutcome,
+    Platform,
     PreconditionExpectation,
     TransferOperation,
 )
@@ -55,7 +58,7 @@ from ..errors import (
     UnsupportedCapabilityError,
     UnsupportedTransferContentError,
 )
-from ..matching import TrackMatcher
+from ..matching import AlbumMatcher, ArtistMatcher, TrackMatcher
 from ..ports import DestinationState, MusicPlatformReadPort, PlatformCapabilities
 from .ordering import apply_logical_order
 
@@ -74,8 +77,11 @@ class TransferContentSpec:
     content_type: ContentType
     snapshot_sections: tuple[str, ...]
     entity_type: EntityType
+    operation: TransferOperation
+    resolution_policy: IdentifierResolutionPolicy
     source_read_capabilities: tuple[str, ...]
     destination_write_capabilities: tuple[str, ...]
+    search_capability: str | None = None
 
 
 #: Engine support registry: only content types with complete transfer paths.
@@ -84,6 +90,9 @@ ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
         content_type=ContentType.LIKED_TRACKS,
         snapshot_sections=("tracks",),
         entity_type=EntityType.TRACK,
+        operation=TransferOperation.SAVE_TRACK,
+        resolution_policy=IdentifierResolutionPolicy.REUSE_OR_SEARCH,
+        search_capability="search_tracks",
         source_read_capabilities=("read_liked_tracks",),
         destination_write_capabilities=("write_liked_tracks",),
     ),
@@ -91,6 +100,9 @@ ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
         content_type=ContentType.SAVED_ALBUMS,
         snapshot_sections=("albums",),
         entity_type=EntityType.ALBUM,
+        operation=TransferOperation.SAVE_ALBUM,
+        resolution_policy=IdentifierResolutionPolicy.REUSE_OR_SEARCH,
+        search_capability="search_albums",
         source_read_capabilities=("read_saved_albums",),
         destination_write_capabilities=("write_saved_albums",),
     ),
@@ -98,6 +110,9 @@ ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
         content_type=ContentType.FOLLOWED_ARTISTS,
         snapshot_sections=("artists",),
         entity_type=EntityType.ARTIST,
+        operation=TransferOperation.FOLLOW_ARTIST,
+        resolution_policy=IdentifierResolutionPolicy.REUSE_OR_SEARCH,
+        search_capability="search_artists",
         source_read_capabilities=("read_followed_artists",),
         destination_write_capabilities=("write_followed_artists",),
     ),
@@ -105,6 +120,9 @@ ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
         content_type=ContentType.PLAYLISTS,
         snapshot_sections=("playlists",),
         entity_type=EntityType.PLAYLIST,
+        operation=TransferOperation.CREATE_PLAYLIST,
+        resolution_policy=IdentifierResolutionPolicy.CONTAINER_CREATE,
+        search_capability=None,
         source_read_capabilities=("read_playlists",),
         destination_write_capabilities=("create_playlists", "write_playlist_items"),
     ),
@@ -195,15 +213,36 @@ class PlannerResult:
 class TransferPlanner:
     """Build a transfer plan from an exported snapshot without writing anything."""
 
-    def __init__(self, matcher: TrackMatcher | None = None, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        matcher: TrackMatcher | None = None,
+        logger: logging.Logger | None = None,
+        *,
+        album_matcher: AlbumMatcher | None = None,
+        artist_matcher: ArtistMatcher | None = None,
+    ) -> None:
         self._matcher = matcher or TrackMatcher()
+        self._album_matcher = album_matcher or AlbumMatcher(self._matcher.policy)
+        self._artist_matcher = artist_matcher or ArtistMatcher(self._matcher.policy)
         self._logger = logger or _LOGGER
 
     @property
     def matcher(self) -> TrackMatcher:
-        """Return the matcher used for cross-platform catalog resolution."""
+        """Return the matcher used for cross-platform track catalog resolution."""
 
         return self._matcher
+
+    @property
+    def album_matcher(self) -> AlbumMatcher:
+        """Return the matcher used for cross-platform album catalog resolution."""
+
+        return self._album_matcher
+
+    @property
+    def artist_matcher(self) -> ArtistMatcher:
+        """Return the matcher used for cross-platform artist catalog resolution."""
+
+        return self._artist_matcher
 
     def build(
         self,
@@ -361,6 +400,53 @@ class TransferPlanner:
             )
             return DestinationState(platform=job.destination_platform)
 
+    def _resolve_identifier(
+        self,
+        item: Any,
+        spec: TransferContentSpec,
+        destination: MusicPlatformReadPort,
+        capabilities: PlatformCapabilities,
+        source_platform: Platform,
+    ) -> IdentifierResolution:
+        """Resolve a destination identifier through direct reuse, search, or explicit failure."""
+
+        source_id = str(getattr(item, "source_id", ""))
+        entity_type = spec.entity_type
+
+        # 1. Direct reusable identifier
+        if destination.can_reuse_identifier(entity_type, source_platform):
+            return IdentifierResolution(
+                destination_id=source_id,
+                match_method=MatchMethod.DIRECT_ID,
+                match_score=1.0,
+                outcome=MatchOutcome.MATCHED,
+                reasons=("direct_identifier_reused",),
+            )
+
+        # 2. Destination catalog resolution if declared capability is supported
+        if spec.search_capability and capabilities.supports(spec.search_capability):
+            if entity_type is EntityType.TRACK:
+                candidates = destination.search_track(item)
+                match = self._matcher.match(item, candidates)
+                return IdentifierResolution.from_match(match)
+            if entity_type is EntityType.ALBUM:
+                candidates = destination.search_album(item)
+                match = self._album_matcher.match(item, candidates)
+                return IdentifierResolution.from_match(match)
+            if entity_type is EntityType.ARTIST:
+                candidates = destination.search_artist(item)
+                match = self._artist_matcher.match(item, candidates)
+                return IdentifierResolution.from_match(match)
+
+        # 3. Explicit NOT_FOUND / unsupported resolution
+        return IdentifierResolution(
+            destination_id=None,
+            match_method=MatchMethod.NONE,
+            match_score=0.0,
+            outcome=MatchOutcome.NOT_FOUND,
+            reasons=("destination_resolution_unavailable",),
+        )
+
     def _plan_section(
         self,
         job: TransferJob,
@@ -387,11 +473,6 @@ class TransferPlanner:
         raw_items = list(getattr(source, section))
         ordered = self._order(job, raw_items, section)
         planned: list[TransferItem] = []
-        op = {
-            EntityType.TRACK: TransferOperation.SAVE_TRACK,
-            EntityType.ALBUM: TransferOperation.SAVE_ALBUM,
-            EntityType.ARTIST: TransferOperation.FOLLOW_ARTIST,
-        }.get(entity_type, TransferOperation.NONE)
         for position, item in enumerate(ordered):
             source_id = str(getattr(item, "source_id", ""))
             if not source_id:
@@ -404,41 +485,30 @@ class TransferPlanner:
                 job.destination_platform,
                 original_position=position,
                 source_metadata=self._metadata_for(item),
-                operation=op,
+                operation=spec.operation,
             )
 
-            reusable = None
-            if entity_type is EntityType.TRACK and destination.can_reuse_identifier(
-                entity_type, job.source_platform
-            ):
-                reusable = source_id
-                transfer_item.destination_id = source_id
-                transfer_item.match_method = _DIRECT_METHOD
-                transfer_item.match_score = 1.0
-            elif entity_type is EntityType.TRACK and capabilities.supports("search_tracks"):
-                match = self._matcher.match(item, destination.search_track(item))
-                transfer_item.match_method = match.method
-                transfer_item.match_score = match.score
-                transfer_item.destination_id = match.destination_id
-                if match.outcome is MatchOutcome.MATCHED:
-                    transfer_item.status = ItemStatus.MATCHED
-                else:
-                    transfer_item.status = (
-                        ItemStatus.AMBIGUOUS
-                        if match.outcome is MatchOutcome.AMBIGUOUS
-                        else ItemStatus.NOT_FOUND
-                    )
-                    transfer_item.last_error = match.outcome.value
-                for warning in match.warnings:
-                    warnings.append(f"{warning}:{source_id}")
+            resolution = self._resolve_identifier(
+                item, spec, destination, capabilities, job.source_platform
+            )
+            transfer_item.match_method = resolution.match_method
+            transfer_item.match_score = resolution.match_score
+            transfer_item.destination_id = resolution.destination_id
+
+            if resolution.outcome is MatchOutcome.MATCHED:
+                transfer_item.status = ItemStatus.MATCHED
+            elif resolution.outcome is MatchOutcome.AMBIGUOUS:
+                transfer_item.status = ItemStatus.AMBIGUOUS
+                transfer_item.last_error = "ambiguous"
             else:
-                reusable = source_id if destination.can_reuse_identifier(
-                    entity_type, job.source_platform
-                ) else None
-                if reusable is not None:
-                    transfer_item.destination_id = reusable
-                    transfer_item.match_method = _DIRECT_METHOD
-                    transfer_item.match_score = 1.0
+                transfer_item.status = ItemStatus.NOT_FOUND
+                if "destination_resolution_unavailable" in resolution.reasons:
+                    transfer_item.last_error = "destination_resolution_unavailable"
+                else:
+                    transfer_item.last_error = "not_found"
+
+            for warning in resolution.warnings:
+                warnings.append(f"{warning}:{source_id}")
 
             if transfer_item.destination_id is not None:
                 if state is not None:
@@ -670,15 +740,18 @@ class TransferPlanner:
 
     @staticmethod
     def _validate_plan(items: list[TransferItem]) -> None:
-        """Validate playlist write positions before plan finalization.
+        """Validate playlist write positions and set-like executable invariants before plan finalization.
 
         Rules:
         1. Executable ADD_PLAYLIST_ITEM entries must have write_position is not None.
         2. Non-executable or non-playlist items must have write_position is None.
         3. For each playlist container, executable write positions must be unique
            and strictly contiguous 0..N-1.
+        4. Every set-like item with executable status (PENDING or MATCHED) must have
+           a non-empty destination_id.
         """
         validate_plan_write_positions(items)
+        validate_plan_set_like_items(items)
 
 
 def migrate_legacy_write_positions(items: list[TransferItem]) -> None:
@@ -749,4 +822,26 @@ def validate_plan_write_positions(items: list[TransferItem]) -> None:
                 raise TransferConfigurationError(
                     f"invalid_playlist_write_positions:non_contiguous:{container_id}"
                 )
+
+
+def validate_plan_set_like_items(items: list[TransferItem]) -> None:
+    """Validate that every executable set-like item has a non-empty destination identifier.
+
+    Raises:
+        TransferConfigurationError: If an executable set-like item is missing its destination ID.
+    """
+    for item in items:
+        if (
+            item.operation
+            in (
+                TransferOperation.SAVE_TRACK,
+                TransferOperation.SAVE_ALBUM,
+                TransferOperation.FOLLOW_ARTIST,
+            )
+            and item.status in (ItemStatus.PENDING, ItemStatus.MATCHED)
+            and not item.destination_id
+        ):
+            raise TransferConfigurationError(
+                f"unresolved_executable_item:{item.entity_type}:{item.source_id}"
+            )
 

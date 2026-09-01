@@ -132,6 +132,42 @@ ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
 CONTENT_SPECS = ENGINE_TRANSFER_SPECS
 
 
+def validate_transfer_content_spec(spec: TransferContentSpec) -> None:
+    """Validate internal consistency of a TransferContentSpec.
+
+    Raises:
+        TransferConfigurationError: If the spec contains contradictory,
+            missing, or unsupported configuration combinations.
+    """
+    if not isinstance(spec, TransferContentSpec):
+        raise TransferConfigurationError(
+            f"invalid_transfer_content_spec_type:{type(spec).__name__}"
+        )
+
+    policy = spec.resolution_policy
+    if policy is IdentifierResolutionPolicy.REUSE_OR_SEARCH:
+        if not spec.search_capability or not isinstance(spec.search_capability, str):
+            raise TransferConfigurationError(
+                f"reuse_or_search_missing_search_capability:{spec.content_type.value}"
+            )
+    elif policy is IdentifierResolutionPolicy.REUSE_ONLY:
+        if spec.search_capability is not None:
+            raise TransferConfigurationError(
+                f"reuse_only_unexpected_search_capability:{spec.content_type.value}"
+            )
+    elif policy is IdentifierResolutionPolicy.CONTAINER_CREATE:
+        if spec.search_capability is not None:
+            raise TransferConfigurationError(
+                f"container_create_unexpected_search_capability:{spec.content_type.value}"
+            )
+    else:
+        raise TransferConfigurationError(f"unrecognized_resolution_policy:{policy}")
+
+
+for _registered_spec in ENGINE_TRANSFER_SPECS.values():
+    validate_transfer_content_spec(_registered_spec)
+
+
 def require_transfer_content_spec(content_type: ContentType) -> TransferContentSpec:
     """Resolve the authoritative transfer spec for a content type.
 
@@ -146,6 +182,7 @@ def require_transfer_content_spec(content_type: ContentType) -> TransferContentS
             content_type=content_type,
             reason="engine_not_implemented",
         )
+    validate_transfer_content_spec(spec)
     return spec
 
 
@@ -410,42 +447,77 @@ class TransferPlanner:
     ) -> IdentifierResolution:
         """Resolve a destination identifier through direct reuse, search, or explicit failure."""
 
-        source_id = str(getattr(item, "source_id", ""))
-        entity_type = spec.entity_type
+        policy = spec.resolution_policy
 
-        # 1. Direct reusable identifier
-        if destination.can_reuse_identifier(entity_type, source_platform):
+        if policy is IdentifierResolutionPolicy.REUSE_OR_SEARCH:
+            # 1. Direct reusable identifier
+            if destination.can_reuse_identifier(spec.entity_type, source_platform):
+                return self._direct_reuse(item)
+            # 2. Destination catalog resolution if declared capability is supported
+            if spec.search_capability and capabilities.supports(spec.search_capability):
+                return self._search_and_match(item, spec.entity_type, destination)
+            # 3. Explicit NOT_FOUND / unsupported resolution
             return IdentifierResolution(
-                destination_id=source_id,
-                match_method=MatchMethod.DIRECT_ID,
-                match_score=1.0,
-                outcome=MatchOutcome.MATCHED,
-                reasons=("direct_identifier_reused",),
+                destination_id=None,
+                match_method=MatchMethod.NONE,
+                match_score=0.0,
+                outcome=MatchOutcome.NOT_FOUND,
+                reasons=("destination_resolution_unavailable",),
             )
 
-        # 2. Destination catalog resolution if declared capability is supported
-        if spec.search_capability and capabilities.supports(spec.search_capability):
-            if entity_type is EntityType.TRACK:
-                candidates = destination.search_track(item)
-                match = self._matcher.match(item, candidates)
-                return IdentifierResolution.from_match(match)
-            if entity_type is EntityType.ALBUM:
-                candidates = destination.search_album(item)
-                match = self._album_matcher.match(item, candidates)
-                return IdentifierResolution.from_match(match)
-            if entity_type is EntityType.ARTIST:
-                candidates = destination.search_artist(item)
-                match = self._artist_matcher.match(item, candidates)
-                return IdentifierResolution.from_match(match)
+        if policy is IdentifierResolutionPolicy.REUSE_ONLY:
+            # 1. Direct reusable identifier
+            if destination.can_reuse_identifier(spec.entity_type, source_platform):
+                return self._direct_reuse(item)
+            # 2. Explicit NOT_FOUND without searching
+            return IdentifierResolution(
+                destination_id=None,
+                match_method=MatchMethod.NONE,
+                match_score=0.0,
+                outcome=MatchOutcome.NOT_FOUND,
+                reasons=("destination_resolution_unavailable",),
+            )
 
-        # 3. Explicit NOT_FOUND / unsupported resolution
-        return IdentifierResolution(
-            destination_id=None,
-            match_method=MatchMethod.NONE,
-            match_score=0.0,
-            outcome=MatchOutcome.NOT_FOUND,
-            reasons=("destination_resolution_unavailable",),
+        if policy is IdentifierResolutionPolicy.CONTAINER_CREATE:
+            raise TransferConfigurationError(
+                f"container_create_resolution_unsupported:{spec.content_type.value}"
+            )
+
+        raise TransferConfigurationError(
+            f"unhandled_resolution_policy:{policy}"
         )
+
+    def _direct_reuse(self, item: Any) -> IdentifierResolution:
+        """Build a successful resolution reusing the source identifier."""
+        source_id = str(getattr(item, "source_id", ""))
+        return IdentifierResolution(
+            destination_id=source_id,
+            match_method=MatchMethod.DIRECT_ID,
+            match_score=1.0,
+            outcome=MatchOutcome.MATCHED,
+            reasons=("direct_identifier_reused",),
+        )
+
+    def _search_and_match(
+        self,
+        item: Any,
+        entity_type: EntityType,
+        destination: MusicPlatformReadPort,
+    ) -> IdentifierResolution:
+        """Query destination catalog candidates and score matches."""
+        if entity_type is EntityType.TRACK:
+            candidates = destination.search_track(item)
+            match = self._matcher.match(item, candidates)
+            return IdentifierResolution.from_match(match)
+        if entity_type is EntityType.ALBUM:
+            candidates = destination.search_album(item)
+            match = self._album_matcher.match(item, candidates)
+            return IdentifierResolution.from_match(match)
+        if entity_type is EntityType.ARTIST:
+            candidates = destination.search_artist(item)
+            match = self._artist_matcher.match(item, candidates)
+            return IdentifierResolution.from_match(match)
+        raise TransferConfigurationError(f"unsupported_search_entity_type:{entity_type.value}")
 
     def _plan_section(
         self,

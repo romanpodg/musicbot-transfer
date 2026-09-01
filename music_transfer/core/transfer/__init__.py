@@ -39,6 +39,7 @@ from .planner import (
     content_sections,
     require_transfer_content_spec,
     validate_plan_set_like_items,
+    validate_transfer_content_spec,
     validate_transfer_content_support,
 )
 from .recovery import RecoveryService
@@ -75,5 +76,6 @@ __all__ = [
     "to_write_order",
     "transition",
     "validate_plan_set_like_items",
+    "validate_transfer_content_spec",
     "validate_transfer_content_support",
 ]

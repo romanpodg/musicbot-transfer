@@ -1,14 +1,21 @@
-"""Regression tests for Phase 1.5A declarative identifier resolution and cross-platform set-like matching.
+"""Regression tests for Phase 1.5A and 1.5A.1 declarative identifier resolution and hardened matching.
 
 Guardrails verified:
 1. TransferContentSpec declares explicit operations, resolution policies, and search capabilities.
-2. Reusable IDs (TIDAL -> TIDAL) do not trigger catalog searches.
-3. Cross-platform transfers without ID portability use conservative catalog resolution.
-4. Missing search capabilities or unmatched candidates result in explicit non-executable item statuses.
-5. Ambiguous matches are flagged AMBIGUOUS with destination_id=None and are non-executable.
-6. Destination presence queries and preconditions always use the resolved destination_id.
-7. Central plan validation guarantees no executable set-like item has a missing destination identifier.
-8. Confirmed plans do not rematch during execution or resume.
+2. ResolutionPolicy enforcement:
+   - REUSE_OR_SEARCH: direct reuse -> search (if supported) -> NOT_FOUND.
+   - REUSE_ONLY: direct reuse -> NOT_FOUND (never search).
+   - CONTAINER_CREATE: rejected if passed to set-like identifier resolver.
+3. Spec consistency validation prevents contradictory or malformed engine specs.
+4. Hardened AlbumMatcher:
+   - UPC remains strong (score 1.0, MATCHED even without artist metadata).
+   - Exact title + confirmed artist -> MATCHED (1.0 or 0.95).
+   - Exact title + missing candidate/source/both artists -> AMBIGUOUS with destination_id=None.
+   - Confirmed artist disagreement -> NOT_FOUND.
+   - Base title without positive artist evidence -> NOT_FOUND / not MATCHED.
+5. Central plan validation guarantees no executable set-like item has a missing destination identifier.
+6. Confirmed plans do not rematch during execution or resume.
+7. TrackMatcher and ArtistMatcher behaviors remain preserved.
 """
 
 from __future__ import annotations
@@ -38,12 +45,19 @@ from music_transfer.core.enums import (
     TransferOperation,
 )
 from music_transfer.core.errors import TransferConfigurationError
-from music_transfer.core.matching import AlbumMatcher, ArtistMatcher, MatchingPolicy
+from music_transfer.core.matching import (
+    AlbumMatcher,
+    ArtistMatcher,
+    MatchingPolicy,
+    TrackMatcher,
+)
 from music_transfer.core.ports import PlatformCapabilities, ReadOnlyAdapter
 from music_transfer.core.transfer import (
+    TransferContentSpec,
     TransferPlanner,
     require_transfer_content_spec,
     validate_plan_set_like_items,
+    validate_transfer_content_spec,
 )
 from music_transfer.infrastructure.persistence import (
     JsonTransferItemRepository,
@@ -56,6 +70,7 @@ from tests.support import (
     album,
     artist,
     snapshot,
+    track,
 )
 
 
@@ -68,7 +83,7 @@ def build_service(root: Path) -> TransferService:
 
 
 class DeclarativeIdentifierResolutionTests(unittest.TestCase):
-    """Test suite for Phase 1.5A declarative identifier resolution."""
+    """Test suite for Phase 1.5A and 1.5A.1 declarative identifier resolution."""
 
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -112,6 +127,8 @@ class DeclarativeIdentifierResolutionTests(unittest.TestCase):
             plan_hash=plan.plan_hash,
         )
 
+    # -- Resolution Policy Enforcement (Phase 1.5A.1) ------------------------
+
     def test_set_like_spec_declares_transfer_operation(self) -> None:
         """TransferContentSpec declares operation, resolution_policy, and search_capability."""
         liked_tracks = require_transfer_content_spec(ContentType.LIKED_TRACKS)
@@ -141,6 +158,317 @@ class DeclarativeIdentifierResolutionTests(unittest.TestCase):
             playlists.resolution_policy, IdentifierResolutionPolicy.CONTAINER_CREATE
         )
         self.assertIsNone(playlists.search_capability)
+
+    def test_reuse_only_policy_never_searches(self) -> None:
+        """REUSE_ONLY policy returns NOT_FOUND without searching even if search_capability declared."""
+        src_album = album("OK Computer", identifier="src-alb-1", artists=["Radiohead"])
+        dst_album = album(
+            "OK Computer",
+            identifier="dst-alb-99",
+            platform=Platform.SPOTIFY,
+            artists=["Radiohead"],
+        )
+
+        spec = TransferContentSpec(
+            content_type=ContentType.SAVED_ALBUMS,
+            snapshot_sections=("albums",),
+            entity_type=EntityType.ALBUM,
+            operation=TransferOperation.SAVE_ALBUM,
+            resolution_policy=IdentifierResolutionPolicy.REUSE_ONLY,
+            search_capability="search_albums",
+            source_read_capabilities=("read_saved_albums",),
+            destination_write_capabilities=("write_saved_albums",),
+        )
+
+        dst = FakePlatformAdapter(
+            platform=Platform.SPOTIFY,
+            catalog_albums=[dst_album],
+            capabilities=PlatformCapabilities(
+                platform=Platform.SPOTIFY,
+                read_saved_albums=True,
+                write_saved_albums=True,
+                search_albums=True,
+            ),
+        )
+
+        planner = TransferPlanner()
+        res = planner._resolve_identifier(
+            src_album, spec, ReadOnlyAdapter(dst), dst.capabilities, Platform.TIDAL
+        )
+
+        self.assertEqual(res.outcome, MatchOutcome.NOT_FOUND)
+        self.assertIsNone(res.destination_id)
+        self.assertEqual(res.match_method, MatchMethod.NONE)
+        self.assertIn("destination_resolution_unavailable", res.reasons)
+
+    def test_reuse_or_search_policy_searches_when_reuse_unavailable(self) -> None:
+        """REUSE_OR_SEARCH policy searches destination when reuse is unavailable."""
+        src_album = album("OK Computer", identifier="src-alb-1", artists=["Radiohead"])
+        dst_album = album(
+            "OK Computer",
+            identifier="dst-alb-99",
+            platform=Platform.SPOTIFY,
+            artists=["Radiohead"],
+        )
+
+        spec = TransferContentSpec(
+            content_type=ContentType.SAVED_ALBUMS,
+            snapshot_sections=("albums",),
+            entity_type=EntityType.ALBUM,
+            operation=TransferOperation.SAVE_ALBUM,
+            resolution_policy=IdentifierResolutionPolicy.REUSE_OR_SEARCH,
+            search_capability="search_albums",
+            source_read_capabilities=("read_saved_albums",),
+            destination_write_capabilities=("write_saved_albums",),
+        )
+
+        dst = FakePlatformAdapter(
+            platform=Platform.SPOTIFY,
+            catalog_albums=[dst_album],
+            capabilities=PlatformCapabilities(
+                platform=Platform.SPOTIFY,
+                read_saved_albums=True,
+                write_saved_albums=True,
+                search_albums=True,
+            ),
+        )
+
+        planner = TransferPlanner()
+        res = planner._resolve_identifier(
+            src_album, spec, ReadOnlyAdapter(dst), dst.capabilities, Platform.TIDAL
+        )
+
+        self.assertEqual(res.outcome, MatchOutcome.MATCHED)
+        self.assertEqual(res.destination_id, "dst-alb-99")
+        self.assertEqual(res.match_method, MatchMethod.EXACT_METADATA)
+
+    def test_direct_reuse_precedes_search_for_reuse_or_search(self) -> None:
+        """Direct reuse takes precedence over search for REUSE_OR_SEARCH."""
+        src_album = album("OK Computer", identifier="alb-1", artists=["Radiohead"])
+        spec = require_transfer_content_spec(ContentType.SAVED_ALBUMS)
+
+        dst = FakePlatformAdapter(platform=Platform.TIDAL)
+        planner = TransferPlanner()
+        res = planner._resolve_identifier(
+            src_album, spec, ReadOnlyAdapter(dst), dst.capabilities, Platform.TIDAL
+        )
+
+        self.assertEqual(res.outcome, MatchOutcome.MATCHED)
+        self.assertEqual(res.destination_id, "alb-1")
+        self.assertEqual(res.match_method, MatchMethod.DIRECT_ID)
+
+    def test_direct_reuse_works_for_reuse_only(self) -> None:
+        """Direct reuse succeeds for REUSE_ONLY policy."""
+        src_album = album("OK Computer", identifier="alb-1", artists=["Radiohead"])
+        spec = TransferContentSpec(
+            content_type=ContentType.SAVED_ALBUMS,
+            snapshot_sections=("albums",),
+            entity_type=EntityType.ALBUM,
+            operation=TransferOperation.SAVE_ALBUM,
+            resolution_policy=IdentifierResolutionPolicy.REUSE_ONLY,
+            source_read_capabilities=("read_saved_albums",),
+            destination_write_capabilities=("write_saved_albums",),
+        )
+
+        dst = FakePlatformAdapter(platform=Platform.TIDAL)
+        planner = TransferPlanner()
+        res = planner._resolve_identifier(
+            src_album, spec, ReadOnlyAdapter(dst), dst.capabilities, Platform.TIDAL
+        )
+
+        self.assertEqual(res.outcome, MatchOutcome.MATCHED)
+        self.assertEqual(res.destination_id, "alb-1")
+        self.assertEqual(res.match_method, MatchMethod.DIRECT_ID)
+
+    def test_container_create_policy_is_rejected_by_set_like_resolver(self) -> None:
+        """CONTAINER_CREATE policy fails closed if passed to set-like resolver."""
+        src_album = album("OK Computer", identifier="alb-1", artists=["Radiohead"])
+        spec = require_transfer_content_spec(ContentType.PLAYLISTS)
+
+        dst = FakePlatformAdapter(platform=Platform.TIDAL)
+        planner = TransferPlanner()
+
+        with self.assertRaises(TransferConfigurationError) as ctx:
+            planner._resolve_identifier(
+                src_album, spec, ReadOnlyAdapter(dst), dst.capabilities, Platform.TIDAL
+            )
+        self.assertIn("container_create_resolution_unsupported:playlists", str(ctx.exception))
+
+    def test_unknown_resolution_policy_fails_closed_if_representable(self) -> None:
+        """Unknown resolution policy fails closed with TransferConfigurationError."""
+        src_album = album("OK Computer", identifier="alb-1", artists=["Radiohead"])
+        spec = TransferContentSpec(
+            content_type=ContentType.SAVED_ALBUMS,
+            snapshot_sections=("albums",),
+            entity_type=EntityType.ALBUM,
+            operation=TransferOperation.SAVE_ALBUM,
+            resolution_policy="unsupported_policy",  # type: ignore[arg-type]
+            source_read_capabilities=("read_saved_albums",),
+            destination_write_capabilities=("write_saved_albums",),
+        )
+
+        dst = FakePlatformAdapter(platform=Platform.TIDAL)
+        planner = TransferPlanner()
+
+        with self.assertRaises(TransferConfigurationError) as ctx:
+            planner._resolve_identifier(
+                src_album, spec, ReadOnlyAdapter(dst), dst.capabilities, Platform.TIDAL
+            )
+        self.assertIn("unhandled_resolution_policy", str(ctx.exception))
+
+    def test_spec_consistency_validation(self) -> None:
+        """validate_transfer_content_spec verifies spec invariants and catches contradictions."""
+        # 1. Valid engine specs pass
+        for spec in (
+            require_transfer_content_spec(ContentType.LIKED_TRACKS),
+            require_transfer_content_spec(ContentType.SAVED_ALBUMS),
+            require_transfer_content_spec(ContentType.FOLLOWED_ARTISTS),
+            require_transfer_content_spec(ContentType.PLAYLISTS),
+        ):
+            validate_transfer_content_spec(spec)
+
+        # 2. REUSE_OR_SEARCH missing search_capability fails
+        bad_search_spec = TransferContentSpec(
+            content_type=ContentType.SAVED_ALBUMS,
+            snapshot_sections=("albums",),
+            entity_type=EntityType.ALBUM,
+            operation=TransferOperation.SAVE_ALBUM,
+            resolution_policy=IdentifierResolutionPolicy.REUSE_OR_SEARCH,
+            search_capability=None,
+            source_read_capabilities=("read_saved_albums",),
+            destination_write_capabilities=("write_saved_albums",),
+        )
+        with self.assertRaises(TransferConfigurationError):
+            validate_transfer_content_spec(bad_search_spec)
+
+        # 3. REUSE_ONLY declaring search_capability fails
+        bad_reuse_spec = TransferContentSpec(
+            content_type=ContentType.SAVED_ALBUMS,
+            snapshot_sections=("albums",),
+            entity_type=EntityType.ALBUM,
+            operation=TransferOperation.SAVE_ALBUM,
+            resolution_policy=IdentifierResolutionPolicy.REUSE_ONLY,
+            search_capability="search_albums",
+            source_read_capabilities=("read_saved_albums",),
+            destination_write_capabilities=("write_saved_albums",),
+        )
+        with self.assertRaises(TransferConfigurationError):
+            validate_transfer_content_spec(bad_reuse_spec)
+
+        # 4. CONTAINER_CREATE declaring search_capability fails
+        bad_container_spec = TransferContentSpec(
+            content_type=ContentType.PLAYLISTS,
+            snapshot_sections=("playlists",),
+            entity_type=EntityType.PLAYLIST,
+            operation=TransferOperation.CREATE_PLAYLIST,
+            resolution_policy=IdentifierResolutionPolicy.CONTAINER_CREATE,
+            search_capability="search_tracks",
+            source_read_capabilities=("read_playlists",),
+            destination_write_capabilities=("create_playlists",),
+        )
+        with self.assertRaises(TransferConfigurationError):
+            validate_transfer_content_spec(bad_container_spec)
+
+        # 5. Invalid spec type fails
+        with self.assertRaises(TransferConfigurationError):
+            validate_transfer_content_spec("not_a_spec")  # type: ignore[arg-type]
+
+    # -- Hardened Album Matching Tests (Phase 1.5A.1) ------------------------
+
+    def test_album_exact_title_and_artist_matches(self) -> None:
+        """Exact normalized title and primary artist match with score 1.0."""
+        policy = MatchingPolicy()
+        matcher = AlbumMatcher(policy)
+
+        src = album("Random Access Memories", artists=["Daft Punk"], identifier="src-1")
+        cand = album("Random Access Memories", artists=["Daft Punk"], identifier="dst-1")
+
+        res = matcher.match(src, [cand])
+        self.assertEqual(res.outcome, MatchOutcome.MATCHED)
+        self.assertEqual(res.destination_id, "dst-1")
+        self.assertEqual(res.score, 1.0)
+        self.assertEqual(res.method, MatchMethod.EXACT_METADATA)
+        self.assertIn("exact_title_and_artist", res.reasons)
+
+    def test_album_exact_title_missing_candidate_artist_is_not_matched(self) -> None:
+        """Exact title with missing candidate artist evidence results in AMBIGUOUS with destination_id=None."""
+        policy = MatchingPolicy()
+        matcher = AlbumMatcher(policy)
+
+        src = album("Greatest Hits", artists=["Artist A"], identifier="src-1")
+        cand = album("Greatest Hits", artists=[], identifier="dst-1")
+
+        res = matcher.match(src, [cand])
+        self.assertEqual(res.outcome, MatchOutcome.AMBIGUOUS)
+        self.assertIsNone(res.destination_id)
+        self.assertIn("exact_title_missing_artist_evidence", res.reasons)
+
+    def test_album_exact_title_missing_source_artist_is_not_matched(self) -> None:
+        """Exact title with missing source artist evidence results in AMBIGUOUS with destination_id=None."""
+        policy = MatchingPolicy()
+        matcher = AlbumMatcher(policy)
+
+        src = album("Greatest Hits", artists=[], identifier="src-1")
+        cand = album("Greatest Hits", artists=["Artist A"], identifier="dst-1")
+
+        res = matcher.match(src, [cand])
+        self.assertEqual(res.outcome, MatchOutcome.AMBIGUOUS)
+        self.assertIsNone(res.destination_id)
+        self.assertIn("exact_title_missing_artist_evidence", res.reasons)
+
+    def test_album_exact_title_both_artists_missing_is_not_matched(self) -> None:
+        """Exact title with both artist lists missing results in AMBIGUOUS with destination_id=None."""
+        policy = MatchingPolicy()
+        matcher = AlbumMatcher(policy)
+
+        src = album("Greatest Hits", artists=[], identifier="src-1")
+        cand = album("Greatest Hits", artists=[], identifier="dst-1")
+
+        res = matcher.match(src, [cand])
+        self.assertEqual(res.outcome, MatchOutcome.AMBIGUOUS)
+        self.assertIsNone(res.destination_id)
+        self.assertIn("exact_title_missing_artist_evidence", res.reasons)
+
+    def test_album_same_title_different_artist_is_not_matched(self) -> None:
+        """Exact title with confirmed artist disagreement is NOT_FOUND."""
+        policy = MatchingPolicy()
+        matcher = AlbumMatcher(policy)
+
+        src = album("Greatest Hits", artists=["Artist A"], identifier="src-1")
+        cand = album("Greatest Hits", artists=["Artist B"], identifier="dst-1")
+
+        res = matcher.match(src, [cand])
+        self.assertEqual(res.outcome, MatchOutcome.NOT_FOUND)
+        self.assertIsNone(res.destination_id)
+
+    def test_album_upc_match_still_matches_without_artist_metadata(self) -> None:
+        """UPC match identifies album with score 1.0 even if artist metadata is absent."""
+        policy = MatchingPolicy()
+        matcher = AlbumMatcher(policy)
+
+        src = album("Greatest Hits", upc="0077774644624", artists=[], identifier="src-1")
+        cand = album("Different Title", upc="0077774644624", artists=[], identifier="dst-1")
+
+        res = matcher.match(src, [cand])
+        self.assertEqual(res.outcome, MatchOutcome.MATCHED)
+        self.assertEqual(res.destination_id, "dst-1")
+        self.assertEqual(res.score, 1.0)
+        self.assertEqual(res.method, MatchMethod.EXACT_METADATA)
+        self.assertIn("upc_equal", res.reasons)
+
+    def test_album_base_title_without_artist_evidence_is_not_matched(self) -> None:
+        """Base title match without positive artist evidence is never MATCHED."""
+        policy = MatchingPolicy()
+        matcher = AlbumMatcher(policy)
+
+        src = album("Abbey Road (Remastered 2009)", artists=[], identifier="src-1")
+        cand = album("Abbey Road", artists=[], identifier="dst-1")
+
+        res = matcher.match(src, [cand])
+        self.assertNotEqual(res.outcome, MatchOutcome.MATCHED)
+        self.assertIsNone(res.destination_id)
+
+    # -- Regression preservation from Phase 1.5A ------------------------------
 
     def test_tidal_album_direct_id_reuse_does_not_search(self) -> None:
         """TIDAL -> TIDAL album transfers reuse source IDs directly without catalog searches."""
@@ -780,46 +1108,6 @@ class DeclarativeIdentifierResolutionTests(unittest.TestCase):
         self.assertEqual(items[0].status, ItemStatus.TRANSFERRED)
         self.assertEqual(items[0].destination_id, "dst-art-99")
 
-    def test_album_matcher_upc_and_qualifier_matching(self) -> None:
-        """AlbumMatcher correctly matches by UPC, exact title, and normalized base title."""
-        policy = MatchingPolicy()
-        matcher = AlbumMatcher(policy)
-
-        # 1. UPC match
-        src = album(
-            "Abbey Road",
-            identifier="src-1",
-            upc="0077774644624",
-            artists=["The Beatles"],
-        )
-        cand = album(
-            "Abbey Road (Super Deluxe Edition)",
-            identifier="dst-1",
-            upc="0077774644624",
-            artists=["The Beatles"],
-        )
-        res = matcher.match(src, [cand])
-        self.assertEqual(res.outcome, MatchOutcome.MATCHED)
-        self.assertEqual(res.destination_id, "dst-1")
-        self.assertEqual(res.method, MatchMethod.EXACT_METADATA)
-        self.assertIn("upc_equal", res.reasons)
-
-        # 2. Qualifier stripped match
-        src_remaster = album(
-            "Abbey Road (Remastered 2009)",
-            identifier="src-2",
-            artists=["The Beatles"],
-        )
-        cand_base = album(
-            "Abbey Road",
-            identifier="dst-2",
-            artists=["The Beatles"],
-        )
-        res_base = matcher.match(src_remaster, [cand_base])
-        self.assertEqual(res_base.outcome, MatchOutcome.MATCHED)
-        self.assertEqual(res_base.destination_id, "dst-2")
-        self.assertAlmostEqual(res_base.score, 0.90)
-
     def test_artist_matcher_exact_and_ambiguity(self) -> None:
         """ArtistMatcher matches exact case/diacritics and disambiguates collisions."""
         policy = MatchingPolicy()
@@ -838,6 +1126,17 @@ class DeclarativeIdentifierResolutionTests(unittest.TestCase):
         res_amb = matcher.match(src, [cand, cand2])
         self.assertEqual(res_amb.outcome, MatchOutcome.AMBIGUOUS)
         self.assertIsNone(res_amb.destination_id)
+
+    def test_track_matching_regressions_unchanged(self) -> None:
+        """TrackMatcher semantics remain identical and preserved."""
+        matcher = TrackMatcher()
+        src_track = track("Paranoid Android", artists=(artist("Radiohead"),), isrc="GBAYE9700078")
+        cand_track = track("Paranoid Android", artists=(artist("Radiohead"),), isrc="GBAYE9700078", identifier="dst-trk-1")
+
+        match = matcher.match(src_track, [cand_track])
+        self.assertEqual(match.outcome, MatchOutcome.MATCHED)
+        self.assertEqual(match.destination_id, "dst-trk-1")
+        self.assertEqual(match.method, MatchMethod.ISRC)
 
 
 if __name__ == "__main__":

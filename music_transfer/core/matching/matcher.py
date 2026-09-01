@@ -335,19 +335,29 @@ class AlbumMatcher:
             cand_artists = [normalize_text(name) for name in candidate.artist_names if name]
             cand_primary = cand_artists[0] if cand_artists else ""
 
+            # Classify artist evidence:
+            # 1. Confirmed agreement (both sides have artist data and match)
+            # 2. Confirmed disagreement (both sides have artist data and do NOT match)
+            # 3. Missing evidence (at least one side lacks artist metadata)
+            has_source_artists = bool(source_artists)
+            has_cand_artists = bool(cand_artists)
+
             artists_exact = False
             artist_overlap = False
-            if source_primary and cand_primary:
+            missing_artist_evidence = False
+
+            if has_source_artists and has_cand_artists:
                 if source_primary == cand_primary:
                     artists_exact = True
                 elif any(a in cand_artists for a in source_artists) or any(
                     a in source_artists for a in cand_artists
                 ):
                     artist_overlap = True
-            elif not source_primary and not cand_primary:
-                artists_exact = True
+                else:
+                    # Confirmed artist disagreement -> reject candidate entirely
+                    continue
             else:
-                artist_overlap = True
+                missing_artist_evidence = True
 
             if source_norm_title and cand_norm_title and source_norm_title == cand_norm_title:
                 if artists_exact:
@@ -361,6 +371,17 @@ class AlbumMatcher:
                             0.95,
                             MatchMethod.NORMALIZED_METADATA,
                             ["exact_title_artist_overlap"],
+                        )
+                    )
+                elif missing_artist_evidence:
+                    # Title matches but artist evidence is missing -> cannot prove identity.
+                    # Score 0.70 falls in ambiguous band (0.62 <= score < 0.88), outcome AMBIGUOUS.
+                    scored.append(
+                        (
+                            candidate,
+                            0.70,
+                            MatchMethod.NORMALIZED_METADATA,
+                            ["exact_title_missing_artist_evidence"],
                         )
                     )
             elif (
@@ -386,6 +407,9 @@ class AlbumMatcher:
                             ["base_title_artist_overlap"],
                         )
                     )
+                elif missing_artist_evidence:
+                    # Base title without positive artist evidence is never enough for MATCHED.
+                    pass
 
         if not scored:
             return AlbumMatchResult(

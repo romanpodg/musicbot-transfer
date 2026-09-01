@@ -43,19 +43,19 @@ def artist(
 
 def album(
     title: str,
-    artists: tuple[Artist, ...] | list[Artist] | list[str] = (),
+    artists: tuple[Artist, ...] | list[Artist] | list[str] | None = None,
     identifier: str | None = None,
     platform: Platform = Platform.TIDAL,
     upc: str | None = None,
 ) -> Album:
     """Build an album with an optional artist list or tuple."""
 
-    if artists and isinstance(artists[0], str):
-        artist_objs = tuple(artist(a, platform=platform) for a in artists)
-    elif artists:
-        artist_objs = tuple(artists)
-    else:
+    if artists is None:
         artist_objs = (artist("Unknown", platform=platform),)
+    elif artists and isinstance(artists[0], str):
+        artist_objs = tuple(artist(a, platform=platform) for a in artists)
+    else:
+        artist_objs = tuple(artists)
 
     return Album(
         source_platform=platform,

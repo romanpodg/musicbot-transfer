@@ -75,7 +75,7 @@ from music_transfer.infrastructure.persistence import (
 )
 from music_transfer.platforms.tidal import TidalAdapter
 
-from tests.support import FakePlatformAdapter, album, artist, playlist, track
+from tests.support import FakePlatformAdapter, album, artist, playlist, record, track
 
 _LOGGER = logging.getLogger("test.destination_presence")
 
@@ -110,6 +110,8 @@ class MockTidalClientForDestinationState:
         tracks: list[Any] | None = None,
         albums: list[Any] | None = None,
         artists: list[Any] | None = None,
+        videos: list[Any] | None = None,
+        mixes: list[Any] | None = None,
         playlists: list[Any] | None = None,
         fail_tracks: bool = False,
         fail_albums: bool = False,
@@ -119,6 +121,8 @@ class MockTidalClientForDestinationState:
         self._tracks = tracks if tracks is not None else []
         self._albums = albums if albums is not None else []
         self._artists = artists if artists is not None else []
+        self._videos = videos if videos is not None else []
+        self._mixes = mixes if mixes is not None else []
         self._playlists = playlists if playlists is not None else []
         self._fail_tracks = fail_tracks
         self._fail_albums = fail_albums
@@ -146,10 +150,17 @@ class MockTidalClientForDestinationState:
         self.calls.append("followed_artists")
         return self._artists
 
+    def videos(self, progress: Any = None) -> list[Any]:
+        self.calls.append("videos")
+        return self._videos
+
+    def mixes(self, progress: Any = None) -> list[Any]:
+        self.calls.append("mixes")
+        return self._mixes
+
     def playlists(self, progress: Any = None) -> list[Any]:
         self.calls.append("playlists")
         return self._playlists
-
 
     def profile(self) -> Any:
         return None
@@ -257,7 +268,7 @@ class DestinationPresenceModelTests(unittest.TestCase):
         self.assertEqual(ctx.exception.section, "trakcs")
 
         with self.assertRaises(InvalidDestinationSectionError):
-            state.presence(EntityType.VIDEO, "123")
+            state.presence(EntityType.FOLDER, "123")
 
     def test_destination_state_complete_and_incomplete_section_is_unknown(self) -> None:
         """Contradictory state (section present in both complete and incomplete) resolves to UNKNOWN."""
@@ -359,11 +370,13 @@ class TidalAdapterDestinationStateTests(unittest.TestCase):
         self.assertEqual(state.presence(EntityType.TRACK, "1"), DestinationPresence.UNKNOWN)
 
     def test_destination_state_none_reads_all_supported_sections(self) -> None:
-        """sections=None invokes all 4 canonical destination endpoints."""
+        """sections=None invokes all 6 canonical destination endpoints."""
         client = MockTidalClientForDestinationState(
             tracks=[make_track("T1", "t1")],
             albums=[make_album("A1", "a1")],
             artists=[make_artist("Ar1", "ar1")],
+            videos=[record("v1", "V1")],
+            mixes=[record("m1", "M1")],
             playlists=[make_playlist("P1", "p1")],
         )
         adapter = TidalAdapter(client)
@@ -371,7 +384,7 @@ class TidalAdapterDestinationStateTests(unittest.TestCase):
         state = adapter.get_destination_state(sections=None)
         self.assertEqual(
             client.calls,
-            ["liked_tracks", "saved_albums", "followed_artists", "playlists"],
+            ["liked_tracks", "saved_albums", "followed_artists", "videos", "mixes", "playlists"],
         )
         self.assertEqual(
             state.complete_sections,
@@ -381,6 +394,8 @@ class TidalAdapterDestinationStateTests(unittest.TestCase):
         self.assertEqual(state.presence(EntityType.TRACK, "t2"), DestinationPresence.ABSENT)
         self.assertEqual(state.presence(EntityType.ALBUM, "a1"), DestinationPresence.PRESENT)
         self.assertEqual(state.presence(EntityType.ARTIST, "ar1"), DestinationPresence.PRESENT)
+        self.assertEqual(state.presence(EntityType.VIDEO, "v1"), DestinationPresence.PRESENT)
+        self.assertEqual(state.presence(EntityType.MIX, "m1"), DestinationPresence.PRESENT)
         self.assertEqual(state.presence(EntityType.PLAYLIST, "p1"), DestinationPresence.PRESENT)
 
     def test_destination_state_explicit_selection_reads_only_requested_sections(self) -> None:

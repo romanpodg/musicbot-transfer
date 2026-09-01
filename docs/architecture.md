@@ -141,6 +141,13 @@ identifier. The planner resolves identifiers following an explicit order:
 
 Destination presence queries and preflight preconditions are evaluated strictly on resolved non-empty destination identifiers.
 
+### 3.7 Videos and Mixes Transfer Support (Phase 1.5B)
+
+The engine supports `VIDEOS` and `MIXES` content transfer end-to-end:
+- **Resolution Policy**: `IdentifierResolutionPolicy.REUSE_ONLY`. Videos and mixes rely strictly on portable identifier reuse across accounts (`can_reuse_identifier`). No catalog search is attempted (`search_capability = None`). Cross-platform transfers without reusable identifiers resolve safely to `NOT_FOUND` with reason `destination_resolution_unavailable`.
+- **Destination Presence**: Canonical destination state sections include `"videos"` and `"mixes"` alongside `"tracks"`, `"albums"`, `"artists"`, and `"playlists"`. Observed presence semantics (PRESENT, ABSENT, UNKNOWN) govern exact preflight preconditions, already-exists skips, and post-write verification.
+- **Adapter Mutation**: Platform adapters declare `read_videos`/`write_videos` and `read_mixes`/`write_mixes` capabilities, executing mutations via `save_video(video_id)` and `save_mix(mix_id)`. `ReadOnlyAdapter` enforces safety by excluding mutating methods during planning.
+
 ---
 
 ## 4. Package contents

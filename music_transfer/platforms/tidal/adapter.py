@@ -250,6 +250,40 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
             except MusicTransferError:
                 incomplete.append("artists")
 
+        if "videos" in wanted:
+            try:
+                state.video_ids = self._read_destination_section(
+                    "videos",
+                    lambda: frozenset(record.source_id for record in self._client.videos()),
+                )
+                complete.add("videos")
+            except (
+                AuthenticationError,
+                AuthorizationError,
+                UnsupportedCapabilityError,
+                TransferConfigurationError,
+            ):
+                raise
+            except MusicTransferError:
+                incomplete.append("videos")
+
+        if "mixes" in wanted:
+            try:
+                state.mix_ids = self._read_destination_section(
+                    "mixes",
+                    lambda: frozenset(record.source_id for record in self._client.mixes()),
+                )
+                complete.add("mixes")
+            except (
+                AuthenticationError,
+                AuthorizationError,
+                UnsupportedCapabilityError,
+                TransferConfigurationError,
+            ):
+                raise
+            except MusicTransferError:
+                incomplete.append("mixes")
+
         if "playlists" in wanted:
             try:
                 state.playlist_ids = self._read_destination_section(

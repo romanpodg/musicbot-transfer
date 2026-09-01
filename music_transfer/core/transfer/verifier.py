@@ -18,7 +18,7 @@ from typing import Any
 from ..domain import SequenceComparison, TransferItem, TransferJob, VerificationResult
 from ..enums import EntityType, ItemStatus, VerificationStatus
 from ..errors import UnsupportedCapabilityError
-from ..ports import MusicPlatformAdapter
+from ..ports import MusicPlatformAdapter, destination_section_for_entity
 
 _LOGGER = logging.getLogger("music_transfer.verifier")
 
@@ -88,25 +88,7 @@ class TransferVerifier:
         part of the contract for favourites.
         """
 
-        try:
-            state = self._destination.get_destination_state(("tracks",))
-        except UnsupportedCapabilityError as error:
-            return VerificationResult(
-                success=False,
-                expected_count=len(expected_ids),
-                warnings=[f"verification_unsupported:{getattr(error, 'capability', 'unknown')}"],
-            )
-        if not state.is_trustworthy("tracks"):
-            return VerificationResult(
-                success=False,
-                expected_count=len(expected_ids),
-                actual_count=len(state.track_ids),
-                warnings=["destination_state_incomplete"],
-            )
-        comparison = compare_sequences(expected_ids, sorted(state.track_ids))
-        # Order is irrelevant for a set-like library section.
-        comparison.order_mismatches = []
-        return VerificationResult.from_comparison(comparison)
+        return self._verify_identifier_set("tracks", expected_ids)
 
     def verify_job(
         self, job: TransferJob, items: list[TransferItem]
@@ -114,7 +96,7 @@ class TransferVerifier:
         """Verify every playlist in a job plus the set-like sections.
 
         Returns a mapping keyed by ``playlist:<container id>`` for playlists and
-        ``tracks``/``albums``/``artists`` for set-like sections.
+        ``tracks``/``albums``/``artists``/``videos``/``mixes`` for set-like sections.
         """
 
         results: dict[str, VerificationResult] = {}
@@ -141,11 +123,14 @@ class TransferVerifier:
             if not container_id:
                 continue
             results[f"playlist:{container_id}"] = self.verify_playlist(container_id, expected)
-        for entity_type, key in (
-            (EntityType.TRACK, "tracks"),
-            (EntityType.ALBUM, "albums"),
-            (EntityType.ARTIST, "artists"),
+        for entity_type in (
+            EntityType.TRACK,
+            EntityType.ALBUM,
+            EntityType.ARTIST,
+            EntityType.VIDEO,
+            EntityType.MIX,
         ):
+            key = destination_section_for_entity(entity_type)
             expected = [
                 item.destination_id
                 for item in items
@@ -155,10 +140,7 @@ class TransferVerifier:
             ]
             if not expected:
                 continue
-            if entity_type is EntityType.TRACK:
-                results[key] = self.verify_liked_tracks(expected)
-            else:
-                results[key] = self._verify_identifier_set(key, expected)
+            results[key] = self._verify_identifier_set(key, expected)
         self._logger.info(
             "event=verification_completed job_id=%s containers=%d failures=%d",
             job.id,
@@ -168,7 +150,7 @@ class TransferVerifier:
         return results
 
     def _verify_identifier_set(self, section: str, expected: Sequence[str]) -> VerificationResult:
-        """Verify membership for a non-track set-like section."""
+        """Verify membership for a set-like section."""
 
         try:
             state = self._destination.get_destination_state((section,))
@@ -178,16 +160,15 @@ class TransferVerifier:
                 expected_count=len(expected),
                 warnings=[f"verification_unsupported:{getattr(error, 'capability', 'unknown')}"],
             )
+        ids = state.identifiers_for_section(section)
         if not state.is_trustworthy(section):
             return VerificationResult(
                 success=False,
                 expected_count=len(expected),
-                actual_count=len(state.album_ids if section == "albums" else state.artist_ids),
+                actual_count=len(ids),
                 warnings=["destination_state_incomplete"],
             )
-        actual = (
-            sorted(state.album_ids) if section == "albums" else sorted(state.artist_ids)
-        )
+        actual = sorted(ids)
         comparison = compare_sequences(expected, actual)
         comparison.order_mismatches = []
         return VerificationResult.from_comparison(comparison)

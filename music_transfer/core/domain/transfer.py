@@ -473,6 +473,8 @@ class TransferItem:
             TransferOperation.SAVE_TRACK,
             TransferOperation.SAVE_ALBUM,
             TransferOperation.FOLLOW_ARTIST,
+            TransferOperation.SAVE_VIDEO,
+            TransferOperation.SAVE_MIX,
             TransferOperation.ADD_PLAYLIST_ITEM,
         ):
             return bool(self.destination_id)
@@ -537,6 +539,8 @@ class TransferItem:
                 EntityType.TRACK: TransferOperation.SAVE_TRACK,
                 EntityType.ALBUM: TransferOperation.SAVE_ALBUM,
                 EntityType.ARTIST: TransferOperation.FOLLOW_ARTIST,
+                EntityType.VIDEO: TransferOperation.SAVE_VIDEO,
+                EntityType.MIX: TransferOperation.SAVE_MIX,
                 EntityType.PLAYLIST: TransferOperation.CREATE_PLAYLIST,
                 EntityType.PLAYLIST_ITEM: TransferOperation.ADD_PLAYLIST_ITEM,
             }.get(entity_type, TransferOperation.NONE)
@@ -734,7 +738,7 @@ class TransferPlanItem:
 
 
 VALID_PRECONDITION_SECTIONS: frozenset[str] = frozenset(
-    {"tracks", "albums", "artists", "playlists"}
+    {"tracks", "albums", "artists", "videos", "mixes", "playlists"}
 )
 
 

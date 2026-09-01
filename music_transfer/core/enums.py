@@ -206,6 +206,8 @@ class TransferOperation(StrEnum):
     SAVE_TRACK = "save_track"
     SAVE_ALBUM = "save_album"
     FOLLOW_ARTIST = "follow_artist"
+    SAVE_VIDEO = "save_video"
+    SAVE_MIX = "save_mix"
     CREATE_PLAYLIST = "create_playlist"
     ADD_PLAYLIST_ITEM = "add_playlist_item"
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import unittest
+from typing import Any
 
 from music_transfer.core.domain import (
     AccountProfile,
@@ -286,34 +287,39 @@ class ContentSupportValidation(unittest.TestCase):
     def test_declared_but_engine_unsupported_content_is_semantic_error(self) -> None:
         """Declared content without engine implementation is rejected regardless of capability flags."""
 
-        source_cap = PlatformCapabilities(
-            platform=Platform.TIDAL, read_videos=True, read_mixes=True
-        )
-        dest_cap = PlatformCapabilities(
-            platform=Platform.TIDAL, write_videos=True, write_mixes=True
-        )
-        for content_type in (ContentType.VIDEOS, ContentType.MIXES):
-            with self.subTest(content_type=content_type):
-                with self.assertRaises(UnsupportedTransferContentError) as ctx:
-                    validate_transfer_content_support((content_type,), source_cap, dest_cap)
-                self.assertEqual(ctx.exception.code, "unsupported_transfer_content")
-                self.assertEqual(ctx.exception.reason, "engine_not_implemented")
-                self.assertEqual(ctx.exception.content_type, content_type)
+        source_cap = PlatformCapabilities(platform=Platform.TIDAL)
+        dest_cap = PlatformCapabilities(platform=Platform.TIDAL)
+        unimplemented_content: Any = "unknown_future_content"
+        with self.assertRaises(UnsupportedTransferContentError) as ctx:
+            validate_transfer_content_support((unimplemented_content,), source_cap, dest_cap)
+        self.assertEqual(ctx.exception.code, "unsupported_transfer_content")
+        self.assertEqual(ctx.exception.reason, "engine_not_implemented")
+        self.assertEqual(ctx.exception.content_type, unimplemented_content)
 
     def test_declared_but_engine_unsupported_content_never_raises_raw_key_error(self) -> None:
         """Resolving unimplemented content raises UnsupportedTransferContentError, never raw KeyError."""
 
-        for content_type in (ContentType.VIDEOS, ContentType.MIXES):
-            with self.subTest(content_type=content_type):
-                with self.assertRaises(UnsupportedTransferContentError) as ctx:
-                    require_transfer_content_spec(content_type)
-                self.assertEqual(ctx.exception.reason, "engine_not_implemented")
+        unimplemented_content: Any = "unknown_future_content"
+        with self.assertRaises(UnsupportedTransferContentError) as ctx:
+            require_transfer_content_spec(unimplemented_content)
+        self.assertEqual(ctx.exception.reason, "engine_not_implemented")
 
     def test_mixed_request_with_unsupported_content_is_rejected_as_a_whole(self) -> None:
         """A mixed request is fail-closed and rejected as a whole without partial filtering."""
 
-        source_cap = FakePlatformAdapter.CAPABILITIES
-        dest_cap = FakePlatformAdapter.CAPABILITIES
+        source_cap = PlatformCapabilities(
+            platform=Platform.TIDAL,
+            read_liked_tracks=True,
+            read_playlists=True,
+            read_videos=False,
+        )
+        dest_cap = PlatformCapabilities(
+            platform=Platform.TIDAL,
+            write_liked_tracks=True,
+            create_playlists=True,
+            write_playlist_items=True,
+            write_videos=True,
+        )
         with self.assertRaises(UnsupportedTransferContentError) as ctx:
             validate_transfer_content_support(
                 (ContentType.LIKED_TRACKS, ContentType.PLAYLISTS, ContentType.VIDEOS),
@@ -321,7 +327,7 @@ class ContentSupportValidation(unittest.TestCase):
                 dest_cap,
             )
         self.assertEqual(ctx.exception.content_type, ContentType.VIDEOS)
-        self.assertEqual(ctx.exception.reason, "engine_not_implemented")
+        self.assertEqual(ctx.exception.reason, "source_read_unsupported")
 
     def test_playlist_requires_create_playlist_capability(self) -> None:
         """Playlist transfer requires destination create_playlists capability."""
@@ -352,7 +358,12 @@ class ContentSupportValidation(unittest.TestCase):
 
         class TrackingSourceAdapter(FakePlatformAdapter):
             def __init__(self) -> None:
-                super().__init__()
+                super().__init__(
+                    capabilities=PlatformCapabilities(
+                        platform=Platform.TIDAL,
+                        read_videos=False,
+                    )
+                )
                 self.export_calls = 0
 
             def export_library(self, sections=None, progress=None) -> LibrarySnapshot:
@@ -378,7 +389,12 @@ class ContentSupportValidation(unittest.TestCase):
         """An unsupported request never performs any destination writes."""
 
         service = self._service()
-        source = FakePlatformAdapter(tracks=[track("A", identifier="a")])
+        source = FakePlatformAdapter(
+            capabilities=PlatformCapabilities(
+                platform=Platform.TIDAL,
+                read_videos=False,
+            )
+        )
         destination = FakePlatformAdapter()
         job = service.create_job(
             new_account("src-1"),

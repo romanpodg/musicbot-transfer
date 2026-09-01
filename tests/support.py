@@ -15,6 +15,7 @@ from music_transfer.core.domain import (
     AccountProfile,
     Album,
     Artist,
+    LibraryRecord,
     LibrarySnapshot,
     Playlist,
     PlaylistItem,
@@ -27,6 +28,22 @@ from music_transfer.core.ports import (
     MusicPlatformAdapter,
     PlatformCapabilities,
 )
+
+
+def record(
+    identifier: str,
+    title: str = "",
+    platform: Platform = Platform.TIDAL,
+    metadata: dict[str, Any] | None = None,
+) -> LibraryRecord:
+    """Build a library record for videos, mixes, or folders."""
+
+    return LibraryRecord(
+        source_platform=platform,
+        source_id=identifier,
+        title=title,
+        metadata=dict(metadata or {}),
+    )
 
 
 def artist(
@@ -119,6 +136,10 @@ def snapshot(
     tracks: tuple[Track, ...] = (),
     albums: tuple[Album, ...] = (),
     artists: tuple[Artist, ...] = (),
+    videos: tuple[LibraryRecord, ...] = (),
+    mixes: tuple[LibraryRecord, ...] = (),
+    folders: tuple[LibraryRecord, ...] = (),
+    incomplete_sections: list[str] | None = None,
 ) -> LibrarySnapshot:
     """Build a minimal library snapshot for planning tests."""
 
@@ -129,6 +150,10 @@ def snapshot(
         albums=list(albums),
         artists=list(artists),
         playlists=list(playlists),
+        videos=list(videos),
+        mixes=list(mixes),
+        folders=list(folders),
+        incomplete_sections=list(incomplete_sections or []),
     )
 
 
@@ -147,9 +172,13 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         read_saved_albums=True,
         read_followed_artists=True,
         read_playlists=True,
+        read_videos=True,
+        read_mixes=True,
         write_liked_tracks=True,
         write_saved_albums=True,
         write_followed_artists=True,
+        write_videos=True,
+        write_mixes=True,
         create_playlists=True,
         write_playlist_items=True,
         search_tracks=True,
@@ -170,6 +199,8 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         albums: list[Album] | None = None,
         artists: list[Artist] | None = None,
         playlists: list[Playlist] | None = None,
+        videos: list[LibraryRecord] | None = None,
+        mixes: list[LibraryRecord] | None = None,
         catalog_tracks: list[Track] | None = None,
         catalog_albums: list[Album] | None = None,
         catalog_artists: list[Artist] | None = None,
@@ -185,12 +216,16 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         self.albums: list[Album] = list(albums or [])
         self.artists: list[Artist] = list(artists or [])
         self.playlists: list[Playlist] = list(playlists or [])
+        self.videos: list[LibraryRecord] = list(videos or [])
+        self.mixes: list[LibraryRecord] = list(mixes or [])
         self.catalog_tracks = list(catalog_tracks) if catalog_tracks is not None else None
         self.catalog_albums = list(catalog_albums) if catalog_albums is not None else None
         self.catalog_artists = list(catalog_artists) if catalog_artists is not None else None
         self.saved_tracks: list[str] = []
         self.saved_albums: list[str] = []
         self.followed_artists: list[str] = []
+        self.saved_videos: list[str] = []
+        self.saved_mixes: list[str] = []
         self.created_playlists: list[str] = []
         #: Method names that should raise, to exercise failure handling.
         self.fail_on = set(fail_on or ())
@@ -266,6 +301,8 @@ class FakePlatformAdapter(MusicPlatformAdapter):
             albums=list(self.albums),
             artists=list(self.artists),
             playlists=list(self.playlists),
+            videos=list(self.videos),
+            mixes=list(self.mixes),
         )
 
     def get_destination_state(self, sections=None) -> DestinationState:
@@ -277,16 +314,18 @@ class FakePlatformAdapter(MusicPlatformAdapter):
 
         if sections is not None:
             for s in sections:
-                if s not in ("tracks", "albums", "artists", "playlists"):
+                if s not in ("tracks", "albums", "artists", "videos", "mixes", "playlists"):
                     raise UnsupportedCapabilityError("capability_unsupported", capability=s)
             wanted = set(sections)
         else:
-            wanted = {"tracks", "albums", "artists", "playlists"}
+            wanted = {"tracks", "albums", "artists", "videos", "mixes", "playlists"}
 
         complete: set[str] = set()
         track_ids: list[str] = []
         album_ids: list[str] = []
         artist_ids: list[str] = []
+        video_ids: list[str] = []
+        mix_ids: list[str] = []
         playlist_ids: list[str] = []
 
         if "tracks" in wanted:
@@ -310,6 +349,20 @@ class FakePlatformAdapter(MusicPlatformAdapter):
                 if identifier not in {item.source_id for item in self.artists}
             ]
             complete.add("artists")
+        if "videos" in wanted:
+            video_ids = [item.source_id for item in self.videos] + [
+                identifier
+                for identifier in self.saved_videos
+                if identifier not in {item.source_id for item in self.videos}
+            ]
+            complete.add("videos")
+        if "mixes" in wanted:
+            mix_ids = [item.source_id for item in self.mixes] + [
+                identifier
+                for identifier in self.saved_mixes
+                if identifier not in {item.source_id for item in self.mixes}
+            ]
+            complete.add("mixes")
         if "playlists" in wanted:
             playlist_ids = [item.source_id for item in self.playlists]
             complete.add("playlists")
@@ -319,6 +372,8 @@ class FakePlatformAdapter(MusicPlatformAdapter):
             track_ids=frozenset(track_ids),
             album_ids=frozenset(album_ids),
             artist_ids=frozenset(artist_ids),
+            video_ids=frozenset(video_ids),
+            mix_ids=frozenset(mix_ids),
             playlist_ids=frozenset(playlist_ids),
             complete_sections=frozenset(complete),
         )
@@ -381,6 +436,18 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         self._record("follow_artist", artist_id)
         self.followed_artists.append(artist_id)
 
+    def save_video(self, video_id: str) -> None:
+        """Record a saved video id."""
+
+        self._record("save_video", video_id)
+        self.saved_videos.append(video_id)
+
+    def save_mix(self, mix_id: str) -> None:
+        """Record a saved mix id."""
+
+        self._record("save_mix", mix_id)
+        self.saved_mixes.append(mix_id)
+
     def create_playlist(self, item: Playlist) -> str:
         """Create a playlist and return its id."""
 
@@ -411,7 +478,7 @@ class FakePlatformAdapter(MusicPlatformAdapter):
     def can_reuse_identifier(self, entity_type: EntityType, source: Platform) -> bool:
         """Return whether a source identifier is valid on this destination.
 
-        Catalogue entities (tracks, albums, artists) are shared, so an id is
+        Catalogue entities (tracks, albums, artists, videos, mixes) are shared, so an id is
         portable.  A playlist belongs to an account and must be created first,
         so its id is never reusable even between two accounts on one platform.
         """
@@ -437,6 +504,7 @@ __all__ = [
     "album",
     "artist",
     "playlist",
+    "record",
     "snapshot",
     "track",
 ]

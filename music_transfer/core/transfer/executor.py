@@ -318,6 +318,10 @@ class TransferExecutor:
                 self._write_album(item)
             elif op is TransferOperation.FOLLOW_ARTIST or (op is TransferOperation.NONE and item.entity_type is EntityType.ARTIST):
                 self._write_artist(item)
+            elif op is TransferOperation.SAVE_VIDEO or (op is TransferOperation.NONE and item.entity_type is EntityType.VIDEO):
+                self._write_video(item)
+            elif op is TransferOperation.SAVE_MIX or (op is TransferOperation.NONE and item.entity_type is EntityType.MIX):
+                self._write_mix(item)
             elif op is TransferOperation.CREATE_PLAYLIST or (op is TransferOperation.NONE and item.entity_type is EntityType.PLAYLIST):
                 self._write_playlist(job, item, all_items)
             elif op is TransferOperation.ADD_PLAYLIST_ITEM or (op is TransferOperation.NONE and item.entity_type is EntityType.PLAYLIST_ITEM):
@@ -387,6 +391,16 @@ class TransferExecutor:
         if not item.destination_id:
             raise _not_found(item)
         self._destination.follow_artist(item.destination_id)
+
+    def _write_video(self, item: TransferItem) -> None:
+        if not item.destination_id:
+            raise _not_found(item)
+        self._destination.save_video(item.destination_id)
+
+    def _write_mix(self, item: TransferItem) -> None:
+        if not item.destination_id:
+            raise _not_found(item)
+        self._destination.save_mix(item.destination_id)
 
     def _write_playlist(
         self, job: TransferJob, item: TransferItem, all_items: list[TransferItem]

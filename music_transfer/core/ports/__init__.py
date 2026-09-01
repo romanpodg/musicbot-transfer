@@ -7,6 +7,7 @@ The core never imports the implementations.
 from __future__ import annotations
 
 from .platform import (
+    KNOWN_DESTINATION_SECTIONS,
     AsyncPlatformAdapter,
     DestinationState,
     LibraryMaintenanceAdapter,
@@ -14,6 +15,7 @@ from .platform import (
     MusicPlatformReadPort,
     PlatformCapabilities,
     ReadOnlyAdapter,
+    destination_section_for_entity,
     operation_kind,
     to_async,
 )
@@ -32,6 +34,7 @@ __all__ = [
     "DestinationState",
     "InlineQueue",
     "JobQueue",
+    "KNOWN_DESTINATION_SECTIONS",
     "LibraryMaintenanceAdapter",
     "MusicPlatformAdapter",
     "MusicPlatformReadPort",
@@ -42,6 +45,7 @@ __all__ = [
     "TransferJobRepository",
     "TransferPlanRepository",
     "UnitOfWork",
+    "destination_section_for_entity",
     "operation_kind",
     "to_async",
 ]

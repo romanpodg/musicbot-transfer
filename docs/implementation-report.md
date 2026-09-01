@@ -357,7 +357,7 @@ and never abort a run.
   account run is still required before production use.
 - **JSON persistence rewrites the whole item document per checkpoint.** Fine for
   thousands of items; the database implementation will update one row.
-- **Videos and mixes** are declared content types in domain enums, but transfer planning is intentionally rejected as `engine_not_implemented` until dedicated support is added in a future phase.
+- **Videos and mixes** are fully supported end-to-end (Phase 1.5B) under `REUSE_ONLY` identifier resolution policy.
 - **Playlist folders** are read and created, but not re-linked on transfer.
 - **Cleanup is not wired to a CLI command.** The destructive operations exist,
   are correctly classified, and are unreachable from transfer; no command drives

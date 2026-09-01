@@ -59,7 +59,12 @@ from ..errors import (
     UnsupportedTransferContentError,
 )
 from ..matching import AlbumMatcher, ArtistMatcher, TrackMatcher
-from ..ports import DestinationState, MusicPlatformReadPort, PlatformCapabilities
+from ..ports import (
+    DestinationState,
+    MusicPlatformReadPort,
+    PlatformCapabilities,
+    destination_section_for_entity,
+)
 from .ordering import apply_logical_order
 
 _LOGGER = logging.getLogger("music_transfer.planner")
@@ -125,6 +130,26 @@ ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
         search_capability=None,
         source_read_capabilities=("read_playlists",),
         destination_write_capabilities=("create_playlists", "write_playlist_items"),
+    ),
+    ContentType.VIDEOS: TransferContentSpec(
+        content_type=ContentType.VIDEOS,
+        snapshot_sections=("videos",),
+        entity_type=EntityType.VIDEO,
+        operation=TransferOperation.SAVE_VIDEO,
+        resolution_policy=IdentifierResolutionPolicy.REUSE_ONLY,
+        search_capability=None,
+        source_read_capabilities=("read_videos",),
+        destination_write_capabilities=("write_videos",),
+    ),
+    ContentType.MIXES: TransferContentSpec(
+        content_type=ContentType.MIXES,
+        snapshot_sections=("mixes",),
+        entity_type=EntityType.MIX,
+        operation=TransferOperation.SAVE_MIX,
+        resolution_policy=IdentifierResolutionPolicy.REUSE_ONLY,
+        search_capability=None,
+        source_read_capabilities=("read_mixes",),
+        destination_write_capabilities=("write_mixes",),
     ),
 }
 
@@ -351,19 +376,9 @@ class TransferPlanner:
                 if not it.destination_id:
                     continue
                 try:
-                    presence = state.presence(it.entity_type, it.destination_id)
+                    section = destination_section_for_entity(it.entity_type)
+                    presence = state.presence_in_section(section, it.destination_id)
                 except InvalidDestinationSectionError:
-                    continue
-
-                if it.entity_type is EntityType.TRACK:
-                    section = "tracks"
-                elif it.entity_type is EntityType.ALBUM:
-                    section = "albums"
-                elif it.entity_type is EntityType.ARTIST:
-                    section = "artists"
-                elif it.entity_type is EntityType.PLAYLIST:
-                    section = "playlists"
-                else:
                     continue
 
                 if presence is DestinationPresence.PRESENT and it.status is ItemStatus.ALREADY_EXISTS:
@@ -909,6 +924,8 @@ def validate_plan_set_like_items(items: list[TransferItem]) -> None:
                 TransferOperation.SAVE_TRACK,
                 TransferOperation.SAVE_ALBUM,
                 TransferOperation.FOLLOW_ARTIST,
+                TransferOperation.SAVE_VIDEO,
+                TransferOperation.SAVE_MIX,
             )
             and item.status in (ItemStatus.PENDING, ItemStatus.MATCHED)
             and not item.destination_id

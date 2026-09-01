@@ -141,15 +141,32 @@ class PlatformCapabilities:
             "read_saved_albums": self.read_saved_albums,
             "read_followed_artists": self.read_followed_artists,
             "read_playlists": self.read_playlists,
+            "read_videos": self.read_videos,
+            "read_mixes": self.read_mixes,
+            "read_folders": self.read_folders,
             "write_liked_tracks": self.write_liked_tracks,
             "write_saved_albums": self.write_saved_albums,
             "write_followed_artists": self.write_followed_artists,
             "create_playlists": self.create_playlists,
             "write_playlist_items": self.write_playlist_items,
+            "write_videos": self.write_videos,
+            "write_mixes": self.write_mixes,
+            "create_folders": self.create_folders,
+            "delete_liked_tracks": self.delete_liked_tracks,
+            "delete_saved_albums": self.delete_saved_albums,
+            "delete_followed_artists": self.delete_followed_artists,
+            "delete_playlists": self.delete_playlists,
+            "delete_folders": self.delete_folders,
             "search_tracks": self.search_tracks,
-            "supports_playlist_duplicates": self.supports_playlist_duplicates,
+            "search_albums": self.search_albums,
+            "search_artists": self.search_artists,
             "preserves_custom_added_date": self.preserves_custom_added_date,
+            "supports_playlist_duplicates": self.supports_playlist_duplicates,
+            "supports_already_exists_detection": self.supports_already_exists_detection,
+            "supports_batch_playlist_writes": self.supports_batch_playlist_writes,
             "insertion_behavior": str(self.insertion_behavior),
+            "distinguishes_region_availability": self.distinguishes_region_availability,
+            "exposes_isrc": self.exposes_isrc,
         }
 
 
@@ -158,15 +175,32 @@ class PlatformCapabilities:
 # --------------------------------------------------------------------------
 
 KNOWN_DESTINATION_SECTIONS: frozenset[str] = frozenset(
-    {"tracks", "albums", "artists", "playlists"}
+    {"tracks", "albums", "artists", "videos", "mixes", "playlists"}
 )
 
 _ENTITY_TYPE_TO_SECTION: dict[EntityType, str] = {
     EntityType.TRACK: "tracks",
     EntityType.ALBUM: "albums",
     EntityType.ARTIST: "artists",
+    EntityType.VIDEO: "videos",
+    EntityType.MIX: "mixes",
     EntityType.PLAYLIST: "playlists",
 }
+
+
+def destination_section_for_entity(entity_type: EntityType) -> str:
+    """Return the canonical destination section name for an EntityType.
+
+    Raises:
+        InvalidDestinationSectionError: If entity_type does not map to a destination section.
+    """
+    section = _ENTITY_TYPE_TO_SECTION.get(entity_type)
+    if section is None:
+        raise InvalidDestinationSectionError(
+            f"unsupported_entity_type_for_destination_presence:{entity_type}",
+            section=str(entity_type),
+        )
+    return section
 
 
 @dataclass(slots=True)
@@ -184,6 +218,8 @@ class DestinationState:
     track_ids: frozenset[str] = frozenset()
     album_ids: frozenset[str] = frozenset()
     artist_ids: frozenset[str] = frozenset()
+    video_ids: frozenset[str] = frozenset()
+    mix_ids: frozenset[str] = frozenset()
     playlist_ids: frozenset[str] = frozenset()
     complete_sections: frozenset[str] = frozenset()
     incomplete_sections: tuple[str, ...] = ()
@@ -196,6 +232,10 @@ class DestinationState:
             object.__setattr__(self, "album_ids", frozenset(self.album_ids))
         if not isinstance(self.artist_ids, frozenset):
             object.__setattr__(self, "artist_ids", frozenset(self.artist_ids))
+        if not isinstance(self.video_ids, frozenset):
+            object.__setattr__(self, "video_ids", frozenset(self.video_ids))
+        if not isinstance(self.mix_ids, frozenset):
+            object.__setattr__(self, "mix_ids", frozenset(self.mix_ids))
         if not isinstance(self.playlist_ids, frozenset):
             object.__setattr__(self, "playlist_ids", frozenset(self.playlist_ids))
         if not isinstance(self.complete_sections, frozenset):
@@ -214,13 +254,33 @@ class DestinationState:
         Raises:
             InvalidDestinationSectionError: If entity_type does not map to a destination section.
         """
-        section = _ENTITY_TYPE_TO_SECTION.get(entity_type)
-        if section is None:
-            raise InvalidDestinationSectionError(
-                f"unsupported_entity_type_for_destination_presence:{entity_type}",
-                section=str(entity_type),
-            )
+        section = destination_section_for_entity(entity_type)
         return self.presence_in_section(section, identifier)
+
+    def identifiers_for_section(self, section: str) -> frozenset[str]:
+        """Return the observed destination identifiers for a canonical section.
+
+        Raises:
+            InvalidDestinationSectionError: If section is not a known destination section.
+        """
+        if section not in KNOWN_DESTINATION_SECTIONS:
+            raise InvalidDestinationSectionError(
+                f"invalid_destination_section:{section}",
+                section=section,
+            )
+        if section == "tracks":
+            return self.track_ids
+        if section == "albums":
+            return self.album_ids
+        if section == "artists":
+            return self.artist_ids
+        if section == "videos":
+            return self.video_ids
+        if section == "mixes":
+            return self.mix_ids
+        if section == "playlists":
+            return self.playlist_ids
+        return frozenset()
 
     def presence_in_section(self, section: str, identifier: str) -> DestinationPresence:
         """Query observed presence within a canonical destination section.
@@ -233,26 +293,10 @@ class DestinationState:
         Raises:
             InvalidDestinationSectionError: If section is not a known destination section.
         """
-        if section not in KNOWN_DESTINATION_SECTIONS:
-            raise InvalidDestinationSectionError(
-                f"invalid_destination_section:{section}",
-                section=section,
-            )
+        id_set = self.identifiers_for_section(section)
         if section in self.incomplete_sections:
             return DestinationPresence.UNKNOWN
         if section not in self.complete_sections:
-            return DestinationPresence.UNKNOWN
-
-        id_set: frozenset[str]
-        if section == "tracks":
-            id_set = self.track_ids
-        elif section == "albums":
-            id_set = self.album_ids
-        elif section == "artists":
-            id_set = self.artist_ids
-        elif section == "playlists":
-            id_set = self.playlist_ids
-        else:
             return DestinationPresence.UNKNOWN
 
         if bool(identifier) and identifier in id_set:
@@ -275,7 +319,6 @@ class DestinationState:
             and section not in self.incomplete_sections
         )
 
-
     def as_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible values for diagnostic plan metadata."""
         return {
@@ -283,6 +326,8 @@ class DestinationState:
             "track_count": len(self.track_ids),
             "album_count": len(self.album_ids),
             "artist_count": len(self.artist_ids),
+            "video_count": len(self.video_ids),
+            "mix_count": len(self.mix_ids),
             "playlist_count": len(self.playlist_ids),
             "complete_sections": sorted(self.complete_sections),
             "incomplete_sections": list(self.incomplete_sections),
@@ -530,6 +575,20 @@ class MusicPlatformAdapter(ABC):
 
         raise UnsupportedCapabilityError(
             "capability_unsupported", capability="write_followed_artists"
+        )
+
+    def save_video(self, video_id: str) -> None:
+        """Save one video at the destination."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="write_videos"
+        )
+
+    def save_mix(self, mix_id: str) -> None:
+        """Save one mix at the destination."""
+
+        raise UnsupportedCapabilityError(
+            "capability_unsupported", capability="write_mixes"
         )
 
     def create_playlist(self, playlist: Playlist) -> str:

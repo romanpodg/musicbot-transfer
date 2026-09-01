@@ -85,9 +85,8 @@ def similarity(left: str, right: str) -> float:
 def score_title(source: NormalizedTrack, candidate: NormalizedTrack) -> float:
     """Compare titles from strictest to loosest."""
 
-    if source.raw_title and candidate.raw_title:
-        if source.raw_title.casefold() == candidate.raw_title.casefold():
-            return 1.0
+    if source.raw_title and candidate.raw_title and source.raw_title.casefold() == candidate.raw_title.casefold():
+        return 1.0
     if source.title and source.title == candidate.title:
         return 1.0
     if source.base_title and source.base_title == candidate.base_title:
@@ -235,20 +234,23 @@ def _apply_penalties(
         breakdown.score = max(0.0, breakdown.score - VERSION_MISMATCH_PENALTY)
         breakdown.warnings.append("version_mismatch")
         breakdown.reasons.append("version_mismatch")
-    if source.explicit is not None and candidate.explicit is not None:
-        if source.explicit != candidate.explicit:
-            if source.explicit and not candidate.explicit:
-                # Replacing an explicit recording with a clean one is the most
-                # damaging silent substitution, so it is penalized hardest.
-                breakdown.score = max(
-                    0.0, breakdown.score - EXPLICIT_TO_CLEAN_PENALTY
-                )
-                breakdown.warnings.append("explicit_replaced_by_clean")
-                breakdown.reasons.append("explicit_mismatch")
-            else:
-                breakdown.score = max(0.0, breakdown.score - EXPLICIT_MISMATCH_PENALTY)
-                breakdown.warnings.append("clean_replaced_by_explicit")
-                breakdown.reasons.append("explicit_mismatch")
+    if (
+        source.explicit is not None
+        and candidate.explicit is not None
+        and source.explicit != candidate.explicit
+    ):
+        if source.explicit and not candidate.explicit:
+            # Replacing an explicit recording with a clean one is the most
+            # damaging silent substitution, so it is penalized hardest.
+            breakdown.score = max(
+                0.0, breakdown.score - EXPLICIT_TO_CLEAN_PENALTY
+            )
+            breakdown.warnings.append("explicit_replaced_by_clean")
+            breakdown.reasons.append("explicit_mismatch")
+        else:
+            breakdown.score = max(0.0, breakdown.score - EXPLICIT_MISMATCH_PENALTY)
+            breakdown.warnings.append("clean_replaced_by_explicit")
+            breakdown.reasons.append("explicit_mismatch")
     return None
 
 

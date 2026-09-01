@@ -273,7 +273,9 @@
     "transfer_confirmation_required": "⚠️ No change was made because confirmation was not provided.",
     "unavailable": "⚠️ The item is not available for this account or region.",
     "unknown": "⚠️ {code}",
-    "unsupported_capability": "⚠️ This platform does not support the requested operation ({capability})."
+    "unknown_operation": "⚠️ Internal error: unknown operation {capability}.",
+    "unsupported_capability": "⚠️ This platform does not support the requested operation ({capability}).",
+    "unsupported_transfer_content": "⚠️ The requested content is not supported for transfer."
   },
   "platform": {
     "tidal": "TIDAL",

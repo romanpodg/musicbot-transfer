@@ -21,23 +21,33 @@ import unittest
 
 from music_transfer.core.domain import (
     AccountProfile,
+    Album,
+    Artist,
     LibrarySnapshot,
+    Track,
     TransferJob,
     TransferSettings,
 )
-from music_transfer.core.enums import ContentType, OperationKind, Platform
+from music_transfer.core.enums import ContentType, EntityType, OperationKind, Platform
 from music_transfer.core.errors import (
     ConfirmationRequired,
     UnsupportedCapabilityError,
+    UnsupportedTransferContentError,
 )
 from music_transfer.core.matching import TrackMatcher
 from music_transfer.core.ports import (
+    DestinationState,
     MusicPlatformAdapter,
+    MusicPlatformReadPort,
     PlatformCapabilities,
     ReadOnlyAdapter,
     operation_kind,
 )
-from music_transfer.core.transfer import TransferPlanner
+from music_transfer.core.transfer import (
+    TransferPlanner,
+    require_transfer_content_spec,
+    validate_transfer_content_support,
+)
 from music_transfer.platforms.registry import default_registry
 
 from tests.support import FakePlatformAdapter, track
@@ -61,6 +71,43 @@ def source_snapshot() -> LibrarySnapshot:
     )
 
 
+class MinimalReadPort:
+    """A minimal implementation of MusicPlatformReadPort with zero mutation methods."""
+
+    def __init__(self, platform: Platform = Platform.TIDAL, tracks: list[Track] | None = None) -> None:
+        self._platform = platform
+        self._tracks = list(tracks or [])
+        self.capabilities = PlatformCapabilities(
+            platform=platform,
+            read_liked_tracks=True,
+            write_liked_tracks=True,
+            search_tracks=True,
+            supports_already_exists_detection=True,
+        )
+
+    @property
+    def platform(self) -> Platform:
+        return self._platform
+
+    def get_destination_state(self, sections: tuple[str, ...] | None = None) -> DestinationState:
+        return DestinationState(
+            platform=self._platform,
+            track_ids=frozenset(t.source_id for t in self._tracks),
+        )
+
+    def search_track(self, track: Track, limit: int = 5) -> list[Track]:
+        return [t for t in self._tracks if t.title == track.title][:limit]
+
+    def search_album(self, album: Album, limit: int = 5) -> list[Album]:
+        return []
+
+    def search_artist(self, artist: Artist, limit: int = 5) -> list[Artist]:
+        return []
+
+    def can_reuse_identifier(self, entity_type: EntityType, source: Platform) -> bool:
+        return source == self._platform
+
+
 class PlanningMakesNoWrites(unittest.TestCase):
     """Invariant B: nothing is written while a plan is being built."""
 
@@ -71,7 +118,7 @@ class PlanningMakesNoWrites(unittest.TestCase):
         job = TransferJob.create(
             Platform.TIDAL, Platform.TIDAL, requested_content=(ContentType.LIKED_TRACKS,)
         )
-        TransferPlanner(TrackMatcher()).build(job, source_snapshot(), destination)
+        TransferPlanner(TrackMatcher()).build(job, source_snapshot(), ReadOnlyAdapter(destination))
 
         self.assertEqual(
             destination.write_calls,
@@ -80,23 +127,78 @@ class PlanningMakesNoWrites(unittest.TestCase):
         )
         self.assertEqual(destination.saved_tracks, [])
 
-    def test_read_only_adapter_blocks_writes(self) -> None:
-        """The read-only wrapper turns any write into an immediate error."""
+    def test_planner_accepts_minimal_read_port(self) -> None:
+        """Planner builds successfully when given a minimal read-only port."""
+
+        minimal = MinimalReadPort()
+        self.assertIsInstance(minimal, MusicPlatformReadPort)
+        job = TransferJob.create(
+            Platform.TIDAL, Platform.TIDAL, requested_content=(ContentType.LIKED_TRACKS,)
+        )
+        result = TransferPlanner(TrackMatcher()).build(job, source_snapshot(), minimal)
+        self.assertEqual(result.summary.total_items, 1)
+        self.assertEqual(result.summary.matched_items, 1)
+
+    def test_planner_does_not_require_full_adapter(self) -> None:
+        """Planner does not require full MusicPlatformAdapter inheritance or write methods."""
+
+        minimal = MinimalReadPort()
+        self.assertFalse(isinstance(minimal, MusicPlatformAdapter))
+        self.assertFalse(hasattr(minimal, "save_track"))
+        self.assertFalse(hasattr(minimal, "create_playlist"))
+
+        job = TransferJob.create(
+            Platform.TIDAL, Platform.TIDAL, requested_content=(ContentType.LIKED_TRACKS,)
+        )
+        result = TransferPlanner(TrackMatcher()).build(job, source_snapshot(), minimal)
+        self.assertIsNotNone(result.plan)
+
+    def test_planning_read_facade_exposes_no_known_write_methods(self) -> None:
+        """The read-only facade has no mutating or destructive methods."""
 
         destination = ReadOnlyAdapter(FakePlatformAdapter())
-        with self.assertRaises(UnsupportedCapabilityError):
-            destination.save_track("1")
-        with self.assertRaises(UnsupportedCapabilityError):
-            destination.follow_artist("1")
-        with self.assertRaises(UnsupportedCapabilityError):
-            destination.add_playlist_item("p", "t")
+        for method in MusicPlatformAdapter.MUTATING_METHODS | MusicPlatformAdapter.DESTRUCTIVE_METHODS:
+            with self.subTest(method=method):
+                self.assertFalse(hasattr(destination, method))
+                with self.assertRaises(AttributeError):
+                    getattr(destination, method)("arg1")
 
-    def test_read_only_adapter_still_allows_reads(self) -> None:
-        """Reads pass through, so planning and verification still work."""
+    def test_planning_read_facade_rejects_unknown_adapter_method(self) -> None:
+        """An unknown future adapter method is unreachable through the read-only facade."""
 
-        destination = ReadOnlyAdapter(FakePlatformAdapter(tracks=[track("A", identifier="a")]))
-        self.assertEqual([item.source_id for item in destination.get_liked_tracks()], ["a"])
-        self.assertEqual(destination.get_profile().display_name, "fake")
+        class AdapterWithFutureMethod(FakePlatformAdapter):
+            def future_remote_mutation(self, arg: str) -> None:
+                self.write_calls.append(("future_remote_mutation", (arg,)))
+
+        fake = AdapterWithFutureMethod()
+        read_only = ReadOnlyAdapter(fake)
+
+        self.assertTrue(hasattr(fake, "future_remote_mutation"))
+        self.assertFalse(hasattr(read_only, "future_remote_mutation"))
+        with self.assertRaises(AttributeError):
+            read_only.future_remote_mutation("payload")  # type: ignore[attr-defined]
+        self.assertEqual(fake.write_calls, [])
+
+    def test_planning_read_facade_has_no_public_full_adapter_escape(self) -> None:
+        """The read facade does not expose a public .inner property to the full adapter."""
+
+        destination = ReadOnlyAdapter(FakePlatformAdapter())
+        self.assertFalse(hasattr(destination, "inner"))
+        with self.assertRaises(AttributeError):
+            _ = destination.inner
+
+    def test_planning_read_facade_forwards_reads(self) -> None:
+        """Planning read methods pass through to the underlying adapter."""
+
+        fake = FakePlatformAdapter(tracks=[track("A", identifier="a")])
+        destination = ReadOnlyAdapter(fake)
+
+        self.assertIs(destination.platform, Platform.TIDAL)
+        self.assertTrue(destination.capabilities.supports("read_liked_tracks"))
+        self.assertTrue(destination.can_reuse_identifier(EntityType.TRACK, Platform.TIDAL))
+        self.assertEqual(len(destination.search_track(track("A"))), 1)
+        state = destination.get_destination_state()
+        self.assertTrue(state.has_track("a"))
 
     def test_operation_kind_classifies_methods(self) -> None:
         """Every adapter method is classified read / mutating / destructive."""
@@ -105,13 +207,187 @@ class PlanningMakesNoWrites(unittest.TestCase):
         self.assertIs(operation_kind(FakePlatformAdapter, "delete_playlist"), OperationKind.DESTRUCTIVE)
         self.assertIs(operation_kind(FakePlatformAdapter, "get_liked_tracks"), OperationKind.READ)
 
+    def test_operation_kind_rejects_unknown_methods(self) -> None:
+        """An unknown method is never implicitly classified as safe READ."""
+
+        with self.assertRaises(UnsupportedCapabilityError) as ctx:
+            operation_kind(FakePlatformAdapter, "future_remote_mutation")
+        self.assertEqual(ctx.exception.code, "unknown_operation")
+        self.assertEqual(ctx.exception.capability, "future_remote_mutation")
+
     def test_mutating_and_destructive_sets_do_not_overlap(self) -> None:
-        """A method is never both a write and a delete."""
+        """Method classification sets are mutually disjoint."""
 
         self.assertFalse(
             MusicPlatformAdapter.MUTATING_METHODS
             & MusicPlatformAdapter.DESTRUCTIVE_METHODS
         )
+        self.assertFalse(
+            MusicPlatformAdapter.READ_METHODS
+            & MusicPlatformAdapter.MUTATING_METHODS
+        )
+        self.assertFalse(
+            MusicPlatformAdapter.READ_METHODS
+            & MusicPlatformAdapter.DESTRUCTIVE_METHODS
+        )
+
+
+class ContentSupportValidation(unittest.TestCase):
+    """Authoritative transfer content support: source ∩ destination ∩ engine."""
+
+    def _service(self):
+        import tempfile
+        from pathlib import Path
+
+        from music_transfer.app.services import TransferService
+        from music_transfer.infrastructure.persistence import (
+            JsonTransferItemRepository,
+            JsonTransferJobRepository,
+        )
+
+        root = Path(tempfile.mkdtemp())
+        return TransferService(
+            JsonTransferJobRepository(root), JsonTransferItemRepository(root)
+        )
+
+    def test_supported_track_transfer_passes_content_validation(self) -> None:
+        """A supported content type with matching capabilities passes validation."""
+
+        source_cap = PlatformCapabilities(platform=Platform.TIDAL, read_liked_tracks=True)
+        dest_cap = PlatformCapabilities(platform=Platform.TIDAL, write_liked_tracks=True)
+        validate_transfer_content_support((ContentType.LIKED_TRACKS,), source_cap, dest_cap)
+
+    def test_source_read_capability_missing_is_semantic_error(self) -> None:
+        """Missing source read capability raises UnsupportedTransferContentError."""
+
+        source_cap = PlatformCapabilities(platform=Platform.TIDAL, read_liked_tracks=False)
+        dest_cap = PlatformCapabilities(platform=Platform.TIDAL, write_liked_tracks=True)
+        with self.assertRaises(UnsupportedTransferContentError) as ctx:
+            validate_transfer_content_support((ContentType.LIKED_TRACKS,), source_cap, dest_cap)
+        self.assertEqual(ctx.exception.code, "unsupported_transfer_content")
+        self.assertEqual(ctx.exception.reason, "source_read_unsupported")
+        self.assertEqual(ctx.exception.content_type, ContentType.LIKED_TRACKS)
+        self.assertEqual(ctx.exception.capability, "read_liked_tracks")
+
+    def test_destination_write_capability_missing_is_semantic_error(self) -> None:
+        """Missing destination write capability raises UnsupportedTransferContentError."""
+
+        source_cap = PlatformCapabilities(platform=Platform.TIDAL, read_liked_tracks=True)
+        dest_cap = PlatformCapabilities(platform=Platform.TIDAL, write_liked_tracks=False)
+        with self.assertRaises(UnsupportedTransferContentError) as ctx:
+            validate_transfer_content_support((ContentType.LIKED_TRACKS,), source_cap, dest_cap)
+        self.assertEqual(ctx.exception.code, "unsupported_transfer_content")
+        self.assertEqual(ctx.exception.reason, "destination_write_unsupported")
+        self.assertEqual(ctx.exception.content_type, ContentType.LIKED_TRACKS)
+        self.assertEqual(ctx.exception.capability, "write_liked_tracks")
+
+    def test_declared_but_engine_unsupported_content_is_semantic_error(self) -> None:
+        """Declared content without engine implementation is rejected regardless of capability flags."""
+
+        source_cap = PlatformCapabilities(
+            platform=Platform.TIDAL, read_videos=True, read_mixes=True
+        )
+        dest_cap = PlatformCapabilities(
+            platform=Platform.TIDAL, write_videos=True, write_mixes=True
+        )
+        for content_type in (ContentType.VIDEOS, ContentType.MIXES):
+            with self.subTest(content_type=content_type):
+                with self.assertRaises(UnsupportedTransferContentError) as ctx:
+                    validate_transfer_content_support((content_type,), source_cap, dest_cap)
+                self.assertEqual(ctx.exception.code, "unsupported_transfer_content")
+                self.assertEqual(ctx.exception.reason, "engine_not_implemented")
+                self.assertEqual(ctx.exception.content_type, content_type)
+
+    def test_declared_but_engine_unsupported_content_never_raises_raw_key_error(self) -> None:
+        """Resolving unimplemented content raises UnsupportedTransferContentError, never raw KeyError."""
+
+        for content_type in (ContentType.VIDEOS, ContentType.MIXES):
+            with self.subTest(content_type=content_type):
+                with self.assertRaises(UnsupportedTransferContentError) as ctx:
+                    require_transfer_content_spec(content_type)
+                self.assertEqual(ctx.exception.reason, "engine_not_implemented")
+
+    def test_mixed_request_with_unsupported_content_is_rejected_as_a_whole(self) -> None:
+        """A mixed request is fail-closed and rejected as a whole without partial filtering."""
+
+        source_cap = FakePlatformAdapter.CAPABILITIES
+        dest_cap = FakePlatformAdapter.CAPABILITIES
+        with self.assertRaises(UnsupportedTransferContentError) as ctx:
+            validate_transfer_content_support(
+                (ContentType.LIKED_TRACKS, ContentType.PLAYLISTS, ContentType.VIDEOS),
+                source_cap,
+                dest_cap,
+            )
+        self.assertEqual(ctx.exception.content_type, ContentType.VIDEOS)
+        self.assertEqual(ctx.exception.reason, "engine_not_implemented")
+
+    def test_playlist_requires_create_playlist_capability(self) -> None:
+        """Playlist transfer requires destination create_playlists capability."""
+
+        source_cap = PlatformCapabilities(platform=Platform.TIDAL, read_playlists=True)
+        dest_cap = PlatformCapabilities(
+            platform=Platform.TIDAL, create_playlists=False, write_playlist_items=True
+        )
+        with self.assertRaises(UnsupportedTransferContentError) as ctx:
+            validate_transfer_content_support((ContentType.PLAYLISTS,), source_cap, dest_cap)
+        self.assertEqual(ctx.exception.reason, "destination_write_unsupported")
+        self.assertEqual(ctx.exception.capability, "create_playlists")
+
+    def test_playlist_requires_playlist_item_write_capability(self) -> None:
+        """Playlist transfer requires destination write_playlist_items capability."""
+
+        source_cap = PlatformCapabilities(platform=Platform.TIDAL, read_playlists=True)
+        dest_cap = PlatformCapabilities(
+            platform=Platform.TIDAL, create_playlists=True, write_playlist_items=False
+        )
+        with self.assertRaises(UnsupportedTransferContentError) as ctx:
+            validate_transfer_content_support((ContentType.PLAYLISTS,), source_cap, dest_cap)
+        self.assertEqual(ctx.exception.reason, "destination_write_unsupported")
+        self.assertEqual(ctx.exception.capability, "write_playlist_items")
+
+    def test_unsupported_request_does_not_export_source(self) -> None:
+        """An unsupported request fails before calling source export_library."""
+
+        class TrackingSourceAdapter(FakePlatformAdapter):
+            def __init__(self) -> None:
+                super().__init__()
+                self.export_calls = 0
+
+            def export_library(self, sections=None, progress=None) -> LibrarySnapshot:
+                self.export_calls += 1
+                return super().export_library(sections=sections, progress=progress)
+
+        service = self._service()
+        source = TrackingSourceAdapter()
+        destination = FakePlatformAdapter()
+        job = service.create_job(
+            new_account("src-1"),
+            new_account("dst-1"),
+            content=(ContentType.VIDEOS,),
+        )
+
+        with self.assertRaises(UnsupportedTransferContentError):
+            service.analyze(job, source, destination)
+
+        self.assertEqual(source.export_calls, 0)
+        self.assertEqual(destination.write_calls, [])
+
+    def test_unsupported_request_produces_zero_destination_writes(self) -> None:
+        """An unsupported request never performs any destination writes."""
+
+        service = self._service()
+        source = FakePlatformAdapter(tracks=[track("A", identifier="a")])
+        destination = FakePlatformAdapter()
+        job = service.create_job(
+            new_account("src-1"),
+            new_account("dst-1"),
+            content=(ContentType.VIDEOS,),
+        )
+
+        with self.assertRaises(UnsupportedTransferContentError):
+            service.analyze(job, source, destination)
+
+        self.assertEqual(destination.write_calls, [])
 
 
 class UnsupportedCapabilityBehaviour(unittest.TestCase):

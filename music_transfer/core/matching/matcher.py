@@ -216,6 +216,4 @@ def _is_fuzzy_only(source: NormalizedTrack, candidate: NormalizedTrack) -> bool:
 
     if source.title and candidate.title and source.title == candidate.title:
         return False
-    if source.base_title and candidate.base_title and source.base_title == candidate.base_title:
-        return False
-    return True
+    return not (source.base_title and candidate.base_title and source.base_title == candidate.base_title)

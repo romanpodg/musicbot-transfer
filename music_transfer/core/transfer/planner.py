@@ -46,9 +46,13 @@ from ..enums import (
     PreconditionExpectation,
     TransferOperation,
 )
-from ..errors import TransferConfigurationError, UnsupportedCapabilityError
+from ..errors import (
+    TransferConfigurationError,
+    UnsupportedCapabilityError,
+    UnsupportedTransferContentError,
+)
 from ..matching import TrackMatcher
-from ..ports import DestinationState, MusicPlatformAdapter, PlatformCapabilities, ReadOnlyAdapter
+from ..ports import DestinationState, MusicPlatformReadPort, PlatformCapabilities
 from .ordering import apply_logical_order
 
 _LOGGER = logging.getLogger("music_transfer.planner")
@@ -57,33 +61,103 @@ _LOGGER = logging.getLogger("music_transfer.planner")
 _DIRECT_METHOD = MatchMethod.DIRECT_ID
 _NONE_METHOD = MatchMethod.NONE
 
-#: Which library section, entity type, and capabilities each content type needs.
-CONTENT_SPECS: dict[ContentType, dict[str, str]] = {
-    ContentType.LIKED_TRACKS: {
-        "section": "tracks",
-        "entity_type": EntityType.TRACK.value,
-        "read_capability": "read_liked_tracks",
-        "write_capability": "write_liked_tracks",
-    },
-    ContentType.SAVED_ALBUMS: {
-        "section": "albums",
-        "entity_type": EntityType.ALBUM.value,
-        "read_capability": "read_saved_albums",
-        "write_capability": "write_saved_albums",
-    },
-    ContentType.FOLLOWED_ARTISTS: {
-        "section": "artists",
-        "entity_type": EntityType.ARTIST.value,
-        "read_capability": "read_followed_artists",
-        "write_capability": "write_followed_artists",
-    },
-    ContentType.PLAYLISTS: {
-        "section": "playlists",
-        "entity_type": EntityType.PLAYLIST.value,
-        "read_capability": "read_playlists",
-        "write_capability": "create_playlists",
-    },
+
+@dataclass(frozen=True, slots=True)
+class TransferContentSpec:
+    """Authoritative transfer specification for a single content type."""
+
+    content_type: ContentType
+    snapshot_sections: tuple[str, ...]
+    entity_type: EntityType
+    source_read_capabilities: tuple[str, ...]
+    destination_write_capabilities: tuple[str, ...]
+
+
+#: Engine support registry: only content types with complete transfer paths.
+ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
+    ContentType.LIKED_TRACKS: TransferContentSpec(
+        content_type=ContentType.LIKED_TRACKS,
+        snapshot_sections=("tracks",),
+        entity_type=EntityType.TRACK,
+        source_read_capabilities=("read_liked_tracks",),
+        destination_write_capabilities=("write_liked_tracks",),
+    ),
+    ContentType.SAVED_ALBUMS: TransferContentSpec(
+        content_type=ContentType.SAVED_ALBUMS,
+        snapshot_sections=("albums",),
+        entity_type=EntityType.ALBUM,
+        source_read_capabilities=("read_saved_albums",),
+        destination_write_capabilities=("write_saved_albums",),
+    ),
+    ContentType.FOLLOWED_ARTISTS: TransferContentSpec(
+        content_type=ContentType.FOLLOWED_ARTISTS,
+        snapshot_sections=("artists",),
+        entity_type=EntityType.ARTIST,
+        source_read_capabilities=("read_followed_artists",),
+        destination_write_capabilities=("write_followed_artists",),
+    ),
+    ContentType.PLAYLISTS: TransferContentSpec(
+        content_type=ContentType.PLAYLISTS,
+        snapshot_sections=("playlists", "folders"),
+        entity_type=EntityType.PLAYLIST,
+        source_read_capabilities=("read_playlists",),
+        destination_write_capabilities=("create_playlists", "write_playlist_items"),
+    ),
 }
+
+#: Backward-compatible alias
+CONTENT_SPECS = ENGINE_TRANSFER_SPECS
+
+
+def require_transfer_content_spec(content_type: ContentType) -> TransferContentSpec:
+    """Resolve the authoritative transfer spec for a content type.
+
+    Raises:
+        UnsupportedTransferContentError: If the content type is not implemented
+            by the transfer engine.
+    """
+    spec = ENGINE_TRANSFER_SPECS.get(content_type)
+    if spec is None:
+        raise UnsupportedTransferContentError(
+            "unsupported_transfer_content",
+            content_type=content_type,
+            reason="engine_not_implemented",
+        )
+    return spec
+
+
+def validate_transfer_content_support(
+    requested_content: tuple[ContentType, ...] | list[ContentType],
+    source_capabilities: PlatformCapabilities,
+    destination_capabilities: PlatformCapabilities,
+) -> None:
+    """Validate that every requested content type is supported end-to-end.
+
+    Rule:
+        source can read ∩ destination can write ∩ engine implements the complete transfer path
+
+    Raises:
+        UnsupportedTransferContentError: If any requested content type fails
+            engine support, source read capability, or destination write capability.
+    """
+    for content_type in requested_content:
+        spec = require_transfer_content_spec(content_type)
+        for read_cap in spec.source_read_capabilities:
+            if not source_capabilities.supports(read_cap):
+                raise UnsupportedTransferContentError(
+                    "unsupported_transfer_content",
+                    content_type=content_type,
+                    reason="source_read_unsupported",
+                    capability=read_cap,
+                )
+        for write_cap in spec.destination_write_capabilities:
+            if not destination_capabilities.supports(write_cap):
+                raise UnsupportedTransferContentError(
+                    "unsupported_transfer_content",
+                    content_type=content_type,
+                    reason="destination_write_unsupported",
+                    capability=write_cap,
+                )
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +191,7 @@ class TransferPlanner:
         self,
         job: TransferJob,
         source: LibrarySnapshot,
-        destination: MusicPlatformAdapter,
+        destination: MusicPlatformReadPort,
         *,
         destination_state: DestinationState | None = None,
     ) -> PlannerResult:
@@ -126,32 +200,33 @@ class TransferPlanner:
         Args:
             job: The job being planned.
             source: The already-exported source snapshot.
-            destination: The destination adapter.  It is wrapped in a
-                read-only guard before any method is called.
+            destination: The destination read port.
             destination_state: A previously captured destination state.  When
                 omitted, the planner reads it (still read-only).
 
         Raises:
+            UnsupportedTransferContentError: If a requested content type is not
+                engine-supported or missing required capabilities.
             UnsupportedCapabilityError: If the destination cannot perform a
                 requested write, or if the source snapshot is missing a
                 requested section.
         """
 
-        read_only = ReadOnlyAdapter(destination)
         capabilities = destination.capabilities
         state = destination_state
         if state is None:
-            state = self._read_destination_state(read_only, job)
+            state = self._read_destination_state(destination, job)
         items: list[TransferItem] = []
         warnings: list[str] = []
         for content_type in job.requested_content:
+            require_transfer_content_spec(content_type)
             if content_type is ContentType.PLAYLISTS:
                 items.extend(
-                    self._plan_playlists(job, source, read_only, capabilities, state, warnings)
+                    self._plan_playlists(job, source, destination, capabilities, state, warnings)
                 )
                 continue
             items.extend(
-                self._plan_section(job, source, read_only, capabilities, state, content_type, warnings)
+                self._plan_section(job, source, destination, capabilities, state, content_type, warnings)
             )
         self._validate_plan(items)
         summary = self._summarize(items, source, state)
@@ -248,7 +323,7 @@ class TransferPlanner:
     # -- sections ----------------------------------------------------------
 
     def _read_destination_state(
-        self, destination: MusicPlatformAdapter, job: TransferJob
+        self, destination: MusicPlatformReadPort, job: TransferJob
     ) -> DestinationState:
         """Read destination state, degrading safely when unsupported."""
 
@@ -265,7 +340,7 @@ class TransferPlanner:
         self,
         job: TransferJob,
         source: LibrarySnapshot,
-        destination: MusicPlatformAdapter,
+        destination: MusicPlatformReadPort,
         capabilities: PlatformCapabilities,
         state: DestinationState | None,
         content_type: ContentType,
@@ -273,16 +348,17 @@ class TransferPlanner:
     ) -> list[TransferItem]:
         """Plan a set-like section (tracks, albums, artists)."""
 
-        spec = CONTENT_SPECS[content_type]
-        section = spec["section"]
+        spec = require_transfer_content_spec(content_type)
+        section = spec.snapshot_sections[0]
         if section in source.incomplete_sections:
             warnings.append(f"source_section_incomplete:{section}")
             self._logger.error(
                 "event=plan_section_incomplete job_id=%s section=%s", job.id, section
             )
             return []
-        capabilities.require(spec["write_capability"])
-        entity_type = EntityType(spec["entity_type"])
+        for write_cap in spec.destination_write_capabilities:
+            capabilities.require(write_cap)
+        entity_type = spec.entity_type
         raw_items = list(getattr(source, section))
         ordered = self._order(job, raw_items, section)
         planned: list[TransferItem] = []
@@ -354,7 +430,7 @@ class TransferPlanner:
         self,
         job: TransferJob,
         source: LibrarySnapshot,
-        destination: MusicPlatformAdapter,
+        destination: MusicPlatformReadPort,
         capabilities: PlatformCapabilities,
         state: DestinationState | None,
         warnings: list[str],
@@ -369,8 +445,9 @@ class TransferPlanner:
         if "playlists" in source.incomplete_sections:
             warnings.append("source_section_incomplete:playlists")
             return []
-        capabilities.require("create_playlists")
-        capabilities.require("write_playlist_items")
+        spec = require_transfer_content_spec(ContentType.PLAYLISTS)
+        for write_cap in spec.destination_write_capabilities:
+            capabilities.require(write_cap)
         planned: list[TransferItem] = []
         for playlists_position, playlist in enumerate(source.playlists):
             playlist_item = TransferItem.create(
@@ -421,7 +498,7 @@ class TransferPlanner:
     def _plan_playlist_item(
         self,
         job: TransferJob,
-        destination: MusicPlatformAdapter,
+        destination: MusicPlatformReadPort,
         playlist: Playlist,
         entry: Any,
         position: int,

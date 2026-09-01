@@ -52,7 +52,12 @@ from ...core.errors import (
     TransferConfigurationError,
 )
 from ...core.matching import MatchingPolicy, TrackMatcher
-from ...core.ports import MusicPlatformAdapter, TransferItemRepository, TransferJobRepository
+from ...core.ports import (
+    MusicPlatformAdapter,
+    ReadOnlyAdapter,
+    TransferItemRepository,
+    TransferJobRepository,
+)
 from ...core.transfer import (
     CancellationToken,
     ExecutionOutcome,
@@ -61,9 +66,11 @@ from ...core.transfer import (
     TransferPlanner,
     TransferVerifier,
     build_report,
+    require_transfer_content_spec,
     scrub_credentials,
     status_after_execution,
     transition,
+    validate_transfer_content_support,
 )
 from ...infrastructure.persistence import JsonTransferPlanRepository
 
@@ -72,14 +79,6 @@ _LOGGER = logging.getLogger("music_transfer.app.transfer")
 ProgressCallback = Callable[[TransferProgress], None]
 #: Progress callback used by the export phase: ``(section, current, total)``.
 ExportProgress = Callable[[str, int, int], None]
-
-#: Content types that map onto a snapshot section, for partial exports.
-_CONTENT_SECTIONS: dict[ContentType, str] = {
-    ContentType.LIKED_TRACKS: "tracks",
-    ContentType.SAVED_ALBUMS: "albums",
-    ContentType.FOLLOWED_ARTISTS: "artists",
-    ContentType.PLAYLISTS: "playlists",
-}
 
 
 class TransferService:
@@ -214,6 +213,12 @@ class TransferService:
         if has_started_execution:
             raise TransferConfigurationError("cannot_replan_after_writes_started")
 
+        validate_transfer_content_support(
+            job.requested_content,
+            source.capabilities,
+            destination.capabilities,
+        )
+
         transition(job, JobStatus.AUTHENTICATING)
         self._jobs.update(job)
         transition(job, JobStatus.EXPORTING)
@@ -230,7 +235,8 @@ class TransferService:
         transition(job, JobStatus.MATCHING)
         transition(job, JobStatus.PLANNING)
         self._jobs.update(job)
-        result = self._planner.build(job, snapshot, destination)
+        read_only_destination = ReadOnlyAdapter(destination)
+        result = self._planner.build(job, snapshot, read_only_destination)
         plan = result.plan
 
         # Determine next revision from durable repository (Section 15)
@@ -879,11 +885,10 @@ class TransferService:
 def content_sections(content: tuple[ContentType, ...]) -> tuple[str, ...]:
     """Return the snapshot sections required by a set of content types."""
 
-    sections = {
-        _CONTENT_SECTIONS[item] for item in content if item in _CONTENT_SECTIONS
-    }
-    if ContentType.PLAYLISTS in content:
-        sections.add("folders")
+    sections: set[str] = set()
+    for item in content:
+        spec = require_transfer_content_spec(item)
+        sections.update(spec.snapshot_sections)
     return tuple(sorted(sections))
 
 

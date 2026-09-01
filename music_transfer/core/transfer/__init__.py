@@ -30,12 +30,21 @@ from .ordering import (
     sort_key_for_text,
     to_write_order,
 )
-from .planner import CONTENT_SPECS, PlannerResult, TransferPlanner
+from .planner import (
+    CONTENT_SPECS,
+    ENGINE_TRANSFER_SPECS,
+    PlannerResult,
+    TransferContentSpec,
+    TransferPlanner,
+    require_transfer_content_spec,
+    validate_transfer_content_support,
+)
 from .recovery import RecoveryService
 from .verifier import TransferVerifier, aggregate_verification_status, compare_sequences
 
 __all__ = [
     "CONTENT_SPECS",
+    "ENGINE_TRANSFER_SPECS",
     "TERMINAL_STATUSES",
     "TRANSITIONS",
     "CancellationToken",
@@ -43,6 +52,7 @@ __all__ = [
     "ExecutionResult",
     "PlannerResult",
     "RecoveryService",
+    "TransferContentSpec",
     "TransferExecutor",
     "TransferPlanner",
     "TransferVerifier",
@@ -52,6 +62,7 @@ __all__ = [
     "can_transition",
     "compare_sequences",
     "is_terminal",
+    "require_transfer_content_spec",
     "restore_positions",
     "resume_target",
     "scrub_credentials",
@@ -60,4 +71,5 @@ __all__ = [
     "status_after_execution",
     "to_write_order",
     "transition",
+    "validate_transfer_content_support",
 ]

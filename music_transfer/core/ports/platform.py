@@ -198,6 +198,53 @@ class DestinationState:
 
 
 # --------------------------------------------------------------------------
+# The platform read port
+# --------------------------------------------------------------------------
+
+
+@runtime_checkable
+class MusicPlatformReadPort(Protocol):
+    """The minimal read-only platform contract required for transfer planning.
+
+    Invariant B: Planning performs no destination mutation.  The planner
+    depends strictly on this interface rather than the full write-capable
+    :class:`MusicPlatformAdapter`.
+    """
+
+    @property
+    def platform(self) -> Platform:
+        """Return the platform identifier."""
+        ...
+
+    @property
+    def capabilities(self) -> PlatformCapabilities:
+        """Return the capability declaration."""
+        ...
+
+    def get_destination_state(
+        self, sections: tuple[str, ...] | None = None
+    ) -> DestinationState:
+        """Return what the destination already contains (read-only)."""
+        ...
+
+    def search_track(self, track: Track, limit: int = 5) -> list[Track]:
+        """Search the destination catalog for a track (read-only)."""
+        ...
+
+    def search_album(self, album: Album, limit: int = 5) -> list[Album]:
+        """Search the destination catalog for an album (read-only)."""
+        ...
+
+    def search_artist(self, artist: Artist, limit: int = 5) -> list[Artist]:
+        """Search the destination catalog for an artist (read-only)."""
+        ...
+
+    def can_reuse_identifier(self, entity_type: EntityType, source: Platform) -> bool:
+        """Return whether source ids can be written directly to this platform (read-only)."""
+        ...
+
+
+# --------------------------------------------------------------------------
 # The adapter contract
 # --------------------------------------------------------------------------
 
@@ -211,6 +258,25 @@ class MusicPlatformAdapter(ABC):
     platforms must not be forced to implement meaningless operations, while
     keeping unsupported calls loud instead of silently successful.
     """
+
+    #: Method names that query remote or local state without mutating it.
+    READ_METHODS: frozenset[str] = frozenset(
+        {
+            "get_profile",
+            "export_library",
+            "get_liked_tracks",
+            "get_saved_albums",
+            "get_followed_artists",
+            "get_playlists",
+            "get_playlist_items",
+            "get_destination_state",
+            "playlist_item_ids",
+            "search_track",
+            "search_album",
+            "search_artist",
+            "can_reuse_identifier",
+        }
+    )
 
     #: Method names that change remote state (non-destructive writes).
     MUTATING_METHODS: frozenset[str] = frozenset(
@@ -492,44 +558,77 @@ class LibraryMaintenanceAdapter:
 # --------------------------------------------------------------------------
 
 
-def operation_kind(adapter: MusicPlatformAdapter, method_name: str) -> OperationKind:
-    """Classify an adapter method as read, mutating, or destructive."""
+def operation_kind(
+    adapter: MusicPlatformAdapter | type[MusicPlatformAdapter], method_name: str
+) -> OperationKind:
+    """Classify an adapter method as read, mutating, or destructive.
+
+    Raises:
+        UnsupportedCapabilityError: If the method name is not recognized,
+            ensuring unknown operations fail closed instead of being
+            implicitly treated as safe reads.
+    """
 
     if method_name in MusicPlatformAdapter.DESTRUCTIVE_METHODS:
         return OperationKind.DESTRUCTIVE
     if method_name in MusicPlatformAdapter.MUTATING_METHODS:
         return OperationKind.MUTATING
-    return OperationKind.READ
+    if method_name in MusicPlatformAdapter.READ_METHODS:
+        return OperationKind.READ
+    raise UnsupportedCapabilityError("unknown_operation", capability=method_name)
 
 
 class ReadOnlyAdapter:
-    """A wrapper that makes every write unreachable.
+    """An explicit fail-closed read-only facade for platform adapters.
 
-    The transfer planner receives destination adapters through this wrapper so
+    The transfer planner receives destination adapters through this facade so
     that Invariant B ("a transfer plan performs no destination mutations") is
-    enforced at runtime, not merely documented.  Attempting a write raises
-    :class:`UnsupportedCapabilityError` naming the attempted method.
+    enforced at runtime by the object boundary itself.
+
+    This class explicitly implements :class:`MusicPlatformReadPort` and forwards
+    only declared planning read operations to the underlying adapter. It defines
+    no generic attribute forwarding (__getattr__) and no public escape hatch to
+    the underlying write adapter. Unknown or mutating methods are unreachable
+    and fail closed.
     """
 
-    def __init__(self, inner: MusicPlatformAdapter) -> None:
-        self._inner = inner
+    def __init__(self, inner: MusicPlatformAdapter | MusicPlatformReadPort) -> None:
+        if isinstance(inner, ReadOnlyAdapter):
+            self._inner = inner._inner
+        else:
+            self._inner = inner
 
     @property
-    def inner(self) -> MusicPlatformAdapter:
-        """Return the wrapped adapter (for tests and diagnostics)."""
+    def platform(self) -> Platform:
+        """Return the platform this adapter talks to."""
+        return self._inner.platform
 
-        return self._inner
+    @property
+    def capabilities(self) -> PlatformCapabilities:
+        """Return the capability declaration."""
+        return self._inner.capabilities
 
-    def __getattr__(self, name: str) -> Any:
-        attribute = getattr(self._inner, name)
-        if callable(attribute) and operation_kind(self._inner, name) is not OperationKind.READ:
-            def blocked(*args: Any, **kwargs: Any) -> Any:
-                raise UnsupportedCapabilityError(
-                    "read_only_adapter_write_blocked", capability=name
-                )
+    def get_destination_state(
+        self, sections: tuple[str, ...] | None = None
+    ) -> DestinationState:
+        """Return what the destination already contains (read-only)."""
+        return self._inner.get_destination_state(sections=sections)
 
-            return blocked
-        return attribute
+    def search_track(self, track: Track, limit: int = 5) -> list[Track]:
+        """Search the destination catalog for a track (read-only)."""
+        return self._inner.search_track(track, limit=limit)
+
+    def search_album(self, album: Album, limit: int = 5) -> list[Album]:
+        """Search the destination catalog for an album (read-only)."""
+        return self._inner.search_album(album, limit=limit)
+
+    def search_artist(self, artist: Artist, limit: int = 5) -> list[Artist]:
+        """Search the destination catalog for an artist (read-only)."""
+        return self._inner.search_artist(artist, limit=limit)
+
+    def can_reuse_identifier(self, entity_type: EntityType, source: Platform) -> bool:
+        """Return whether source ids can be written directly to this platform (read-only)."""
+        return self._inner.can_reuse_identifier(entity_type, source)
 
 
 @runtime_checkable

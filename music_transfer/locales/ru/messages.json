@@ -273,7 +273,9 @@
     "transfer_confirmation_required": "⚠️ Изменения не внесены, так как подтверждение не получено.",
     "unavailable": "⚠️ Объект недоступен для этого аккаунта или региона.",
     "unknown": "⚠️ Код ошибки: {code}",
-    "unsupported_capability": "⚠️ Платформа не поддерживает запрошенную операцию ({capability})."
+    "unknown_operation": "⚠️ Внутренняя ошибка: неизвестная операция {capability}.",
+    "unsupported_capability": "⚠️ Платформа не поддерживает запрошенную операцию ({capability}).",
+    "unsupported_transfer_content": "⚠️ Запрошенный тип контента не поддерживается для переноса."
   },
   "platform": {
     "tidal": "TIDAL",

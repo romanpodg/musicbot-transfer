@@ -15,6 +15,7 @@ Durability rules:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -49,11 +50,9 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary_path, path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
+        with contextlib.suppress(OSError):
             # A platform without POSIX permissions must not break persistence.
-            pass
+            os.chmod(path, 0o600)
     except OSError as error:
         raise PersistenceError("atomic_write_failed") from error
     finally:

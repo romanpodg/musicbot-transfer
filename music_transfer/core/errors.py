@@ -11,6 +11,8 @@ map codes to localized messages.  Core code must not embed user-facing text.
 
 from __future__ import annotations
 
+from typing import Any
+
 
 class MusicTransferError(Exception):
     """Base class for every error raised by the core.
@@ -150,6 +152,36 @@ class TransferConfigurationError(MusicTransferError):
 
     code = "transfer_configuration_error"
     retryable = False
+
+
+class UnsupportedTransferContentError(TransferConfigurationError):
+    """The requested transfer content is not supported end-to-end.
+
+    Attributes:
+        content_type: The requested ContentType (or str).
+        reason: Why the content cannot be transferred:
+            - 'engine_not_implemented': Engine lacks complete transfer path.
+            - 'source_read_unsupported': Source lacks required read capability.
+            - 'destination_write_unsupported': Destination lacks required write capability.
+        capability: The specific missing capability flag, if applicable.
+    """
+
+    code = "unsupported_transfer_content"
+    retryable = False
+
+    def __init__(
+        self,
+        code: str | None = None,
+        message: str | None = None,
+        *,
+        content_type: Any = None,
+        reason: str | None = None,
+        capability: str | None = None,
+    ) -> None:
+        super().__init__(code, message)
+        self.content_type = content_type
+        self.reason = reason
+        self.capability = capability
 
 
 class InvalidStateTransition(TransferConfigurationError):

@@ -154,12 +154,12 @@ OperationKind.MUTATING     # needs confirmation
 OperationKind.DESTRUCTIVE  # needs confirmation and an explicit user request
 ```
 
-`operation_kind(adapter, "save_track")` resolves a method name to its kind.
-`ReadOnlyAdapter` uses it to make writes structurally unreachable:
+`operation_kind(adapter, "save_track")` resolves a method name to its kind (failing closed on unknown operations).
+`ReadOnlyAdapter` implements `MusicPlatformReadPort` as an explicit forwarding facade, making writes structurally unreachable:
 
 ```python
 planner.build(job, snapshot, ReadOnlyAdapter(destination))
-# any mutating call → UnsupportedCapabilityError("read_only_adapter_write_blocked")
+# mutating and unknown methods do not exist on the facade (AttributeError)
 ```
 
 ---

@@ -18,19 +18,21 @@ from typing import Any
 DATA_DIRECTORIES: tuple[str, ...] = ("backups", "reports", "logs", "state")
 
 
-def _environment_bool(name: str, default: bool = False) -> bool:
+def _environment_bool(name: str, default: bool = False, environment: Any = None) -> bool:
     """Parse a boolean environment variable."""
 
-    value = os.environ.get(name)
+    env = os.environ if environment is None else environment
+    value = env.get(name)
     if value is None:
         return default
     return value.strip().casefold() in {"1", "true", "yes", "on"}
 
 
-def _environment_int(name: str, default: int) -> int:
+def _environment_int(name: str, default: int, environment: Any = None) -> int:
     """Parse an integer environment variable, falling back on bad input."""
 
-    value = os.environ.get(name)
+    env = os.environ if environment is None else environment
+    value = env.get(name)
     if value is None:
         return default
     try:
@@ -39,10 +41,11 @@ def _environment_int(name: str, default: int) -> int:
         return default
 
 
-def _environment_float(name: str, default: float) -> float:
+def _environment_float(name: str, default: float, environment: Any = None) -> float:
     """Parse a float environment variable, falling back on bad input."""
 
-    value = os.environ.get(name)
+    env = os.environ if environment is None else environment
+    value = env.get(name)
     if value is None:
         return default
     try:
@@ -66,10 +69,10 @@ class HttpSettings:
 
         source = os.environ if environment is None else environment
         return cls(
-            timeout_seconds=_environment_float("MUSIC_TRANSFER_HTTP_TIMEOUT", 20.0),
-            max_attempts=max(1, _environment_int("MUSIC_TRANSFER_HTTP_MAX_ATTEMPTS", 3)),
-            initial_backoff_seconds=_environment_float("MUSIC_TRANSFER_BACKOFF_INITIAL", 1.0),
-            max_backoff_seconds=_environment_float("MUSIC_TRANSFER_BACKOFF_MAX", 8.0),
+            timeout_seconds=_environment_float("MUSIC_TRANSFER_HTTP_TIMEOUT", 20.0, source),
+            max_attempts=max(1, _environment_int("MUSIC_TRANSFER_HTTP_MAX_ATTEMPTS", 3, source)),
+            initial_backoff_seconds=_environment_float("MUSIC_TRANSFER_BACKOFF_INITIAL", 1.0, source),
+            max_backoff_seconds=_environment_float("MUSIC_TRANSFER_BACKOFF_MAX", 8.0, source),
         )
 
 
@@ -88,10 +91,10 @@ class PaginationSettings:
 
         source = os.environ if environment is None else environment
         return cls(
-            page_size=max(1, _environment_int("MUSIC_TRANSFER_PAGE_SIZE", 50)),
-            playlist_page_size=max(1, _environment_int("MUSIC_TRANSFER_PLAYLIST_PAGE_SIZE", 100)),
-            max_pages=max(1, _environment_int("MUSIC_TRANSFER_MAX_PAGES", 10_000)),
-            max_items=max(1, _environment_int("MUSIC_TRANSFER_MAX_ITEMS", 1_000_000)),
+            page_size=max(1, _environment_int("MUSIC_TRANSFER_PAGE_SIZE", 50, source)),
+            playlist_page_size=max(1, _environment_int("MUSIC_TRANSFER_PLAYLIST_PAGE_SIZE", 100, source)),
+            max_pages=max(1, _environment_int("MUSIC_TRANSFER_MAX_PAGES", 10_000, source)),
+            max_items=max(1, _environment_int("MUSIC_TRANSFER_MAX_ITEMS", 1_000_000, source)),
         )
 
 
@@ -110,10 +113,10 @@ class MatchingSettings:
 
         source = os.environ if environment is None else environment
         return cls(
-            high_confidence=_environment_float("MUSIC_TRANSFER_MATCH_HIGH", 0.88),
-            ambiguous_threshold=_environment_float("MUSIC_TRANSFER_MATCH_AMBIGUOUS", 0.62),
-            fuzzy_enabled=_environment_bool("MUSIC_TRANSFER_MATCH_FUZZY", True),
-            max_candidates=max(1, _environment_int("MUSIC_TRANSFER_MATCH_CANDIDATES", 5)),
+            high_confidence=_environment_float("MUSIC_TRANSFER_MATCH_HIGH", 0.88, source),
+            ambiguous_threshold=_environment_float("MUSIC_TRANSFER_MATCH_AMBIGUOUS", 0.62, source),
+            fuzzy_enabled=_environment_bool("MUSIC_TRANSFER_MATCH_FUZZY", True, source),
+            max_candidates=max(1, _environment_int("MUSIC_TRANSFER_MATCH_CANDIDATES", 5, source)),
         )
 
 
@@ -131,9 +134,9 @@ class ExecutionSettings:
 
         source = os.environ if environment is None else environment
         return cls(
-            max_item_attempts=max(1, _environment_int("MUSIC_TRANSFER_MAX_ITEM_ATTEMPTS", 3)),
-            checkpoint_every_item=_environment_bool("MUSIC_TRANSFER_CHECKPOINT_EVERY_ITEM", True),
-            verify_after_execution=_environment_bool("MUSIC_TRANSFER_VERIFY", True),
+            max_item_attempts=max(1, _environment_int("MUSIC_TRANSFER_MAX_ITEM_ATTEMPTS", 3, source)),
+            checkpoint_every_item=_environment_bool("MUSIC_TRANSFER_CHECKPOINT_EVERY_ITEM", True, source),
+            verify_after_execution=_environment_bool("MUSIC_TRANSFER_VERIFY", True, source),
         )
 
 

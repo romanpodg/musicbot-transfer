@@ -27,7 +27,9 @@ from ...core.errors import (
     PermanentPlatformError,
     RateLimitError,
     TemporaryPlatformError,
+    TransferConfigurationError,
     UnavailableError,
+    UnsupportedCapabilityError,
 )
 
 #: Reasons that mean "the remote outcome of a write is unknown".
@@ -72,6 +74,9 @@ def translate_provider_error(
             mutation, in which case a transient failure is reported as
             ambiguous so the caller reconciles instead of replaying.
     """
+
+    if isinstance(error, (UnsupportedCapabilityError, TransferConfigurationError)):
+        return error
 
     reason = str(getattr(error, "reason", "") or "")
     attempts = int(getattr(error, "attempts", 0) or 0)

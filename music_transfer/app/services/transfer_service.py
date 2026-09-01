@@ -13,7 +13,7 @@ repositories and returns domain objects.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from ...core.domain import (
@@ -224,7 +224,11 @@ class TransferService:
         transition(job, JobStatus.EXPORTING)
         self._jobs.update(job)
         if snapshot is None:
-            snapshot = source.export_library(progress=export_progress)
+            sections = content_sections(job.requested_content)
+            snapshot = source.export_library(
+                sections=sections,
+                progress=export_progress,
+            )
         self._logger.info(
             "event=source_exported job_id=%s counts=%s partial=%s",
             job.id,
@@ -882,7 +886,9 @@ class TransferService:
         return self._matcher.policy
 
 
-def content_sections(content: tuple[ContentType, ...]) -> tuple[str, ...]:
+def content_sections(
+    content: tuple[ContentType, ...] | list[ContentType] | Iterable[ContentType],
+) -> tuple[str, ...]:
     """Return the snapshot sections required by a set of content types."""
 
     sections: set[str] = set()

@@ -98,7 +98,7 @@ ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
     ),
     ContentType.PLAYLISTS: TransferContentSpec(
         content_type=ContentType.PLAYLISTS,
-        snapshot_sections=("playlists", "folders"),
+        snapshot_sections=("playlists",),
         entity_type=EntityType.PLAYLIST,
         source_read_capabilities=("read_playlists",),
         destination_write_capabilities=("create_playlists", "write_playlist_items"),

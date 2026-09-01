@@ -34,7 +34,11 @@ from ...core.domain import (
     Track,
 )
 from ...core.enums import Platform
-from ...core.errors import AuthenticationError, MusicTransferError
+from ...core.errors import (
+    AuthenticationError,
+    MusicTransferError,
+    UnsupportedCapabilityError,
+)
 from ...infrastructure.http import (
     ProviderRequestError,
     RetryCallback,
@@ -137,13 +141,35 @@ class TidalLibraryClient:
 
     # -- reads -------------------------------------------------------------
 
-    def export_library(self, progress: ProgressCallback | None = None) -> LibrarySnapshot:
-        """Export every supported section, marking unreadable ones incomplete.
+    KNOWN_SECTIONS: tuple[str, ...] = (
+        "tracks",
+        "albums",
+        "artists",
+        "videos",
+        "mixes",
+        "folders",
+        "playlists",
+    )
 
-        A section that cannot be read is listed in ``incomplete_sections``
-        rather than silently omitted, so a backup or cleanup plan can never
-        treat a partial view as complete.
+    def export_library(
+        self,
+        sections: tuple[str, ...] | list[str] | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> LibrarySnapshot:
+        """Export supported sections, marking unreadable requested ones incomplete.
+
+        When ``sections is None``, all supported sections are exported.
+        When ``sections`` is explicitly specified, only the requested producers
+        run.  Unrequested sections remain empty and are not marked incomplete.
+        Unknown section names fail closed before executing any producer.
         """
+
+        if sections is not None:
+            for section in sections:
+                if section not in self.KNOWN_SECTIONS:
+                    raise UnsupportedCapabilityError(
+                        "capability_unsupported", capability=section
+                    )
 
         self._logger.info("event=library_export_started platform=tidal")
         snapshot = LibrarySnapshot(
@@ -159,7 +185,13 @@ class TidalLibraryClient:
             ("folders", lambda: self.folders(progress)),
             ("playlists", lambda: self.playlists(progress)),
         )
-        for section, producer in producers:
+        if sections is None:
+            selected = producers
+        else:
+            requested = set(sections)
+            selected = tuple(p for p in producers if p[0] in requested)
+
+        for section, producer in selected:
             try:
                 if progress:
                     progress(section, 0, 0)

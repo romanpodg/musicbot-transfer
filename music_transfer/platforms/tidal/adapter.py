@@ -34,6 +34,10 @@ from ...core.domain import (
     Track,
 )
 from ...core.enums import EntityType, InsertionBehavior, Platform
+from ...core.errors import (
+    TransferConfigurationError,
+    UnsupportedCapabilityError,
+)
 from ...core.ports import (
     DestinationState,
     LibraryMaintenanceAdapter,
@@ -141,12 +145,12 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
     def export_library(
         self, sections: tuple[str, ...] | None = None, progress: Any = None
     ) -> LibrarySnapshot:
-        snapshot = self._read("export_library", self._client.export_library, progress)
-        if sections:
-            snapshot.incomplete_sections = [
-                section for section in snapshot.incomplete_sections if section in sections
-            ]
-        return snapshot
+        return self._read(
+            "export_library",
+            self._client.export_library,
+            sections=sections,
+            progress=progress,
+        )
 
     def get_liked_tracks(self, progress: Any = None) -> list[Track]:
         return self._read("get_liked_tracks", self._client.liked_tracks, progress)
@@ -335,11 +339,14 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
 
     # -- internals ---------------------------------------------------------
 
-    def _read(self, operation: str, method: Any, *args: Any) -> Any:
+    def _read(self, operation: str, method: Any, *args: Any, **kwargs: Any) -> Any:
         """Run a read-only provider call and translate failures."""
 
         try:
-            return method(*args)
+            return method(*args, **kwargs)
+        except (UnsupportedCapabilityError, TransferConfigurationError) as error:
+            self._log_failure(operation, error)
+            raise
         except (TidalClientError, ItemUnavailableError) as error:
             self._log_failure(operation, error)
             raise translate_provider_error(error, operation_is_write=False) from None

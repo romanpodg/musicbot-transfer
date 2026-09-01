@@ -23,6 +23,7 @@ The planner turns an exported source snapshot into ordered
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -39,6 +40,7 @@ from ..domain import (
 )
 from ..enums import (
     ContentType,
+    DestinationPresence,
     EntityType,
     ItemStatus,
     MatchMethod,
@@ -47,6 +49,8 @@ from ..enums import (
     TransferOperation,
 )
 from ..errors import (
+    DestinationPresenceUnknownError,
+    InvalidDestinationSectionError,
     TransferConfigurationError,
     UnsupportedCapabilityError,
     UnsupportedTransferContentError,
@@ -56,6 +60,7 @@ from ..ports import DestinationState, MusicPlatformReadPort, PlatformCapabilitie
 from .ordering import apply_logical_order
 
 _LOGGER = logging.getLogger("music_transfer.planner")
+
 
 #: Match methods recorded when no catalog search is required.
 _DIRECT_METHOD = MatchMethod.DIRECT_ID
@@ -160,8 +165,21 @@ def validate_transfer_content_support(
                 )
 
 
+def content_sections(
+    content: tuple[ContentType, ...] | list[ContentType] | Iterable[ContentType],
+) -> tuple[str, ...]:
+    """Return the snapshot sections required by a set of content types."""
+
+    sections: set[str] = set()
+    for item in content:
+        spec = require_transfer_content_spec(item)
+        sections.update(spec.snapshot_sections)
+    return tuple(sorted(sections))
+
+
 @dataclass(frozen=True, slots=True)
 class PlannerResult:
+
     """The outcome of planning one job."""
 
     plan: TransferPlan
@@ -250,13 +268,17 @@ class TransferPlanner:
             for it in items
         )
 
-        # Build trustworthy destination preconditions (Invariants I, J)
+        # Build trustworthy destination preconditions based on observed presence (Invariants I, J, Phase 1.4C)
         preconditions: list[PlanPrecondition] = []
         if state is not None:
             for it in items:
                 if not it.destination_id:
                     continue
-                # Determine section
+                try:
+                    presence = state.presence(it.entity_type, it.destination_id)
+                except InvalidDestinationSectionError:
+                    continue
+
                 if it.entity_type is EntityType.TRACK:
                     section = "tracks"
                 elif it.entity_type is EntityType.ALBUM:
@@ -268,10 +290,7 @@ class TransferPlanner:
                 else:
                     continue
 
-                if not state.is_trustworthy(section):
-                    continue
-
-                if it.status is ItemStatus.ALREADY_EXISTS:
+                if presence is DestinationPresence.PRESENT and it.status is ItemStatus.ALREADY_EXISTS:
                     preconditions.append(
                         PlanPrecondition(
                             entity_type=it.entity_type,
@@ -280,7 +299,11 @@ class TransferPlanner:
                             section=section,
                         )
                     )
-                elif it.status is ItemStatus.MATCHED and it.operation != TransferOperation.NONE:
+                elif (
+                    presence is DestinationPresence.ABSENT
+                    and it.status is ItemStatus.MATCHED
+                    and it.operation != TransferOperation.NONE
+                ):
                     preconditions.append(
                         PlanPrecondition(
                             entity_type=it.entity_type,
@@ -289,6 +312,7 @@ class TransferPlanner:
                             section=section,
                         )
                     )
+
 
         plan = TransferPlan(
             job_id=job.id,
@@ -325,13 +349,14 @@ class TransferPlanner:
     def _read_destination_state(
         self, destination: MusicPlatformReadPort, job: TransferJob
     ) -> DestinationState:
-        """Read destination state, degrading safely when unsupported."""
+        """Read destination state selectively, degrading safely to all-UNKNOWN when unsupported."""
 
+        sections = content_sections(job.requested_content)
         try:
-            return destination.get_destination_state()
+            return destination.get_destination_state(sections=sections)
         except UnsupportedCapabilityError:
             self._logger.info(
-                "event=plan_destination_state_unsupported platform=%s",
+                "event=plan_destination_state_unsupported platform=%s destination_presence=unknown",
                 job.destination_platform,
             )
             return DestinationState(platform=job.destination_platform)
@@ -414,17 +439,39 @@ class TransferPlanner:
                     transfer_item.destination_id = reusable
                     transfer_item.match_method = _DIRECT_METHOD
                     transfer_item.match_score = 1.0
-            if (
-                job.settings.skip_already_existing
-                and transfer_item.destination_id is not None
-                and state is not None
-                and self._state_contains(state, entity_type, transfer_item.destination_id)
-            ):
-                transfer_item.status = ItemStatus.ALREADY_EXISTS
-            elif transfer_item.status is ItemStatus.PENDING and transfer_item.destination_id:
-                transfer_item.status = ItemStatus.MATCHED
+
+            if transfer_item.destination_id is not None:
+                if state is not None:
+                    presence = state.presence(entity_type, transfer_item.destination_id)
+                else:
+                    presence = DestinationPresence.UNKNOWN
+
+                if job.settings.skip_already_existing:
+                    if presence is DestinationPresence.PRESENT:
+                        transfer_item.status = ItemStatus.ALREADY_EXISTS
+                    elif presence is DestinationPresence.ABSENT:
+                        if transfer_item.status is ItemStatus.PENDING:
+                            transfer_item.status = ItemStatus.MATCHED
+                    elif presence is DestinationPresence.UNKNOWN:
+                        reason = "state_unsupported"
+                        if state is not None:
+                            if section in state.incomplete_sections:
+                                reason = "section_incomplete"
+                            elif section not in state.complete_sections:
+                                reason = "section_not_read"
+                        raise DestinationPresenceUnknownError(
+                            f"destination_presence_unknown:{section}:{transfer_item.destination_id}",
+                            section=section,
+                            entity_type=entity_type,
+                            destination_id=transfer_item.destination_id,
+                            reason=reason,
+                        )
+                else:
+                    if transfer_item.status is ItemStatus.PENDING:
+                        transfer_item.status = ItemStatus.MATCHED
             planned.append(transfer_item)
         return planned
+
 
     def _plan_playlists(
         self,
@@ -577,17 +624,16 @@ class TransferPlanner:
     def _state_contains(
         state: DestinationState, entity_type: EntityType, identifier: str
     ) -> bool:
-        """Return whether the destination already holds an identifier."""
+        """Return whether the destination already holds an identifier.
 
-        if entity_type is EntityType.TRACK:
-            return state.has_track(identifier)
-        if entity_type is EntityType.ALBUM:
-            return identifier in state.album_ids
-        if entity_type is EntityType.ARTIST:
-            return identifier in state.artist_ids
-        if entity_type is EntityType.PLAYLIST:
-            return identifier in state.playlist_ids
-        return False
+        Deprecated: Prefer explicit `state.presence()`.
+        """
+
+        try:
+            return state.presence(entity_type, identifier) is DestinationPresence.PRESENT
+        except InvalidDestinationSectionError:
+            return False
+
 
     @staticmethod
     def _metadata_for(item: Any) -> dict[str, Any]:

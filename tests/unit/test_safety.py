@@ -93,7 +93,9 @@ class MinimalReadPort:
         return DestinationState(
             platform=self._platform,
             track_ids=frozenset(t.source_id for t in self._tracks),
+            complete_sections=frozenset({"tracks"}),
         )
+
 
     def search_track(self, track: Track, limit: int = 5) -> list[Track]:
         return [t for t in self._tracks if t.title == track.title][:limit]

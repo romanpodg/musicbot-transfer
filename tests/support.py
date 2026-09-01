@@ -21,6 +21,7 @@ from music_transfer.core.domain import (
     Track,
 )
 from music_transfer.core.enums import EntityType, Platform
+from music_transfer.core.errors import UnsupportedCapabilityError
 from music_transfer.core.ports import (
     DestinationState,
     MusicPlatformAdapter,
@@ -238,15 +239,46 @@ class FakePlatformAdapter(MusicPlatformAdapter):
                 raise self.error_factory()
             raise RuntimeError("simulated failure in get_destination_state")
 
+        if sections is not None:
+            for s in sections:
+                if s not in ("tracks", "albums", "artists", "playlists"):
+                    raise UnsupportedCapabilityError("capability_unsupported", capability=s)
+            wanted = set(sections)
+        else:
+            wanted = {"tracks", "albums", "artists", "playlists"}
+
+        complete: set[str] = set()
+        track_ids: list[str] = []
+        album_ids: list[str] = []
+        artist_ids: list[str] = []
+        playlist_ids: list[str] = []
+
+        if "tracks" in wanted:
+            track_ids = [item.source_id for item in self.tracks] + [
+                identifier
+                for identifier in self.saved_tracks
+                if identifier not in {item.source_id for item in self.tracks}
+            ]
+            complete.add("tracks")
+        if "albums" in wanted:
+            album_ids = [item.source_id for item in self.albums]
+            complete.add("albums")
+        if "artists" in wanted:
+            artist_ids = [item.source_id for item in self.artists]
+            complete.add("artists")
+        if "playlists" in wanted:
+            playlist_ids = [item.source_id for item in self.playlists]
+            complete.add("playlists")
+
         return DestinationState(
             platform=self._platform,
-            track_ids=[item.source_id for item in self.tracks]
-            + [identifier for identifier in self.saved_tracks if identifier not in
-               {item.source_id for item in self.tracks}],
-            album_ids=[item.source_id for item in self.albums],
-            artist_ids=[item.source_id for item in self.artists],
-            playlist_ids=[item.source_id for item in self.playlists],
+            track_ids=frozenset(track_ids),
+            album_ids=frozenset(album_ids),
+            artist_ids=frozenset(artist_ids),
+            playlist_ids=frozenset(playlist_ids),
+            complete_sections=frozenset(complete),
         )
+
 
     def search_track(self, query: Track, limit: int = 5) -> list[Track]:
         """Return candidates by exact title, then by normalized title."""

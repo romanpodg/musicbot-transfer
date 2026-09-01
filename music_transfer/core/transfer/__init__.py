@@ -36,6 +36,7 @@ from .planner import (
     PlannerResult,
     TransferContentSpec,
     TransferPlanner,
+    content_sections,
     require_transfer_content_spec,
     validate_transfer_content_support,
 )
@@ -61,8 +62,10 @@ __all__ = [
     "build_report",
     "can_transition",
     "compare_sequences",
+    "content_sections",
     "is_terminal",
     "require_transfer_content_spec",
+
     "restore_positions",
     "resume_target",
     "scrub_credentials",

@@ -35,8 +35,8 @@ from ..domain import (
     PlaylistItem,
     Track,
 )
-from ..enums import EntityType, InsertionBehavior, OperationKind, Platform
-from ..errors import UnsupportedCapabilityError
+from ..enums import DestinationPresence, EntityType, InsertionBehavior, OperationKind, Platform
+from ..errors import InvalidDestinationSectionError, UnsupportedCapabilityError
 
 #: Progress callback signature: ``(section, current, total)``.
 ProgressCallback = Any
@@ -157,14 +157,27 @@ class PlatformCapabilities:
 # Destination state
 # --------------------------------------------------------------------------
 
+KNOWN_DESTINATION_SECTIONS: frozenset[str] = frozenset(
+    {"tracks", "albums", "artists", "playlists"}
+)
+
+_ENTITY_TYPE_TO_SECTION: dict[EntityType, str] = {
+    EntityType.TRACK: "tracks",
+    EntityType.ALBUM: "albums",
+    EntityType.ARTIST: "artists",
+    EntityType.PLAYLIST: "playlists",
+}
+
 
 @dataclass(slots=True)
 class DestinationState:
     """A read-only view of what the destination already contains.
 
-    Used for "already exists" detection and for reconciling an ambiguous write.
-    ``incomplete_sections`` keeps a partial read honest: an absent id then means
-    "unknown", not "absent".
+    Destination membership is tri-state: PRESENT, ABSENT, UNKNOWN (Phase 1.4C).
+    ``complete_sections`` records which sections were successfully read to completion.
+    Absence can only be proven if the relevant section is in ``complete_sections``.
+    A default DestinationState has empty ``complete_sections`` and represents UNKNOWN
+    for all sections (fail-closed).
     """
 
     platform: Platform
@@ -172,29 +185,98 @@ class DestinationState:
     album_ids: frozenset[str] = frozenset()
     artist_ids: frozenset[str] = frozenset()
     playlist_ids: frozenset[str] = frozenset()
+    complete_sections: frozenset[str] = frozenset()
     incomplete_sections: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Coerce collections into frozensets/tuples without assuming completeness."""
+        if not isinstance(self.track_ids, frozenset):
+            object.__setattr__(self, "track_ids", frozenset(self.track_ids))
+        if not isinstance(self.album_ids, frozenset):
+            object.__setattr__(self, "album_ids", frozenset(self.album_ids))
+        if not isinstance(self.artist_ids, frozenset):
+            object.__setattr__(self, "artist_ids", frozenset(self.artist_ids))
+        if not isinstance(self.playlist_ids, frozenset):
+            object.__setattr__(self, "playlist_ids", frozenset(self.playlist_ids))
+        if not isinstance(self.complete_sections, frozenset):
+            object.__setattr__(self, "complete_sections", frozenset(self.complete_sections))
+        if not isinstance(self.incomplete_sections, tuple):
+            object.__setattr__(self, "incomplete_sections", tuple(self.incomplete_sections))
+
+    def presence(self, entity_type: EntityType, identifier: str) -> DestinationPresence:
+        """Query observed presence for an entity type and identifier.
+
+        Returns:
+            PRESENT: The section is complete and identifier was observed.
+            ABSENT: The section is complete and identifier was not observed.
+            UNKNOWN: The section is not complete (unread, failed, or partial).
+
+        Raises:
+            InvalidDestinationSectionError: If entity_type does not map to a destination section.
+        """
+        section = _ENTITY_TYPE_TO_SECTION.get(entity_type)
+        if section is None:
+            raise InvalidDestinationSectionError(
+                f"unsupported_entity_type_for_destination_presence:{entity_type}",
+                section=str(entity_type),
+            )
+        return self.presence_in_section(section, identifier)
+
+    def presence_in_section(self, section: str, identifier: str) -> DestinationPresence:
+        """Query observed presence within a canonical destination section.
+
+        Returns:
+            PRESENT: The section is complete and identifier was observed.
+            ABSENT: The section is complete and identifier was not observed.
+            UNKNOWN: The section is not complete (unread, failed, or partial).
+
+        Raises:
+            InvalidDestinationSectionError: If section is not a known destination section.
+        """
+        if section not in KNOWN_DESTINATION_SECTIONS:
+            raise InvalidDestinationSectionError(
+                f"invalid_destination_section:{section}",
+                section=section,
+            )
+        if section not in self.complete_sections:
+            return DestinationPresence.UNKNOWN
+
+        id_set: frozenset[str]
+        if section == "tracks":
+            id_set = self.track_ids
+        elif section == "albums":
+            id_set = self.album_ids
+        elif section == "artists":
+            id_set = self.artist_ids
+        elif section == "playlists":
+            id_set = self.playlist_ids
+        else:
+            return DestinationPresence.UNKNOWN
+
+        if bool(identifier) and identifier in id_set:
+            return DestinationPresence.PRESENT
+        return DestinationPresence.ABSENT
 
     def has_track(self, track_id: str | None) -> bool:
         """Return whether a track id is known to be present."""
-
         return bool(track_id) and track_id in self.track_ids
 
     def is_trustworthy(self, section: str) -> bool:
         """Return whether a section was read completely."""
-
-        return section not in self.incomplete_sections
+        return section in self.complete_sections
 
     def as_dict(self) -> dict[str, Any]:
-        """Serialize to JSON-compatible values."""
-
+        """Serialize to JSON-compatible values for diagnostic plan metadata."""
         return {
             "platform": str(self.platform),
             "track_count": len(self.track_ids),
             "album_count": len(self.album_ids),
             "artist_count": len(self.artist_ids),
             "playlist_count": len(self.playlist_ids),
+            "complete_sections": sorted(self.complete_sections),
             "incomplete_sections": list(self.incomplete_sections),
         }
+
 
 
 # --------------------------------------------------------------------------

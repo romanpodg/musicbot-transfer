@@ -220,3 +220,16 @@ class PreconditionExpectation(StrEnum):
     ABSENT = "absent"
 
 
+class DestinationPresence(StrEnum):
+    """The observed presence of an entity at the destination (Phase 1.4C).
+
+    Distinguishes definitively observed presence, definitively observed absence,
+    and unknown absence/presence due to unread, partial, or unsupported state.
+    """
+
+    PRESENT = "present"
+    ABSENT = "absent"
+    UNKNOWN = "unknown"
+
+
+

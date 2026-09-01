@@ -597,7 +597,9 @@ class VerificationSemanticsTests(unittest.TestCase):
             return DestinationState(
                 platform=state.platform,
                 track_ids=frozenset(list(state.track_ids) + ["unexpected-dst-track"]),
+                complete_sections=state.complete_sections,
             )
+
 
         destination.get_destination_state = extra_track_state  # type: ignore[method-assign]
 

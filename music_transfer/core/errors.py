@@ -242,6 +242,61 @@ class PlanValidationUnavailableError(MusicTransferError):
     retryable = True
 
 
+class DestinationStateError(MusicTransferError):
+    """Base class for destination state and presence errors."""
+
+    code = "destination_state_error"
+    retryable = False
+
+
+class InvalidDestinationSectionError(DestinationStateError, TransferConfigurationError):
+    """An unknown destination section was requested or queried."""
+
+    code = "invalid_destination_section"
+    retryable = False
+
+    def __init__(
+        self,
+        code: str | None = None,
+        message: str | None = None,
+        *,
+        section: str | None = None,
+    ) -> None:
+        super().__init__(code, message)
+        self.section = section
+
+
+class DestinationPresenceUnknownError(DestinationStateError, TransferConfigurationError):
+    """Destination presence is unknown when skip_already_existing is required.
+
+    Attributes:
+        section: Destination section name.
+        entity_type: The entity type.
+        destination_id: The destination identifier.
+        reason: Why presence cannot be determined ('section_not_read', 'section_incomplete', 'state_unsupported').
+    """
+
+    code = "destination_presence_unknown"
+    retryable = False
+
+    def __init__(
+        self,
+        code: str | None = None,
+        message: str | None = None,
+        *,
+        section: str | None = None,
+        entity_type: Any = None,
+        destination_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        super().__init__(code, message)
+        self.section = section
+        self.entity_type = entity_type
+        self.destination_id = destination_id
+        self.reason = reason
+
+
+
 class PaginationError(MusicTransferError):
     """A paginated read stopped making progress or exceeded its safety bound."""
 

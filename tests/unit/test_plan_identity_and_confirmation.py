@@ -584,7 +584,12 @@ class PlanIntegrityAndDriftTests(unittest.TestCase):
         self.assertEqual(destination.saved_tracks, [])
 
     def test_incomplete_state_does_not_invent_absent_precondition(self) -> None:
-        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL)
+        from music_transfer.core.domain import TransferSettings
+
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, settings=TransferSettings(skip_already_existing=False)
+        )
+
         destination = FakePlatformAdapter()
 
         # Destination state with incomplete/untrustworthy section
@@ -600,6 +605,7 @@ class PlanIntegrityAndDriftTests(unittest.TestCase):
         # Incomplete section must NOT generate ABSENT preconditions (Invariant J)
         absent_preconditions = [p for p in res.plan.preconditions if p.expected == "absent"]
         self.assertEqual(len(absent_preconditions), 0)
+
 
     def test_required_preflight_unavailable_fails_closed(self) -> None:
         job = self.service.create_job(Platform.TIDAL, Platform.TIDAL)

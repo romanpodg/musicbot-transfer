@@ -13,7 +13,7 @@ repositories and returns domain objects.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from typing import Any
 
 from ...core.domain import (
@@ -30,6 +30,7 @@ from ...core.domain import (
 )
 from ...core.enums import (
     ContentType,
+    DestinationPresence,
     EntityType,
     ItemStatus,
     JobStatus,
@@ -43,6 +44,7 @@ from ...core.errors import (
     AuthenticationError,
     AuthorizationError,
     ConfirmationRequired,
+    InvalidDestinationSectionError,
     InvalidPersistedStateError,
     InvalidStateTransition,
     PlanConfirmationMismatch,
@@ -66,7 +68,7 @@ from ...core.transfer import (
     TransferPlanner,
     TransferVerifier,
     build_report,
-    require_transfer_content_spec,
+    content_sections,
     scrub_credentials,
     status_after_execution,
     transition,
@@ -511,10 +513,13 @@ class TransferService:
                     self._logger.warning("event=plan_stale reason=execution_intent_drift job_id=%s", job.id)
                     raise PlanStaleError("plan_stale")
 
-            # Destination precondition validation (Sections 10-13)
+            # Destination precondition validation (Sections 10-13, 22-24, Phase 1.4C)
             if not has_started_execution and plan.preconditions:
+                required_sections = sorted({pre.section for pre in plan.preconditions})
                 try:
-                    dest_state = destination.get_destination_state()
+                    dest_state = destination.get_destination_state(
+                        sections=tuple(required_sections)
+                    )
                 except (AuthenticationError, AuthorizationError) as err:
                     # Fatal auth error (Invariant K, Section 38)
                     transition(job, JobStatus.FAILED)
@@ -530,27 +535,21 @@ class TransferService:
                     raise PlanValidationUnavailableError("plan_validation_unavailable")
 
                 for pre in plan.preconditions:
-                    if not dest_state.is_trustworthy(pre.section):
-                        raise PlanValidationUnavailableError("plan_validation_unavailable")
-
-                    if pre.section == "tracks":
-                        actual = dest_state.has_track(pre.destination_id)
-                    elif pre.section == "albums":
-                        actual = pre.destination_id in dest_state.album_ids
-                    elif pre.section == "artists":
-                        actual = pre.destination_id in dest_state.artist_ids
-                    elif pre.section == "playlists":
-                        actual = pre.destination_id in dest_state.playlist_ids
-                    else:
+                    try:
+                        actual = dest_state.presence_in_section(pre.section, pre.destination_id)
+                    except InvalidDestinationSectionError as err:
                         raise InvalidPersistedStateError(
                             "invalid_persisted_state",
                             f"Invalid precondition section: '{pre.section}'",
-                        )
+                        ) from err
+
+                    if actual is DestinationPresence.UNKNOWN:
+                        raise PlanValidationUnavailableError("plan_validation_unavailable")
 
                     if pre.expected == PreconditionExpectation.PRESENT or pre.expected == "present":
-                        expected = True
+                        expected = DestinationPresence.PRESENT
                     elif pre.expected == PreconditionExpectation.ABSENT or pre.expected == "absent":
-                        expected = False
+                        expected = DestinationPresence.ABSENT
                     else:
                         raise InvalidPersistedStateError(
                             "invalid_persisted_state",
@@ -568,10 +567,11 @@ class TransferService:
                             "event=plan_stale reason=destination_drift job_id=%s destination_id=%s expected=%s actual=%s",
                             job.id,
                             pre.destination_id,
-                            expected,
-                            actual,
+                            expected.value,
+                            actual.value,
                         )
                         raise PlanStaleError("plan_stale")
+
 
 
         if job.status is not JobStatus.IMPORTING:
@@ -716,7 +716,9 @@ class TransferService:
                 current=str(job.status), target=str(JobStatus.IMPORTING)
             )
         try:
-            state = destination.get_destination_state()
+            sections = content_sections(job.requested_content)
+            state = destination.get_destination_state(sections=sections)
+
         except (AuthenticationError, AuthorizationError) as error:
             self._logger.error(
                 "event=resume_fatal_auth_error job_id=%s error_type=%s error_code=%s",
@@ -886,20 +888,9 @@ class TransferService:
         return self._matcher.policy
 
 
-def content_sections(
-    content: tuple[ContentType, ...] | list[ContentType] | Iterable[ContentType],
-) -> tuple[str, ...]:
-    """Return the snapshot sections required by a set of content types."""
-
-    sections: set[str] = set()
-    for item in content:
-        spec = require_transfer_content_spec(item)
-        sections.update(spec.snapshot_sections)
-    return tuple(sorted(sections))
-
-
 __all__ = [
     "ExecutionOutcome",
     "TransferService",
     "content_sections",
 ]
+

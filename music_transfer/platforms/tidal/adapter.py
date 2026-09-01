@@ -170,19 +170,35 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
     def get_destination_state(self, sections: tuple[str, ...] | None = None) -> DestinationState:
         """Read what the destination already contains.
 
-        A section that cannot be read is listed in ``incomplete_sections`` so
-        callers can tell "absent" apart from "unknown"; treating an unknown as
-        absent would cause duplicate writes.
+        When ``sections is None``, all canonical destination sections are read.
+        When ``sections`` is explicitly provided (e.g. ``()`` or ``("tracks",)``),
+        only the requested sections are read.
+        Unrequested sections remain UNKNOWN (not in complete_sections, not in incomplete_sections).
+        Failed reads are added to incomplete_sections and omitted from complete_sections.
+        Unknown section names fail closed before any provider read is initiated.
         """
 
-        wanted = set(sections or ("tracks", "albums", "artists", "playlists"))
+        from ...core.ports.platform import KNOWN_DESTINATION_SECTIONS
+
+        if sections is not None:
+            for section in sections:
+                if section not in KNOWN_DESTINATION_SECTIONS:
+                    raise UnsupportedCapabilityError(
+                        "capability_unsupported", capability=section
+                    )
+            wanted = set(sections)
+        else:
+            wanted = set(KNOWN_DESTINATION_SECTIONS)
+
         state = DestinationState(platform=Platform.TIDAL)
+        complete: set[str] = set()
         incomplete: list[str] = []
         if "tracks" in wanted:
             try:
                 state.track_ids = frozenset(
                     track.source_id for track in self._client.liked_tracks()
                 )
+                complete.add("tracks")
             except Exception as error:  # noqa: BLE001 - recorded as incomplete
                 self._warn("destination_state_tracks", error)
                 incomplete.append("tracks")
@@ -191,6 +207,7 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
                 state.album_ids = frozenset(
                     album.source_id for album in self._client.saved_albums()
                 )
+                complete.add("albums")
             except Exception as error:  # noqa: BLE001 - recorded as incomplete
                 self._warn("destination_state_albums", error)
                 incomplete.append("albums")
@@ -199,6 +216,7 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
                 state.artist_ids = frozenset(
                     artist.source_id for artist in self._client.followed_artists()
                 )
+                complete.add("artists")
             except Exception as error:  # noqa: BLE001 - recorded as incomplete
                 self._warn("destination_state_artists", error)
                 incomplete.append("artists")
@@ -207,11 +225,14 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
                 state.playlist_ids = frozenset(
                     playlist.source_id for playlist in self._client.playlists()
                 )
+                complete.add("playlists")
             except Exception as error:  # noqa: BLE001 - recorded as incomplete
                 self._warn("destination_state_playlists", error)
                 incomplete.append("playlists")
+        state.complete_sections = frozenset(complete)
         state.incomplete_sections = tuple(incomplete)
         return state
+
 
     def playlist_item_ids(self, playlist_id: str) -> list[str]:
         return self._read("playlist_item_ids", self._client.playlist_item_ids, playlist_id)

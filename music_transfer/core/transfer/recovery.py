@@ -21,10 +21,12 @@ from ..domain import TransferItem, TransferJob
 from ..enums import (
     RETRYABLE_ITEM_STATUSES,
     TERMINAL_ITEM_STATUSES,
+    DestinationPresence,
     ItemStatus,
     JobStatus,
     MutationState,
 )
+from ..errors import InvalidDestinationSectionError
 from ..ports import DestinationState, TransferItemRepository
 
 _LOGGER = logging.getLogger("music_transfer.recovery")
@@ -114,8 +116,8 @@ class RecoveryService:
         Re-reading the destination resolves it safely: if the identifier is
         present, the write succeeded and must never be repeated.
 
-        Returns the items whose status changed.  Items that remain unknown stay
-        ambiguous so a human can decide.
+        Returns the items whose status changed. Items that are ABSENT or UNKNOWN
+        stay ambiguous so they are never blindly auto-replayed.
         """
 
         del entity_type_matches  # Reserved for per-type resolution policies.
@@ -126,13 +128,32 @@ class RecoveryService:
             identifier = item.destination_id
             if not identifier:
                 continue
-            if _state_contains(state, item, identifier):
+            try:
+                presence = state.presence(item.entity_type, identifier)
+            except InvalidDestinationSectionError:
+                continue
+
+            if presence is DestinationPresence.PRESENT:
                 item.mark(ItemStatus.TRANSFERRED, error=None)
                 item.last_failure_kind = None
                 self._items.update(item)
                 resolved.append(item)
                 self._logger.info(
-                    "event=ambiguity_resolved job_id=%s item_id=%s source_id=%s",
+                    "event=ambiguity_resolved job_id=%s item_id=%s source_id=%s presence=present",
+                    job_id,
+                    item.id,
+                    item.source_id,
+                )
+            elif presence is DestinationPresence.ABSENT:
+                self._logger.info(
+                    "event=ambiguity_unresolved job_id=%s item_id=%s source_id=%s presence=absent",
+                    job_id,
+                    item.id,
+                    item.source_id,
+                )
+            elif presence is DestinationPresence.UNKNOWN:
+                self._logger.info(
+                    "event=ambiguity_unresolved job_id=%s item_id=%s source_id=%s presence=unknown",
                     job_id,
                     item.id,
                     item.source_id,
@@ -154,20 +175,19 @@ class RecoveryService:
 
 
 def _state_contains(state: DestinationState, item: TransferItem, identifier: str) -> bool:
-    """Return whether a destination state already contains an identifier."""
+    """Return whether a destination state contains an identifier.
 
-    if item.entity_type.value == "track":
-        return state.has_track(identifier)
-    if item.entity_type.value == "album":
-        return identifier in state.album_ids
-    if item.entity_type.value == "artist":
-        return identifier in state.artist_ids
-    if item.entity_type.value == "playlist":
-        return identifier in state.playlist_ids
-    return False
+    Deprecated: Prefer explicit `state.presence()`.
+    """
+
+    try:
+        return state.presence(item.entity_type, identifier) is DestinationPresence.PRESENT
+    except InvalidDestinationSectionError:
+        return False
 
 
 def job_status_for_recovery(job: TransferJob) -> JobStatus:
     """Return the status a job should carry while awaiting recovery."""
 
     return JobStatus.PAUSED if not job.is_finished else job.status
+

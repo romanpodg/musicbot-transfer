@@ -226,9 +226,9 @@ class DestinationState:
         """Query observed presence within a canonical destination section.
 
         Returns:
-            PRESENT: The section is complete and identifier was observed.
-            ABSENT: The section is complete and identifier was not observed.
-            UNKNOWN: The section is not complete (unread, failed, or partial).
+            PRESENT: The section is complete, not incomplete, and identifier was observed.
+            ABSENT: The section is complete, not incomplete, and identifier was not observed.
+            UNKNOWN: The section is not complete (unread, failed, contradictory, or partial).
 
         Raises:
             InvalidDestinationSectionError: If section is not a known destination section.
@@ -238,6 +238,8 @@ class DestinationState:
                 f"invalid_destination_section:{section}",
                 section=section,
             )
+        if section in self.incomplete_sections:
+            return DestinationPresence.UNKNOWN
         if section not in self.complete_sections:
             return DestinationPresence.UNKNOWN
 
@@ -259,11 +261,20 @@ class DestinationState:
 
     def has_track(self, track_id: str | None) -> bool:
         """Return whether a track id is known to be present."""
-        return bool(track_id) and track_id in self.track_ids
+        if not track_id:
+            return False
+        return (
+            self.presence(EntityType.TRACK, track_id)
+            is DestinationPresence.PRESENT
+        )
 
     def is_trustworthy(self, section: str) -> bool:
-        """Return whether a section was read completely."""
-        return section in self.complete_sections
+        """Return whether a section was read completely and without incomplete evidence."""
+        return (
+            section in self.complete_sections
+            and section not in self.incomplete_sections
+        )
+
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible values for diagnostic plan metadata."""

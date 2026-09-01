@@ -44,11 +44,14 @@ from music_transfer.core.enums import (
     DestinationPresence,
     EntityType,
     ItemStatus,
+    JobStatus,
     Platform,
     PreconditionExpectation,
     TransferOperation,
 )
 from music_transfer.core.errors import (
+    AuthenticationError,
+    AuthorizationError,
     DestinationPresenceUnknownError,
     InvalidDestinationSectionError,
     PlanStaleError,
@@ -110,6 +113,8 @@ class MockTidalClientForDestinationState:
         playlists: list[Any] | None = None,
         fail_tracks: bool = False,
         fail_albums: bool = False,
+        tracks_error: Exception | None = None,
+        albums_error: Exception | None = None,
     ) -> None:
         self._tracks = tracks if tracks is not None else []
         self._albums = albums if albums is not None else []
@@ -117,16 +122,22 @@ class MockTidalClientForDestinationState:
         self._playlists = playlists if playlists is not None else []
         self._fail_tracks = fail_tracks
         self._fail_albums = fail_albums
+        self._tracks_error = tracks_error
+        self._albums_error = albums_error
         self.calls: list[str] = []
 
     def liked_tracks(self, progress: Any = None) -> list[Any]:
         self.calls.append("liked_tracks")
+        if self._tracks_error is not None:
+            raise self._tracks_error
         if self._fail_tracks:
             raise RuntimeError("simulated failure in liked_tracks")
         return self._tracks
 
     def saved_albums(self, progress: Any = None) -> list[Any]:
         self.calls.append("saved_albums")
+        if self._albums_error is not None:
+            raise self._albums_error
         if self._fail_albums:
             raise RuntimeError("simulated failure in saved_albums")
         return self._albums
@@ -138,6 +149,7 @@ class MockTidalClientForDestinationState:
     def playlists(self, progress: Any = None) -> list[Any]:
         self.calls.append("playlists")
         return self._playlists
+
 
     def profile(self) -> Any:
         return None
@@ -247,6 +259,69 @@ class DestinationPresenceModelTests(unittest.TestCase):
         with self.assertRaises(InvalidDestinationSectionError):
             state.presence(EntityType.VIDEO, "123")
 
+    def test_destination_state_complete_and_incomplete_section_is_unknown(self) -> None:
+        """Contradictory state (section present in both complete and incomplete) resolves to UNKNOWN."""
+        cases = [
+            (EntityType.TRACK, "tracks", "t1", "track_ids"),
+            (EntityType.ALBUM, "albums", "a1", "album_ids"),
+            (EntityType.ARTIST, "artists", "ar1", "artist_ids"),
+            (EntityType.PLAYLIST, "playlists", "p1", "playlist_ids"),
+        ]
+        for entity_type, section, item_id, id_field in cases:
+            kwargs: dict[str, Any] = {
+                "platform": Platform.TIDAL,
+                id_field: frozenset({item_id}),
+                "complete_sections": frozenset({section}),
+                "incomplete_sections": (section,),
+            }
+            state = DestinationState(**kwargs)
+            self.assertEqual(
+                state.presence(entity_type, item_id),
+                DestinationPresence.UNKNOWN,
+                f"Contradictory state for {section} should return UNKNOWN",
+            )
+            self.assertEqual(
+                state.presence(entity_type, "missing"),
+                DestinationPresence.UNKNOWN,
+                f"Contradictory state for {section} missing item should return UNKNOWN",
+            )
+            self.assertEqual(
+                state.presence_in_section(section, item_id),
+                DestinationPresence.UNKNOWN,
+            )
+            self.assertEqual(
+                state.presence_in_section(section, "missing"),
+                DestinationPresence.UNKNOWN,
+            )
+            self.assertFalse(state.is_trustworthy(section))
+            if section == "tracks":
+                self.assertFalse(state.has_track(item_id))
+
+    def test_has_track_does_not_bypass_completeness(self) -> None:
+        """has_track only returns True when tracks section is complete and not incomplete."""
+        # Unread / default state
+        unread = DestinationState(platform=Platform.TIDAL, track_ids=frozenset({"t1"}))
+        self.assertFalse(unread.has_track("t1"))
+        self.assertFalse(unread.has_track(None))
+        self.assertFalse(unread.has_track(""))
+
+        # Incomplete state
+        incomplete = DestinationState(
+            platform=Platform.TIDAL,
+            track_ids=frozenset({"t1"}),
+            incomplete_sections=("tracks",),
+        )
+        self.assertFalse(incomplete.has_track("t1"))
+
+        # Complete state
+        complete = DestinationState(
+            platform=Platform.TIDAL,
+            track_ids=frozenset({"t1"}),
+            complete_sections=frozenset({"tracks"}),
+        )
+        self.assertTrue(complete.has_track("t1"))
+        self.assertFalse(complete.has_track("t2"))
+
     def test_destination_state_as_dict_metadata(self) -> None:
         """as_dict() serializes complete_sections and diagnostic counts."""
         state = DestinationState(
@@ -261,6 +336,7 @@ class DestinationPresenceModelTests(unittest.TestCase):
         self.assertEqual(data["album_count"], 0)
         self.assertEqual(data["complete_sections"], ["tracks"])
         self.assertEqual(data["incomplete_sections"], ["albums"])
+
 
 
 # ==============================================================================
@@ -382,6 +458,54 @@ class TidalAdapterDestinationStateTests(unittest.TestCase):
         self.assertNotIn("tracks", state.complete_sections)
         self.assertIn("tracks", state.incomplete_sections)
         self.assertEqual(state.presence(EntityType.TRACK, "t1"), DestinationPresence.UNKNOWN)
+
+    def test_tidal_destination_state_authentication_error_propagates(self) -> None:
+        """Fatal AuthenticationError from provider read propagates immediately out of get_destination_state."""
+        client = MockTidalClientForDestinationState(
+            tracks_error=AuthenticationError("authentication_failed"),
+        )
+        adapter = TidalAdapter(client)
+
+        with self.assertRaises(AuthenticationError) as ctx:
+            adapter.get_destination_state(sections=("tracks", "albums"))
+        self.assertEqual(ctx.exception.code, "authentication_failed")
+
+    def test_tidal_destination_state_authorization_error_propagates(self) -> None:
+        """Fatal AuthorizationError from provider read propagates immediately out of get_destination_state."""
+        from music_transfer.platforms.tidal.errors import TidalClientError
+
+        client = MockTidalClientForDestinationState(
+            tracks_error=TidalClientError("authorization_error"),
+        )
+        adapter = TidalAdapter(client)
+
+        with self.assertRaises(AuthorizationError) as ctx:
+            adapter.get_destination_state(sections=("tracks", "albums"))
+        self.assertEqual(ctx.exception.code, "authorization_error")
+
+    def test_tidal_destination_state_temporary_failure_remains_isolated(self) -> None:
+        """A transient failure in one section marks only that section incomplete while other sections succeed."""
+        from music_transfer.platforms.tidal.errors import TidalClientError
+
+        client = MockTidalClientForDestinationState(
+            tracks=[make_track("T1", "t1")],
+            albums_error=TidalClientError("api_timeout"),
+            artists=[make_artist("Ar1", "ar1")],
+        )
+        adapter = TidalAdapter(client)
+
+        state = adapter.get_destination_state(sections=("tracks", "albums", "artists"))
+        # Sections tracks and artists succeeded
+        self.assertIn("tracks", state.complete_sections)
+        self.assertIn("artists", state.complete_sections)
+        self.assertNotIn("albums", state.complete_sections)
+        self.assertIn("albums", state.incomplete_sections)
+
+        # Presence checks
+        self.assertEqual(state.presence(EntityType.TRACK, "t1"), DestinationPresence.PRESENT)
+        self.assertEqual(state.presence(EntityType.ARTIST, "ar1"), DestinationPresence.PRESENT)
+        self.assertEqual(state.presence(EntityType.ALBUM, "a1"), DestinationPresence.UNKNOWN)
+
 
 
 # ==============================================================================
@@ -577,6 +701,14 @@ class PlannerDestinationPresenceTests(unittest.TestCase):
             ("albums", "tracks"),
         )
 
+    def test_no_safety_sensitive_caller_uses_deprecated_boolean_membership(self) -> None:
+        """TransferPlanner and RecoveryService do not export or rely on deprecated _state_contains."""
+        from music_transfer.core.transfer import RecoveryService, TransferPlanner
+
+        self.assertFalse(hasattr(TransferPlanner, "_state_contains"))
+        self.assertFalse(hasattr(RecoveryService, "_state_contains"))
+
+
 
 # ==============================================================================
 # 4. Execution Preflight & Preconditions
@@ -686,6 +818,29 @@ class ExecutionPreflightTests(unittest.TestCase):
         self.assertEqual(destination.write_calls, [])
         self.assertIsNone(job.confirmed_plan_id)
         self.assertEqual(job.error_code, "plan_stale")
+
+    def test_execution_preflight_fatal_auth_causes_zero_writes_and_fails_job(self) -> None:
+        """When preflight encounters a fatal AuthenticationError, it transitions job to FAILED and performs 0 writes."""
+        job = self.service.create_job(Platform.TIDAL, Platform.TIDAL, content=(ContentType.LIKED_TRACKS,))
+        source = FakePlatformAdapter(tracks=[make_track("Track 1", "t1")])
+        destination = FakePlatformAdapter()
+
+        plan = self.service.analyze(job, source, destination)
+        self.service.confirm_plan(job, plan_id=plan.plan_id, revision=plan.revision, plan_hash=plan.plan_hash)
+
+        # Preflight raises fatal AuthenticationError
+        def failing_get_state(sections=None) -> DestinationState:
+            raise AuthenticationError("session_expired")
+
+        destination.get_destination_state = failing_get_state  # type: ignore[method-assign]
+
+        with self.assertRaises(AuthenticationError):
+            self.service.execute(job, destination, confirmed=True)
+
+        self.assertEqual(destination.write_calls, [])
+        self.assertEqual(job.status, JobStatus.FAILED)
+        self.assertEqual(job.error_code, "session_expired")
+
 
 
 # ==============================================================================

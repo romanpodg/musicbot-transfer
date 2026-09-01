@@ -174,20 +174,9 @@ class RecoveryService:
         }
 
 
-def _state_contains(state: DestinationState, item: TransferItem, identifier: str) -> bool:
-    """Return whether a destination state contains an identifier.
-
-    Deprecated: Prefer explicit `state.presence()`.
-    """
-
-    try:
-        return state.presence(item.entity_type, identifier) is DestinationPresence.PRESENT
-    except InvalidDestinationSectionError:
-        return False
-
-
 def job_status_for_recovery(job: TransferJob) -> JobStatus:
     """Return the status a job should carry while awaiting recovery."""
 
     return JobStatus.PAUSED if not job.is_finished else job.status
+
 

@@ -621,23 +621,9 @@ class TransferPlanner:
         )
 
     @staticmethod
-    def _state_contains(
-        state: DestinationState, entity_type: EntityType, identifier: str
-    ) -> bool:
-        """Return whether the destination already holds an identifier.
-
-        Deprecated: Prefer explicit `state.presence()`.
-        """
-
-        try:
-            return state.presence(entity_type, identifier) is DestinationPresence.PRESENT
-        except InvalidDestinationSectionError:
-            return False
-
-
-    @staticmethod
     def _metadata_for(item: Any) -> dict[str, Any]:
         """Return compact source metadata for logs, reports, and review screens."""
+
 
         title = getattr(item, "title", "") or getattr(item, "name", "")
         metadata: dict[str, Any] = {"title": str(title)}

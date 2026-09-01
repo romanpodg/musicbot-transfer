@@ -75,16 +75,27 @@ def translate_provider_error(
             ambiguous so the caller reconciles instead of replaying.
     """
 
-    if isinstance(error, (UnsupportedCapabilityError, TransferConfigurationError)):
+    if isinstance(
+        error,
+        (
+            AuthenticationError,
+            AuthorizationError,
+            UnsupportedCapabilityError,
+            TransferConfigurationError,
+        ),
+    ):
         return error
 
     reason = str(getattr(error, "reason", "") or "")
     attempts = int(getattr(error, "attempts", 0) or 0)
     if reason in UNAVAILABLE_REASONS:
         return ItemUnavailableError("item_unavailable", attempts)
-    if reason == "authorization_error":
+    if reason in ("authorization_error", "unauthorized"):
         return AuthorizationError("authorization_error")
+    if reason in ("authentication_error", "auth_error", "unauthenticated", "token_expired"):
+        return AuthenticationError("authentication_failed")
     if reason == "rate_limited":
+
         retry_after = getattr(error, "retry_after_seconds", None)
         if operation_is_write:
             return AmbiguousOperationError("rate_limited_write_unconfirmed")
@@ -96,6 +107,7 @@ def translate_provider_error(
     if isinstance(error, TidalClientError):
         return TidalClientError(reason or "provider_error", attempts)
     return PermanentPlatformError(reason or "provider_error")
+
 
 
 def is_ambiguous(error: Exception) -> bool:

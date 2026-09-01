@@ -35,6 +35,9 @@ from ...core.domain import (
 )
 from ...core.enums import EntityType, InsertionBehavior, Platform
 from ...core.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    MusicTransferError,
     TransferConfigurationError,
     UnsupportedCapabilityError,
 )
@@ -174,7 +177,9 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
         When ``sections`` is explicitly provided (e.g. ``()`` or ``("tracks",)``),
         only the requested sections are read.
         Unrequested sections remain UNKNOWN (not in complete_sections, not in incomplete_sections).
-        Failed reads are added to incomplete_sections and omitted from complete_sections.
+        Non-fatal/transient section failures are added to incomplete_sections and omitted from complete_sections.
+        Fatal errors (AuthenticationError, AuthorizationError, UnsupportedCapabilityError, TransferConfigurationError)
+        propagate immediately out of get_destination_state.
         Unknown section names fail closed before any provider read is initiated.
         """
 
@@ -193,45 +198,128 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
         state = DestinationState(platform=Platform.TIDAL)
         complete: set[str] = set()
         incomplete: list[str] = []
+
         if "tracks" in wanted:
             try:
-                state.track_ids = frozenset(
-                    track.source_id for track in self._client.liked_tracks()
+                state.track_ids = self._read_destination_section(
+                    "tracks",
+                    lambda: frozenset(track.source_id for track in self._client.liked_tracks()),
                 )
                 complete.add("tracks")
-            except Exception as error:  # noqa: BLE001 - recorded as incomplete
-                self._warn("destination_state_tracks", error)
+            except (
+                AuthenticationError,
+                AuthorizationError,
+                UnsupportedCapabilityError,
+                TransferConfigurationError,
+            ):
+                raise
+            except MusicTransferError:
                 incomplete.append("tracks")
+
         if "albums" in wanted:
             try:
-                state.album_ids = frozenset(
-                    album.source_id for album in self._client.saved_albums()
+                state.album_ids = self._read_destination_section(
+                    "albums",
+                    lambda: frozenset(album.source_id for album in self._client.saved_albums()),
                 )
                 complete.add("albums")
-            except Exception as error:  # noqa: BLE001 - recorded as incomplete
-                self._warn("destination_state_albums", error)
+            except (
+                AuthenticationError,
+                AuthorizationError,
+                UnsupportedCapabilityError,
+                TransferConfigurationError,
+            ):
+                raise
+            except MusicTransferError:
                 incomplete.append("albums")
+
         if "artists" in wanted:
             try:
-                state.artist_ids = frozenset(
-                    artist.source_id for artist in self._client.followed_artists()
+                state.artist_ids = self._read_destination_section(
+                    "artists",
+                    lambda: frozenset(artist.source_id for artist in self._client.followed_artists()),
                 )
                 complete.add("artists")
-            except Exception as error:  # noqa: BLE001 - recorded as incomplete
-                self._warn("destination_state_artists", error)
+            except (
+                AuthenticationError,
+                AuthorizationError,
+                UnsupportedCapabilityError,
+                TransferConfigurationError,
+            ):
+                raise
+            except MusicTransferError:
                 incomplete.append("artists")
+
         if "playlists" in wanted:
             try:
-                state.playlist_ids = frozenset(
-                    playlist.source_id for playlist in self._client.playlists()
+                state.playlist_ids = self._read_destination_section(
+                    "playlists",
+                    lambda: frozenset(playlist.source_id for playlist in self._client.playlists()),
                 )
                 complete.add("playlists")
-            except Exception as error:  # noqa: BLE001 - recorded as incomplete
-                self._warn("destination_state_playlists", error)
+            except (
+                AuthenticationError,
+                AuthorizationError,
+                UnsupportedCapabilityError,
+                TransferConfigurationError,
+            ):
+                raise
+            except MusicTransferError:
                 incomplete.append("playlists")
+
         state.complete_sections = frozenset(complete)
         state.incomplete_sections = tuple(incomplete)
         return state
+
+    def _read_destination_section(
+        self, section: str, reader: Any
+    ) -> frozenset[str]:
+        """Read a single destination section, translating provider errors.
+
+        Fatal errors (AuthenticationError, AuthorizationError, etc.) propagate immediately.
+        Non-fatal section failures are logged and raised as MusicTransferError for isolation.
+        """
+        try:
+            return reader()
+        except (
+            AuthenticationError,
+            AuthorizationError,
+            UnsupportedCapabilityError,
+            TransferConfigurationError,
+        ) as error:
+            self._log_failure(f"destination_state_{section}", error)
+            raise
+        except (TidalClientError, ItemUnavailableError) as error:
+            translated = translate_provider_error(error, operation_is_write=False)
+            if isinstance(
+                translated,
+                (
+                    AuthenticationError,
+                    AuthorizationError,
+                    UnsupportedCapabilityError,
+                    TransferConfigurationError,
+                ),
+            ):
+                self._log_failure(f"destination_state_{section}", translated)
+                raise translated from None
+            self._warn(f"destination_state_{section}", translated)
+            raise translated from None
+        except Exception as error:  # noqa: BLE001 - classified through translate_provider_error
+            translated = translate_provider_error(error, operation_is_write=False)
+            if isinstance(
+                translated,
+                (
+                    AuthenticationError,
+                    AuthorizationError,
+                    UnsupportedCapabilityError,
+                    TransferConfigurationError,
+                ),
+            ):
+                self._log_failure(f"destination_state_{section}", translated)
+                raise translated from None
+            self._warn(f"destination_state_{section}", translated)
+            raise translated from None
+
 
 
     def playlist_item_ids(self, playlist_id: str) -> list[str]:

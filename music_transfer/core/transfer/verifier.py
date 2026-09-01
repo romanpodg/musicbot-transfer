@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from typing import Any
 
 from ..domain import SequenceComparison, TransferItem, TransferJob, VerificationResult
@@ -51,6 +51,36 @@ def compare_sequences(
                 {"position": position, "expected": expected_id, "actual": actual_id}
             )
     return comparison
+
+
+def compare_expected_membership(
+    expected: Sequence[str],
+    actual: Collection[str],
+    *,
+    warnings: list[str] | None = None,
+) -> VerificationResult:
+    """Verify that every expected identifier is present in actual collection (expected ⊆ actual).
+
+    Set-like sections (liked tracks, albums, artists, videos, mixes) are scoped to the
+    job's expected IDs. Unrelated items in the destination library section are neither
+    unexpected nor verification failures.
+    """
+
+    expected_set = set(expected)
+    actual_set = set(actual)
+
+    missing = expected_set - actual_set
+    observed_expected = expected_set & actual_set
+
+    return VerificationResult(
+        success=not missing,
+        expected_count=len(expected_set),
+        actual_count=len(observed_expected),
+        missing=sorted(missing),
+        unexpected=[],
+        order_mismatches=[],
+        warnings=list(warnings or []),
+    )
 
 
 class TransferVerifier:
@@ -152,26 +182,26 @@ class TransferVerifier:
     def _verify_identifier_set(self, section: str, expected: Sequence[str]) -> VerificationResult:
         """Verify membership for a set-like section."""
 
+        expected_set = set(expected)
+
         try:
             state = self._destination.get_destination_state((section,))
         except UnsupportedCapabilityError as error:
             return VerificationResult(
                 success=False,
-                expected_count=len(expected),
+                expected_count=len(expected_set),
                 warnings=[f"verification_unsupported:{getattr(error, 'capability', 'unknown')}"],
             )
         ids = state.identifiers_for_section(section)
         if not state.is_trustworthy(section):
+            observed = expected_set & set(ids)
             return VerificationResult(
                 success=False,
-                expected_count=len(expected),
-                actual_count=len(ids),
+                expected_count=len(expected_set),
+                actual_count=len(observed),
                 warnings=["destination_state_incomplete"],
             )
-        actual = sorted(ids)
-        comparison = compare_sequences(expected, actual)
-        comparison.order_mismatches = []
-        return VerificationResult.from_comparison(comparison)
+        return compare_expected_membership(expected, ids)
 
     @staticmethod
     def aggregate(results: dict[str, VerificationResult]) -> VerificationResult:

@@ -488,8 +488,8 @@ class VerificationSemanticsTests(unittest.TestCase):
         assert reloaded is not None
         self.assertEqual(reloaded.verification_status, VerificationStatus.FAILED)
 
-    def test_playlist_order_mismatch_sets_verification_failed(self) -> None:
-        """When playlist items land out of expected order, verification is FAILED."""
+    def _setup_job_with_playlist(self) -> tuple[TransferJob, FakePlatformAdapter]:
+        """Create a job with a playlist container and two items confirmed."""
         job = self.service.create_job(
             new_account("src-pl"),
             new_account("dst-pl"),
@@ -569,6 +569,11 @@ class VerificationSemanticsTests(unittest.TestCase):
             revision=plan.revision,
             plan_hash=plan.plan_hash,
         )
+        return job, destination
+
+    def test_playlist_order_mismatch_sets_verification_failed(self) -> None:
+        """When playlist items land out of expected order, verification is FAILED."""
+        job, destination = self._setup_job_with_playlist()
 
         # Make destination playlist return inverted order during verification: [dst-track-b, dst-track-a]
         original_playlist_item_ids = destination.playlist_item_ids
@@ -586,8 +591,8 @@ class VerificationSemanticsTests(unittest.TestCase):
         self.assertEqual(job.verification_status, VerificationStatus.FAILED)
         self.assertEqual(result["verification_status"], VerificationStatus.FAILED)
 
-    def test_unexpected_item_sets_verification_failed(self) -> None:
-        """When destination contains unexpected items, verification is FAILED."""
+    def test_unexpected_item_in_set_section_ignores_unrelated_content(self) -> None:
+        """When set-like destination section contains unrelated items, verification is PASSED (subset semantics)."""
         job, destination = self._setup_job_with_items(["track-1"])
 
         original_state = destination.get_destination_state
@@ -600,8 +605,26 @@ class VerificationSemanticsTests(unittest.TestCase):
                 complete_sections=state.complete_sections,
             )
 
-
         destination.get_destination_state = extra_track_state  # type: ignore[method-assign]
+
+        result = self.service.execute(job, destination, confirmed=True)
+        self.assertEqual(job.status, JobStatus.COMPLETED)
+        self.assertEqual(job.verification_status, VerificationStatus.PASSED)
+        self.assertEqual(result["verification_status"], VerificationStatus.PASSED)
+
+    def test_unexpected_item_in_playlist_sets_verification_failed(self) -> None:
+        """When destination playlist contains unexpected items, playlist verification is FAILED (exact sequence semantics)."""
+        job, destination = self._setup_job_with_playlist()
+
+        original_playlist_item_ids = destination.playlist_item_ids
+
+        def extra_playlist_items(playlist_id: str) -> list[str]:
+            ids = original_playlist_item_ids(playlist_id)
+            if len(ids) == 2:
+                return list(ids) + ["unexpected-playlist-track"]
+            return ids
+
+        destination.playlist_item_ids = extra_playlist_items  # type: ignore[method-assign]
 
         result = self.service.execute(job, destination, confirmed=True)
         self.assertEqual(job.status, JobStatus.COMPLETED)

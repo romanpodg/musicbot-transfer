@@ -268,15 +268,9 @@ are decoupled concepts:
 
 ### Section Verification Rules
 
-- **Set-like sections** (liked tracks, albums, artists): membership only.
-- **Playlists**: membership **and** order.
-- Duplicates are compared as multisets, so `A, B, A` verifies correctly.
-
-`SequenceComparison` reports `missing`, `unexpected`, and `order_mismatches`
-separately. Order mismatches are capped at 50 so a large library cannot flood a
-report. If the destination cannot be read back, the result is
-`success=False` with a `verification_unsupported:` warning — never a silent
-pass.
+- **Set-like sections** (liked tracks, albums, artists, videos, mixes): subset membership (`expected ⊆ actual`). Verification proves that every job-expected destination ID is present in the destination library section. Unrelated pre-existing items in the destination account are outside job scope and do not populate `unexpected` or fail verification. `actual_count` counts observed expected IDs.
+- **Playlists**: exact container comparison (membership, duplicate counts, **and** exact order). `SequenceComparison` reports `missing`, `unexpected`, and `order_mismatches` separately. Duplicates are compared as multisets (`A, B, A`).
+- Order mismatches in playlists are capped at 50 so a large library cannot flood a report. If the destination cannot be read back, the result is `success=False` with a `verification_unsupported:` warning — never a silent pass.
 
 ---
 

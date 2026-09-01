@@ -43,7 +43,12 @@ from .planner import (
     validate_transfer_content_support,
 )
 from .recovery import RecoveryService
-from .verifier import TransferVerifier, aggregate_verification_status, compare_sequences
+from .verifier import (
+    TransferVerifier,
+    aggregate_verification_status,
+    compare_expected_membership,
+    compare_sequences,
+)
 
 __all__ = [
     "CONTENT_SPECS",
@@ -63,6 +68,7 @@ __all__ = [
     "apply_logical_order",
     "build_report",
     "can_transition",
+    "compare_expected_membership",
     "compare_sequences",
     "content_sections",
     "is_terminal",

@@ -373,11 +373,16 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
         raw_order = self._read("playlist_media_order", self._client.playlist_media_order, playlist_id)
         refs: list[PlaylistMediaRef] = []
         for entry in raw_order:
-            kind = str(entry.get("kind", "")).lower()
-            media_id = str(entry.get("id", ""))
+            media_id = str(entry.get("id", "") or "")
             if not media_id:
-                continue
-            entity_type = EntityType.VIDEO if kind == "video" else EntityType.TRACK
+                raise TidalClientError("provider_id_missing")
+            kind = str(entry.get("kind", "") or "").lower()
+            if kind == "video":
+                entity_type = EntityType.VIDEO
+            elif kind == "track":
+                entity_type = EntityType.TRACK
+            else:
+                raise TidalClientError("playlist_media_type_unsupported")
             refs.append(PlaylistMediaRef(entity_type=entity_type, media_id=media_id))
         return refs
 

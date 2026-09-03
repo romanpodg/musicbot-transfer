@@ -695,31 +695,60 @@ class PlaylistRecoveryTests(unittest.TestCase):
         job = self.service.create_job(
             Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
         )
-        tracks = [
-            track("A", identifier="a"),
-            track("X", identifier="x"),
-            track("B", identifier="b"),
-        ]
-        source = FakePlatformAdapter(
-            display_name="source", playlists=[playlist("Pl1", tracks)]
+        container_item = TransferItem.create(
+            job.id, EntityType.PLAYLIST, Platform.TIDAL, "pl1", Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
         )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id, EntityType.PLAYLIST_ITEM, Platform.TIDAL, "a", Platform.TIDAL,
+            container_source_id="pl1", original_position=0, write_position=0,
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            playlist_item_type=EntityType.TRACK,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.container_destination_id = "dst-pl1"
+        item_a.status = ItemStatus.TRANSFERRED
+
+        item_x = TransferItem.create(
+            job.id, EntityType.PLAYLIST_ITEM, Platform.TIDAL, "x", Platform.TIDAL,
+            container_source_id="pl1", original_position=1, write_position=None,
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            playlist_item_type=EntityType.TRACK,
+        )
+        item_x.container_destination_id = "dst-pl1"
+        item_x.mark(ItemStatus.NOT_FOUND)
+
+        item_b = TransferItem.create(
+            job.id, EntityType.PLAYLIST_ITEM, Platform.TIDAL, "b", Platform.TIDAL,
+            container_source_id="pl1", original_position=2, write_position=1,
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            playlist_item_type=EntityType.TRACK,
+        )
+        item_b.destination_id = "dst-b"
+        item_b.container_destination_id = "dst-pl1"
+        item_b.status = ItemStatus.TRANSFERRED
+
+        self.service.items.add_many([container_item, item_a, item_x, item_b])
+
         destination = FakePlatformAdapter(
             display_name="destination",
             tracks=[track("A", identifier="dst-a"), track("B", identifier="dst-b")],
         )
-        destination.can_reuse_identifier = lambda et, sp: False
-        self.service.analyze(job, source, destination)
-        self.service.confirm_plan(
-            job,
-            plan_id=job.active_plan_id,
-            revision=job.active_plan_revision,
-            plan_hash=job.active_plan_hash,
+        destination.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[
+                    PlaylistItem(position=1, track=track("A", identifier="dst-a")),
+                    PlaylistItem(position=2, track=track("B", identifier="dst-b")),
+                ],
+            )
         )
 
-        self.service.execute(job, destination, confirmed=True)
-        self.assertEqual(destination.playlist_item_ids("dst-pl1"), ["dst-a", "dst-b"])
-
-        # Run verifier directly
         verifier = TransferVerifier(destination)
         completed_items = self.service.items.list_for_job(job.id)
         results = verifier.verify_job(job, completed_items)

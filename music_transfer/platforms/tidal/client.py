@@ -359,13 +359,30 @@ class TidalLibraryClient:
             operation="playlist_order_read",
             logger=self._logger,
         )
-        return [
-            {
-                "kind": "video" if "video" in type(item).__name__.lower() else "track",
-                "id": _required_id(item),
-            }
-            for item in items
-        ]
+        result: list[dict[str, str]] = []
+        for item in items:
+            if isinstance(item, dict):
+                media_id = str(item.get("id") or "")
+                if not media_id:
+                    raise TidalClientError("provider_id_missing")
+                raw_kind = str(item.get("kind") or "").lower()
+                if raw_kind == "video":
+                    kind = "video"
+                elif raw_kind == "track":
+                    kind = "track"
+                else:
+                    raise TidalClientError("playlist_media_type_unsupported")
+            else:
+                media_id = _required_id(item)
+                type_name = type(item).__name__.lower()
+                if "video" in type_name:
+                    kind = "video"
+                elif "track" in type_name:
+                    kind = "track"
+                else:
+                    raise TidalClientError("playlist_media_type_unsupported")
+            result.append({"kind": kind, "id": media_id})
+        return result
 
     def playlist_item_ids(self, playlist_id: str) -> list[str]:
         """Return the exact media id sequence of a playlist.

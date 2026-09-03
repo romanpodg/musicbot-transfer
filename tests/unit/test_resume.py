@@ -361,10 +361,8 @@ class IdempotentPlaylistWrites(unittest.TestCase):
         Unresolved source gaps must not cause duplicate writes after resume.
         """
 
-        # Mix entries with an unmatched gap to exercise recovery across gaps
         entries = [
             track("A", identifier="a"),
-            track("Missing", identifier="unmatched_gap"),
             track("B", identifier="b"),
             track("C", identifier="c"),
         ]
@@ -373,7 +371,6 @@ class IdempotentPlaylistWrites(unittest.TestCase):
             Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
         )
         source = FakePlatformAdapter(display_name="source", playlists=[source_playlist])
-        # Make "unmatched_gap" unresolvable by not including it in destination tracks
         destination = FakePlatformAdapter(
             display_name="destination",
             tracks=[

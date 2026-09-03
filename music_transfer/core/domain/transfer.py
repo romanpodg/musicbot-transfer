@@ -398,13 +398,22 @@ class TransferItem:
     updated_at: str = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
-        if self.playlist_item_type is None and self.entity_type is EntityType.PLAYLIST_ITEM:
+        if self.playlist_item_type is not None:
+            if self.playlist_item_type not in (EntityType.TRACK, EntityType.VIDEO):
+                raise InvalidPersistedStateError(
+                    f"Unsupported playlist_item_type '{self.playlist_item_type}'"
+                )
+            if self.entity_type is not EntityType.PLAYLIST_ITEM:
+                raise InvalidPersistedStateError(
+                    f"playlist_item_type '{self.playlist_item_type}' not allowed for entity_type '{self.entity_type}'"
+                )
+        elif self.entity_type is EntityType.PLAYLIST_ITEM:
             meta = self.source_metadata or {}
             if meta.get("kind") == "video":
                 self.playlist_item_type = EntityType.VIDEO
             elif meta.get("kind") == "unresolved":
                 self.playlist_item_type = None
-            elif not meta or "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+            elif meta.get("kind") in (None, "track"):
                 self.playlist_item_type = EntityType.TRACK
 
     @classmethod
@@ -589,21 +598,37 @@ class TransferItem:
         else:
             mutation_state = MutationState.NONE
 
-        raw_playlist_item_type = value.get("playlist_item_type")
-        if raw_playlist_item_type is not None:
-            try:
-                playlist_item_type = EntityType(str(raw_playlist_item_type))
-            except ValueError:
+        if "playlist_item_type" in value:
+            raw_playlist_item_type = value["playlist_item_type"]
+            if raw_playlist_item_type is not None:
+                try:
+                    parsed_type = EntityType(str(raw_playlist_item_type))
+                except ValueError as err:
+                    raise InvalidPersistedStateError(
+                        f"Invalid persisted playlist_item_type '{raw_playlist_item_type}'"
+                    ) from err
+                if parsed_type not in (EntityType.TRACK, EntityType.VIDEO):
+                    raise InvalidPersistedStateError(
+                        f"Unsupported playlist_item_type '{raw_playlist_item_type}'"
+                    )
+                if entity_type is not EntityType.PLAYLIST_ITEM:
+                    raise InvalidPersistedStateError(
+                        f"playlist_item_type '{parsed_type}' not allowed for entity_type '{entity_type}'"
+                    )
+                playlist_item_type = parsed_type
+            else:
                 playlist_item_type = None
         else:
             if entity_type is EntityType.PLAYLIST_ITEM:
                 meta = value.get("source_metadata") or {}
                 if meta.get("kind") == "video":
                     playlist_item_type = EntityType.VIDEO
-                elif "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+                elif meta.get("kind") == "unresolved":
+                    playlist_item_type = None
+                elif meta.get("kind") in (None, "track"):
                     playlist_item_type = EntityType.TRACK
                 else:
-                    playlist_item_type = EntityType.TRACK
+                    playlist_item_type = None
             else:
                 playlist_item_type = None
 
@@ -724,13 +749,22 @@ class TransferPlanItem:
     source_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.playlist_item_type is None and self.entity_type is EntityType.PLAYLIST_ITEM:
+        if self.playlist_item_type is not None:
+            if self.playlist_item_type not in (EntityType.TRACK, EntityType.VIDEO):
+                raise InvalidPersistedStateError(
+                    f"Unsupported playlist_item_type '{self.playlist_item_type}'"
+                )
+            if self.entity_type is not EntityType.PLAYLIST_ITEM:
+                raise InvalidPersistedStateError(
+                    f"playlist_item_type '{self.playlist_item_type}' not allowed for entity_type '{self.entity_type}'"
+                )
+        elif self.entity_type is EntityType.PLAYLIST_ITEM:
             meta = self.source_metadata or {}
             if meta.get("kind") == "video":
                 object.__setattr__(self, "playlist_item_type", EntityType.VIDEO)
             elif meta.get("kind") == "unresolved":
                 pass
-            elif not meta or "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+            elif meta.get("kind") in (None, "track"):
                 object.__setattr__(self, "playlist_item_type", EntityType.TRACK)
 
     def as_dict(self) -> dict[str, Any]:
@@ -757,21 +791,37 @@ class TransferPlanItem:
     def from_dict(cls, value: dict[str, Any]) -> TransferPlanItem:
         """Rebuild a plan item snapshot from persisted data."""
         entity_type = EntityType(str(value.get("entity_type")))
-        raw_playlist_item_type = value.get("playlist_item_type")
-        if raw_playlist_item_type is not None:
-            try:
-                playlist_item_type = EntityType(str(raw_playlist_item_type))
-            except ValueError:
+        if "playlist_item_type" in value:
+            raw_playlist_item_type = value["playlist_item_type"]
+            if raw_playlist_item_type is not None:
+                try:
+                    parsed_type = EntityType(str(raw_playlist_item_type))
+                except ValueError as err:
+                    raise InvalidPersistedStateError(
+                        f"Invalid persisted playlist_item_type '{raw_playlist_item_type}'"
+                    ) from err
+                if parsed_type not in (EntityType.TRACK, EntityType.VIDEO):
+                    raise InvalidPersistedStateError(
+                        f"Unsupported playlist_item_type '{raw_playlist_item_type}'"
+                    )
+                if entity_type is not EntityType.PLAYLIST_ITEM:
+                    raise InvalidPersistedStateError(
+                        f"playlist_item_type '{parsed_type}' not allowed for entity_type '{entity_type}'"
+                    )
+                playlist_item_type = parsed_type
+            else:
                 playlist_item_type = None
         else:
             if entity_type is EntityType.PLAYLIST_ITEM:
                 meta = value.get("source_metadata") or {}
                 if meta.get("kind") == "video":
                     playlist_item_type = EntityType.VIDEO
-                elif "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+                elif meta.get("kind") == "unresolved":
+                    playlist_item_type = None
+                elif meta.get("kind") in (None, "track"):
                     playlist_item_type = EntityType.TRACK
                 else:
-                    playlist_item_type = EntityType.TRACK
+                    playlist_item_type = None
             else:
                 playlist_item_type = None
 
@@ -1075,20 +1125,36 @@ class TransferPlan:
                 else:
                     # Legacy TransferItem representation
                     legacy_entity = EntityType(str(item.get("entity_type", EntityType.TRACK.value)))
-                    raw_pit = item.get("playlist_item_type")
-                    if raw_pit is not None:
-                        try:
-                            pit = EntityType(str(raw_pit))
-                        except ValueError:
+                    if "playlist_item_type" in item:
+                        raw_pit = item["playlist_item_type"]
+                        if raw_pit is not None:
+                            try:
+                                parsed_pit = EntityType(str(raw_pit))
+                            except ValueError as err:
+                                raise InvalidPersistedStateError(
+                                    f"Invalid persisted playlist_item_type '{raw_pit}'"
+                                ) from err
+                            if parsed_pit not in (EntityType.TRACK, EntityType.VIDEO):
+                                raise InvalidPersistedStateError(
+                                    f"Unsupported playlist_item_type '{raw_pit}'"
+                                )
+                            if legacy_entity is not EntityType.PLAYLIST_ITEM:
+                                raise InvalidPersistedStateError(
+                                    f"playlist_item_type '{parsed_pit}' not allowed for entity_type '{legacy_entity}'"
+                                )
+                            pit = parsed_pit
+                        else:
                             pit = None
                     elif legacy_entity is EntityType.PLAYLIST_ITEM:
                         meta = item.get("source_metadata") or {}
                         if meta.get("kind") == "video":
                             pit = EntityType.VIDEO
-                        elif "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+                        elif meta.get("kind") == "unresolved":
+                            pit = None
+                        elif meta.get("kind") in (None, "track"):
                             pit = EntityType.TRACK
                         else:
-                            pit = EntityType.TRACK
+                            pit = None
                     else:
                         pit = None
                     items.append(

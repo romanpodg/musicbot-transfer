@@ -13,6 +13,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,7 @@ from music_transfer.core.domain import (
     PlaylistItem,
     PlaylistMediaRef,
     TransferItem,
+    TransferJob,
     TransferPlan,
     TransferPlanItem,
 )
@@ -33,17 +35,24 @@ from music_transfer.core.enums import (
     ContentType,
     EntityType,
     ItemStatus,
+    JobStatus,
     MatchMethod,
+    MutationState,
     Platform,
     TransferOperation,
 )
-from music_transfer.core.errors import AmbiguousOperationError
+from music_transfer.core.errors import (
+    AmbiguousOperationError,
+    InvalidPersistedStateError,
+)
 from music_transfer.core.transfer.executor import TransferExecutor
 from music_transfer.core.transfer.verifier import TransferVerifier, compare_sequences
 from music_transfer.infrastructure.persistence import (
     JsonTransferItemRepository,
     JsonTransferJobRepository,
 )
+from music_transfer.platforms.tidal.adapter import TidalAdapter
+from music_transfer.platforms.tidal.client import TidalClientError, TidalLibraryClient
 from music_transfer.platforms.tidal.mapper import playlist_item_from_tidal
 
 from tests.support import FakePlatformAdapter, track
@@ -296,6 +305,107 @@ class PlanIdentityAndCompatibilityTests(unittest.TestCase):
         item = TransferPlanItem.from_dict(legacy_dict)
         self.assertEqual(item.playlist_item_type, EntityType.TRACK)
 
+    def test_explicit_unknown_playlist_item_type_fails_closed(self) -> None:
+        """Explicit invalid playlist_item_type fails closed with InvalidPersistedStateError."""
+        bad_dict = {
+            "entity_type": "playlist_item",
+            "source_id": "item-1",
+            "destination_id": "dst-item-1",
+            "operation": "add_playlist_item",
+            "planned_status": "matched",
+            "match_method": "direct_id",
+            "match_score": 1.0,
+            "playlist_item_type": "garbage",
+        }
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferPlanItem.from_dict(bad_dict)
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferItem.from_dict(bad_dict)
+
+    def test_explicit_album_playlist_item_type_fails_closed(self) -> None:
+        """Explicit album playlist_item_type fails closed with InvalidPersistedStateError."""
+        album_dict = {
+            "entity_type": "playlist_item",
+            "source_id": "item-1",
+            "destination_id": "dst-item-1",
+            "operation": "add_playlist_item",
+            "planned_status": "matched",
+            "match_method": "direct_id",
+            "match_score": 1.0,
+            "playlist_item_type": "album",
+        }
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferPlanItem.from_dict(album_dict)
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferItem.from_dict(album_dict)
+
+    def test_missing_legacy_playlist_item_type_with_video_metadata_normalizes_to_video(self) -> None:
+        """Legacy dictionary with missing playlist_item_type and kind='video' normalizes to video."""
+        video_dict = {
+            "id": "item-1",
+            "job_id": "job-1",
+            "entity_type": "playlist_item",
+            "source_platform": "tidal",
+            "source_id": "video-1",
+            "destination_platform": "tidal",
+            "destination_id": "dst-video-1",
+            "operation": "add_playlist_item",
+            "planned_status": "matched",
+            "match_method": "direct_id",
+            "match_score": 1.0,
+            "source_metadata": {"kind": "video", "title": "A Video"},
+        }
+        item = TransferItem.from_dict(video_dict)
+        self.assertEqual(item.playlist_item_type, EntityType.VIDEO)
+        plan_item = TransferPlanItem.from_dict(video_dict)
+        self.assertEqual(plan_item.playlist_item_type, EntityType.VIDEO)
+
+    def test_missing_legacy_playlist_item_type_with_clear_track_metadata_normalizes_to_track(self) -> None:
+        """Legacy dictionary with missing playlist_item_type and track metadata normalizes to track."""
+        track_dict = {
+            "id": "item-2",
+            "job_id": "job-1",
+            "entity_type": "playlist_item",
+            "source_platform": "tidal",
+            "source_id": "track-1",
+            "destination_platform": "tidal",
+            "destination_id": "dst-track-1",
+            "operation": "add_playlist_item",
+            "planned_status": "matched",
+            "match_method": "direct_id",
+            "match_score": 1.0,
+            "source_metadata": {"isrc": "US123", "artists": ["Artist A"]},
+        }
+        item = TransferItem.from_dict(track_dict)
+        self.assertEqual(item.playlist_item_type, EntityType.TRACK)
+        plan_item = TransferPlanItem.from_dict(track_dict)
+        self.assertEqual(plan_item.playlist_item_type, EntityType.TRACK)
+
+    def test_transfer_plan_item_rejects_invalid_playlist_item_type(self) -> None:
+        """TransferPlanItem constructor rejects invalid or non-playlist_item entity types."""
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferPlanItem(
+                entity_type=EntityType.PLAYLIST_ITEM,
+                source_id="src-1",
+                destination_id="dst-1",
+                operation=TransferOperation.ADD_PLAYLIST_ITEM,
+                planned_status=ItemStatus.MATCHED,
+                match_method=MatchMethod.DIRECT_ID,
+                match_score=1.0,
+                playlist_item_type=EntityType.ALBUM,
+            )
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferPlanItem(
+                entity_type=EntityType.TRACK,
+                source_id="src-1",
+                destination_id="dst-1",
+                operation=TransferOperation.SAVE_TRACK,
+                planned_status=ItemStatus.MATCHED,
+                match_method=MatchMethod.DIRECT_ID,
+                match_score=1.0,
+                playlist_item_type=EntityType.TRACK,
+            )
+
 
 class HeterogeneousPlannerTests(unittest.TestCase):
     """Planner tests for heterogeneous playlist items and fail-closed sequence semantics."""
@@ -502,6 +612,221 @@ class HeterogeneousPlannerTests(unittest.TestCase):
         self.assertEqual(container.planned_status, ItemStatus.PENDING)
         self.assertEqual(plan.warnings, [])
 
+    def test_track_not_found_blocks_entire_playlist(self) -> None:
+        """TRACK -> NOT_FOUND blocks entire parent playlist sequence."""
+        t_a = track("Track A", identifier="a")
+        t_b = track("Track B", identifier="b")
+        v_v = LibraryRecord(source_platform=Platform.TIDAL, source_id="v", title="Video V")
+        pl = Playlist(
+            source_platform=Platform.TIDAL,
+            source_id="pl1",
+            name="Mix",
+            tracks=[
+                PlaylistItem(position=1, track=t_a),
+                PlaylistItem(position=2, track=t_b),
+                PlaylistItem(position=3, video=v_v),
+            ],
+        )
+        source = FakePlatformAdapter(display_name="source", playlists=[pl])
+        # Destination only has Track A and Video V, so Track B is NOT_FOUND
+        destination = FakePlatformAdapter(
+            display_name="destination",
+            tracks=[track("Track A", identifier="dst-a")],
+            videos=[LibraryRecord(source_platform=Platform.TIDAL, source_id="v", title="Video V")],
+        )
+        destination.can_reuse_identifier = lambda et, sp: False
+
+        self.service.analyze(self.job, source, destination)
+        plan = self.service.plans.get_by_id(self.job.active_plan_id)
+        assert plan is not None
+
+        parent_pl = next(it for it in plan.items if it.entity_type is EntityType.PLAYLIST)
+        self.assertEqual(parent_pl.planned_status, ItemStatus.AMBIGUOUS)
+
+        items = self.service.items.list_for_job(self.job.id)
+        parent_item = next(it for it in items if it.entity_type is EntityType.PLAYLIST)
+        self.assertEqual(parent_item.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(parent_item.last_error, "playlist_sequence_unresolved")
+
+        child_items = [it for it in items if it.entity_type is EntityType.PLAYLIST_ITEM]
+        self.assertEqual(len(child_items), 3)
+        for child in child_items:
+            self.assertIsNone(child.write_position)
+
+        item_b = next(it for it in child_items if it.source_id == "b")
+        self.assertEqual(item_b.status, ItemStatus.NOT_FOUND)
+
+    def test_track_ambiguous_blocks_entire_playlist(self) -> None:
+        """TRACK -> AMBIGUOUS blocks entire parent playlist sequence."""
+        t_a = track("Track A", identifier="a")
+        t_b = track("Track B", identifier="b")
+        t_c = track("Track C", identifier="c")
+        pl = Playlist(
+            source_platform=Platform.TIDAL,
+            source_id="pl1",
+            name="Mix",
+            tracks=[
+                PlaylistItem(position=1, track=t_a),
+                PlaylistItem(position=2, track=t_b),
+                PlaylistItem(position=3, track=t_c),
+            ],
+        )
+        source = FakePlatformAdapter(display_name="source", playlists=[pl])
+        destination = FakePlatformAdapter(
+            display_name="destination",
+            tracks=[
+                track("Track A", identifier="dst-a"),
+                track("Track B", identifier="dst-b1"),
+                track("Track B", identifier="dst-b2"),
+                track("Track C", identifier="dst-c"),
+            ],
+        )
+        destination.can_reuse_identifier = lambda et, sp: False
+        # Mock search to return 2 identical candidates for Track B, making it AMBIGUOUS
+        destination.search_track = lambda t, limit=5: (  # type: ignore[method-assign]
+            [track("Track B", identifier="dst-b1"), track("Track B", identifier="dst-b2")]
+            if t.title == "Track B"
+            else [track(t.title, identifier=f"dst-{t.source_id}")]
+        )
+
+        self.service.analyze(self.job, source, destination)
+        items = self.service.items.list_for_job(self.job.id)
+        parent_item = next(it for it in items if it.entity_type is EntityType.PLAYLIST)
+        self.assertEqual(parent_item.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(parent_item.last_error, "playlist_sequence_unresolved")
+
+        child_items = [it for it in items if it.entity_type is EntityType.PLAYLIST_ITEM]
+        for child in child_items:
+            self.assertIsNone(child.write_position)
+
+    def test_mixed_playlist_with_track_not_found_has_zero_write_positions(self) -> None:
+        """Mixed playlist with one NOT_FOUND track gives write_position = None to all items."""
+        t_a = track("Track A", identifier="a")
+        t_b = track("Track B", identifier="b")
+        v_v = LibraryRecord(source_platform=Platform.TIDAL, source_id="v", title="Video V")
+        pl = Playlist(
+            source_platform=Platform.TIDAL,
+            source_id="pl1",
+            name="Mix",
+            tracks=[
+                PlaylistItem(position=1, track=t_a),
+                PlaylistItem(position=2, track=t_b),
+                PlaylistItem(position=3, video=v_v),
+            ],
+        )
+        source = FakePlatformAdapter(display_name="source", playlists=[pl])
+        destination = FakePlatformAdapter(
+            display_name="destination",
+            tracks=[track("Track A", identifier="dst-a")],
+            videos=[LibraryRecord(source_platform=Platform.TIDAL, source_id="v", title="Video V")],
+        )
+        destination.can_reuse_identifier = lambda et, sp: False
+
+        self.service.analyze(self.job, source, destination)
+        items = self.service.items.list_for_job(self.job.id)
+        child_items = [it for it in items if it.entity_type is EntityType.PLAYLIST_ITEM]
+        for child in child_items:
+            self.assertIsNone(child.write_position)
+
+    def test_blocked_track_playlist_produces_zero_remote_writes(self) -> None:
+        """Blocked playlist produces zero create_playlist and zero add_playlist_item/add_playlist_media calls."""
+        t_a = track("Track A", identifier="a")
+        t_b = track("Track B", identifier="b")
+        v_v = LibraryRecord(source_platform=Platform.TIDAL, source_id="v", title="Video V")
+        pl = Playlist(
+            source_platform=Platform.TIDAL,
+            source_id="pl1",
+            name="Mix",
+            tracks=[
+                PlaylistItem(position=1, track=t_a),
+                PlaylistItem(position=2, track=t_b),
+                PlaylistItem(position=3, video=v_v),
+            ],
+        )
+        source = FakePlatformAdapter(display_name="source", playlists=[pl])
+        destination = FakePlatformAdapter(
+            display_name="destination",
+            tracks=[track("Track A", identifier="dst-a")],
+            videos=[LibraryRecord(source_platform=Platform.TIDAL, source_id="v", title="Video V")],
+        )
+        destination.can_reuse_identifier = lambda et, sp: False
+
+        self.service.analyze(self.job, source, destination)
+        self.service.confirm_plan(
+            self.job,
+            plan_id=self.job.active_plan_id,
+            revision=self.job.active_plan_revision,
+            plan_hash=self.job.active_plan_hash,
+        )
+
+        create_calls = []
+        destination.create_playlist = lambda name: (create_calls.append(name) or "dst-pl1")  # type: ignore[method-assign]
+        write_calls = []
+        destination.add_playlist_item = lambda pid, tid: write_calls.append((pid, tid))  # type: ignore[method-assign]
+        destination.add_playlist_media = lambda pid, ref: write_calls.append((pid, ref))  # type: ignore[method-assign]
+
+        self.service.execute(self.job, destination, confirmed=True)
+
+        self.assertEqual(len(create_calls), 0)
+        self.assertEqual(len(write_calls), 0)
+
+    def test_track_resolution_failure_does_not_block_sibling_playlist(self) -> None:
+        """One blocked playlist does not block independent sibling playlists."""
+        pl_blocked = Playlist(
+            source_platform=Platform.TIDAL,
+            source_id="pl_fail",
+            name="Blocked",
+            tracks=[
+                PlaylistItem(position=1, track=track("Track A", identifier="a")),
+                PlaylistItem(position=2, track=track("Missing", identifier="missing")),
+            ],
+        )
+        pl_ok = Playlist(
+            source_platform=Platform.TIDAL,
+            source_id="pl_ok",
+            name="Ok",
+            tracks=[
+                PlaylistItem(position=1, track=track("Track C", identifier="c")),
+                PlaylistItem(position=2, track=track("Track D", identifier="d")),
+            ],
+        )
+        source = FakePlatformAdapter(display_name="source", playlists=[pl_blocked, pl_ok])
+        destination = FakePlatformAdapter(
+            display_name="destination",
+            tracks=[
+                track("Track A", identifier="dst-a"),
+                track("Track C", identifier="dst-c"),
+                track("Track D", identifier="dst-d"),
+            ],
+        )
+        destination.can_reuse_identifier = lambda et, sp: False
+
+        self.service.analyze(self.job, source, destination)
+        self.service.confirm_plan(
+            self.job,
+            plan_id=self.job.active_plan_id,
+            revision=self.job.active_plan_revision,
+            plan_hash=self.job.active_plan_hash,
+        )
+
+        items = self.service.items.list_for_job(self.job.id)
+        pl_blocked_item = next(it for it in items if it.source_id == "pl_fail")
+        pl_ok_item = next(it for it in items if it.source_id == "pl_ok")
+
+        self.assertEqual(pl_blocked_item.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(pl_ok_item.status, ItemStatus.PENDING)
+
+        pl_ok_children = [
+            it for it in items if it.container_source_id == "pl_ok" and it.entity_type is EntityType.PLAYLIST_ITEM
+        ]
+        self.assertEqual(len(pl_ok_children), 2)
+        self.assertEqual(pl_ok_children[0].write_position, 0)
+        self.assertEqual(pl_ok_children[1].write_position, 1)
+
+        self.service.execute(self.job, destination, confirmed=True)
+        self.assertEqual(destination.playlist_item_ids("dst-pl_ok"), ["dst-c", "dst-d"])
+        self.assertNotIn("dst-pl_fail", [p.source_id for p in destination.playlists])
+
 
 class HeterogeneousExecutionAndRecoveryTests(unittest.TestCase):
     """Execution, reconciliation, and recovery tests for heterogeneous media sequences."""
@@ -659,6 +984,57 @@ class HeterogeneousExecutionAndRecoveryTests(unittest.TestCase):
         self.assertEqual(len(destination.playlists), 0)
         self.assertEqual(len(destination.write_calls), 0)
 
+    def test_executor_inconclusive_readback_does_not_blindly_retry(self) -> None:
+        """Malformed/inconclusive destination readback marks item AMBIGUOUS and issues 0 remote writes."""
+        job = self.service.create_job(
+            Platform.TIDAL, Platform.TIDAL, content=(ContentType.PLAYLISTS,)
+        )
+        destination = FakePlatformAdapter(display_name="destination")
+        container_item = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST,
+            Platform.TIDAL,
+            "pl1",
+            Platform.TIDAL,
+            operation=TransferOperation.CREATE_PLAYLIST,
+        )
+        container_item.destination_id = "dst-pl1"
+        container_item.status = ItemStatus.TRANSFERRED
+
+        item_a = TransferItem.create(
+            job.id,
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "a",
+            Platform.TIDAL,
+            original_position=0,
+            write_position=0,
+            container_source_id="pl1",
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            mutation_state=MutationState.IN_FLIGHT,
+            playlist_item_type=EntityType.TRACK,
+        )
+        item_a.destination_id = "dst-a"
+        item_a.container_destination_id = "dst-pl1"
+        item_a.status = ItemStatus.MATCHED
+        self.service.items.add_many([container_item, item_a])
+        job.status = JobStatus.IMPORTING
+        self.service.jobs.update(job)
+
+        # Make destination.playlist_media_order fail (malformed readback)
+        destination.playlist_media_order = MagicMock(side_effect=RuntimeError("unknown/malformed occurrence"))  # type: ignore[method-assign]
+
+        remote_writes: list[Any] = []
+        destination.add_playlist_item = lambda cid, tid: remote_writes.append((cid, tid))  # type: ignore[method-assign]
+        destination.add_playlist_media = lambda cid, ref: remote_writes.append((cid, ref))  # type: ignore[method-assign]
+
+        self.service.resume(job, destination, confirmed=True)
+
+        reconciled = next(it for it in self.service.items.list_for_job(job.id) if it.id == item_a.id)
+        self.assertEqual(reconciled.status, ItemStatus.AMBIGUOUS)
+        self.assertEqual(reconciled.last_error, "playlist_state_inconclusive")
+        self.assertEqual(len(remote_writes), 0, "must issue zero remote writes on inconclusive readback")
+
 
 class HeterogeneousVerificationTests(unittest.TestCase):
     """Verifier tests for typed media sequences."""
@@ -735,6 +1111,146 @@ class HeterogeneousVerificationTests(unittest.TestCase):
         self.assertFalse(res_fail.success)
         self.assertEqual(res_fail.missing, ["track:v1"])
         self.assertEqual(res_fail.unexpected, ["video:v1"])
+
+    def test_verifier_fails_when_transferred_playlist_item_type_missing(self) -> None:
+        """Verifier fails closed when a transferred playlist item has playlist_item_type=None."""
+        dest = FakePlatformAdapter()
+        t = track("Track 1", identifier="t1")
+        dest.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[PlaylistItem(position=1, track=t)],
+            )
+        )
+        item = TransferItem.create(
+            "job-1",
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "t1",
+            Platform.TIDAL,
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            original_position=0,
+            write_position=0,
+        )
+        item.destination_id = "t1"
+        item.container_destination_id = "dst-pl1"
+        item.status = ItemStatus.TRANSFERRED
+        # Force missing playlist_item_type to test fail-closed verifier
+        item.playlist_item_type = None
+
+        verifier = TransferVerifier(dest)
+        job = TransferJob(
+            id="job-1",
+            source_platform=Platform.TIDAL,
+            destination_platform=Platform.TIDAL,
+        )
+        results = verifier.verify_job(job, [item])
+        pl_res = results.get("playlist:dst-pl1")
+        self.assertIsNotNone(pl_res)
+        assert pl_res is not None
+        self.assertFalse(pl_res.success)
+        self.assertIn("playlist_item_type_missing", pl_res.warnings)
+
+    def test_verifier_does_not_default_missing_type_to_track(self) -> None:
+        """Verifier does not treat missing playlist_item_type as TRACK even if destination has TRACK."""
+        dest = FakePlatformAdapter()
+        t = track("Track 123", identifier="123")
+        dest.playlists.append(
+            Playlist(
+                source_platform=Platform.TIDAL,
+                source_id="dst-pl1",
+                name="Pl1",
+                tracks=[PlaylistItem(position=1, track=t)],
+            )
+        )
+        item = TransferItem.create(
+            "job-1",
+            EntityType.PLAYLIST_ITEM,
+            Platform.TIDAL,
+            "123",
+            Platform.TIDAL,
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            original_position=0,
+            write_position=0,
+        )
+        item.destination_id = "123"
+        item.container_destination_id = "dst-pl1"
+        item.status = ItemStatus.TRANSFERRED
+        item.playlist_item_type = None
+
+        verifier = TransferVerifier(dest)
+        job = TransferJob(
+            id="job-1",
+            source_platform=Platform.TIDAL,
+            destination_platform=Platform.TIDAL,
+        )
+        results = verifier.verify_job(job, [item])
+        self.assertFalse(results["playlist:dst-pl1"].success)
+
+
+class TidalStrictReadbackTests(unittest.TestCase):
+    """Tests for strict typed readback in TidalLibraryClient and TidalAdapter."""
+
+    def test_tidal_playlist_media_order_rejects_unknown_media_kind(self) -> None:
+        """TidalLibraryClient and TidalAdapter reject unknown media kinds during readback."""
+        client = TidalLibraryClient(MagicMock(), logging.getLogger("test"))
+        fake_playlist = MagicMock()
+
+        class UnknownMedia:
+            id = "item-1"
+
+        fake_playlist.items.side_effect = lambda limit=100, offset=0: [UnknownMedia()] if offset == 0 else []
+        client._playlist = MagicMock(return_value=fake_playlist)  # type: ignore[method-assign]
+
+        with self.assertRaises(TidalClientError) as ctx:
+            client.playlist_media_order("pl-1")
+        self.assertEqual(ctx.exception.reason, "playlist_media_type_unsupported")
+
+        # Also test TidalAdapter
+        adapter = TidalAdapter(client)
+        client.playlist_media_order = MagicMock(return_value=[{"id": "item-1", "kind": "podcast"}])  # type: ignore[method-assign]
+        with self.assertRaises(TidalClientError) as ctx_adapter:
+            adapter.playlist_media_order("pl-1")
+        self.assertEqual(ctx_adapter.exception.reason, "playlist_media_type_unsupported")
+
+    def test_tidal_playlist_media_order_rejects_missing_media_id(self) -> None:
+        """TidalLibraryClient and TidalAdapter reject playlist entries without an identifier."""
+        client = TidalLibraryClient(MagicMock(), logging.getLogger("test"))
+        fake_playlist = MagicMock()
+
+        class TrackWithoutId:
+            pass
+
+        fake_playlist.items.side_effect = lambda limit=100, offset=0: [TrackWithoutId()] if offset == 0 else []
+        client._playlist = MagicMock(return_value=fake_playlist)  # type: ignore[method-assign]
+
+        with self.assertRaises(TidalClientError) as ctx:
+            client.playlist_media_order("pl-1")
+        self.assertEqual(ctx.exception.reason, "provider_id_missing")
+
+        # Also test TidalAdapter
+        adapter = TidalAdapter(client)
+        client.playlist_media_order = MagicMock(return_value=[{"id": "", "kind": "track"}])  # type: ignore[method-assign]
+        with self.assertRaises(TidalClientError) as ctx_adapter:
+            adapter.playlist_media_order("pl-1")
+        self.assertEqual(ctx_adapter.exception.reason, "provider_id_missing")
+
+    def test_unknown_tidal_playlist_object_is_not_classified_as_track(self) -> None:
+        """Non-track, non-video objects must not default to track."""
+        client = TidalLibraryClient(MagicMock(), logging.getLogger("test"))
+        fake_playlist = MagicMock()
+
+        class OtherMedia:
+            id = "other-1"
+
+        fake_playlist.items.side_effect = lambda limit=100, offset=0: [OtherMedia()] if offset == 0 else []
+        client._playlist = MagicMock(return_value=fake_playlist)  # type: ignore[method-assign]
+
+        with self.assertRaises(TidalClientError) as ctx:
+            client.playlist_media_order("pl-1")
+        self.assertEqual(ctx.exception.reason, "playlist_media_type_unsupported")
 
 
 if __name__ == "__main__":

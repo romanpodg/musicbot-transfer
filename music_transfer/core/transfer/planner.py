@@ -912,12 +912,7 @@ class TransferPlanner:
                 if not planned_item.is_executable():
                     err_code = planned_item.last_error or "playlist_item_unresolved"
                     warnings.append(f"{err_code}:{playlist.source_id}:{position}")
-                    if planned_item.last_error in (
-                        "playlist_item_unresolved",
-                        "playlist_item_resolution_unsupported:video",
-                        "playlist_item_resolution_unsupported:track",
-                    ):
-                        blocks_playlist = True
+                    blocks_playlist = True
 
             if blocks_playlist:
                 playlist_item.status = ItemStatus.AMBIGUOUS

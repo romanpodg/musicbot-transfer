@@ -164,13 +164,26 @@ class TransferVerifier:
                 item.write_position if item.write_position is not None else item.original_position,
             )
         )
+        failed_playlists: dict[str, list[str]] = {}
         for item in playlist_items:
             container = item.container_destination_id or ""
+            if not container:
+                continue
+            if item.playlist_item_type not in (EntityType.TRACK, EntityType.VIDEO):
+                failed_playlists.setdefault(container, []).append("playlist_item_type_missing")
+                continue
             bucket = playlists.setdefault(container, [])
-            item_type = item.playlist_item_type or EntityType.TRACK
-            bucket.append(PlaylistMediaRef(item_type, item.destination_id))
+            bucket.append(PlaylistMediaRef(item.playlist_item_type, item.destination_id))
+
+        for container_id, errors in failed_playlists.items():
+            results[f"playlist:{container_id}"] = VerificationResult(
+                success=False,
+                missing=list(errors),
+                warnings=list(errors),
+            )
+
         for container_id, expected in playlists.items():
-            if not container_id:
+            if not container_id or container_id in failed_playlists:
                 continue
             results[f"playlist:{container_id}"] = self.verify_playlist(container_id, expected)
 

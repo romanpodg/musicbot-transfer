@@ -201,11 +201,20 @@ class TransferVerifier:
                         continue
 
                     dest_folder = dest_folders_by_id[fid]
-                    expected_title = (
-                        f_item.source_metadata.get("name")
-                        or f_item.source_metadata.get("title")
-                        or f_item.source_id
+                    raw_title = (
+                        (f_item.source_metadata.get("name") or f_item.source_metadata.get("title"))
+                        if f_item.source_metadata
+                        else None
                     )
+                    expected_title = str(raw_title).strip() if raw_title else ""
+                    if not expected_title:
+                        results[f"folder:{fid}"] = VerificationResult(
+                            success=False,
+                            missing=["folder_name_missing"],
+                            warnings=["folder_name_missing"],
+                        )
+                        continue
+
                     parent_src = f_item.container_source_id
                     if parent_src is None:
                         expected_parent_dest = None

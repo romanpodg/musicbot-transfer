@@ -653,6 +653,91 @@ class VerificationTests(unittest.TestCase):
 
         self.assertEqual(aggregate_verification_status(results), VerificationStatus.PARTIAL)
 
+    def test_folder_verification_fails_when_confirmed_name_missing(self) -> None:
+        dest = FakePlatformAdapter()
+        dest.folders = [_make_folder_rec("dst-f1", "Folder 1", parent_id=None)]
+
+        f1_item = TransferItem.create(
+            "j1", EntityType.FOLDER, Platform.TIDAL, "src-folder-123", Platform.TIDAL,
+            operation=TransferOperation.CREATE_FOLDER,
+            source_metadata={},  # Missing name/title
+        )
+        f1_item.destination_id = "dst-f1"
+        f1_item.status = ItemStatus.TRANSFERRED
+
+        verifier = TransferVerifier(dest)
+        job = TransferJob.create(Platform.TIDAL, Platform.TIDAL, requested_content=(ContentType.PLAYLISTS,))
+        results = verifier.verify_job(job, [f1_item])
+
+        folder_result = results["folder:dst-f1"]
+        self.assertFalse(folder_result.success)
+        self.assertIn("folder_name_missing", folder_result.warnings)
+        self.assertNotEqual(aggregate_verification_status(results), VerificationStatus.PASSED)
+
+    def test_folder_verification_does_not_use_source_id_as_name_fallback(self) -> None:
+        dest = FakePlatformAdapter()
+        dest.folders = [_make_folder_rec("dst-f1", "src-folder-123", parent_id=None)]
+
+        f1_item = TransferItem.create(
+            "j1", EntityType.FOLDER, Platform.TIDAL, "src-folder-123", Platform.TIDAL,
+            operation=TransferOperation.CREATE_FOLDER,
+            source_metadata={},  # Confirmed name missing; destination title equals source_id
+        )
+        f1_item.destination_id = "dst-f1"
+        f1_item.status = ItemStatus.TRANSFERRED
+
+        verifier = TransferVerifier(dest)
+        job = TransferJob.create(Platform.TIDAL, Platform.TIDAL, requested_content=(ContentType.PLAYLISTS,))
+        results = verifier.verify_job(job, [f1_item])
+
+        folder_result = results["folder:dst-f1"]
+        self.assertFalse(folder_result.success)
+        self.assertIn("folder_name_missing", folder_result.warnings)
+        self.assertNotEqual(aggregate_verification_status(results), VerificationStatus.PASSED)
+
+    def test_folder_verification_fails_on_wrong_title(self) -> None:
+        dest = FakePlatformAdapter()
+        dest.folders = [_make_folder_rec("dst-f1", "Different Destination Title", parent_id=None)]
+
+        f1_item = TransferItem.create(
+            "j1", EntityType.FOLDER, Platform.TIDAL, "f1", Platform.TIDAL,
+            operation=TransferOperation.CREATE_FOLDER,
+            source_metadata={"name": "Expected Title"},
+        )
+        f1_item.destination_id = "dst-f1"
+        f1_item.status = ItemStatus.TRANSFERRED
+
+        verifier = TransferVerifier(dest)
+        job = TransferJob.create(Platform.TIDAL, Platform.TIDAL, requested_content=(ContentType.PLAYLISTS,))
+        results = verifier.verify_job(job, [f1_item])
+
+        folder_result = results["folder:dst-f1"]
+        self.assertFalse(folder_result.success)
+        self.assertIn("title_mismatch", folder_result.missing)
+        self.assertEqual(aggregate_verification_status(results), VerificationStatus.FAILED)
+
+    def test_folder_verification_fails_on_wrong_parent(self) -> None:
+        dest = FakePlatformAdapter()
+        dest.folders = [_make_folder_rec("dst-f1", "Folder 1", parent_id="wrong-parent-id")]
+
+        f1_item = TransferItem.create(
+            "j1", EntityType.FOLDER, Platform.TIDAL, "f1", Platform.TIDAL,
+            operation=TransferOperation.CREATE_FOLDER,
+            source_metadata={"name": "Folder 1"},
+        )
+        f1_item.container_source_id = None  # Expected root (None)
+        f1_item.destination_id = "dst-f1"
+        f1_item.status = ItemStatus.TRANSFERRED
+
+        verifier = TransferVerifier(dest)
+        job = TransferJob.create(Platform.TIDAL, Platform.TIDAL, requested_content=(ContentType.PLAYLISTS,))
+        results = verifier.verify_job(job, [f1_item])
+
+        folder_result = results["folder:dst-f1"]
+        self.assertFalse(folder_result.success)
+        self.assertIn("parent_mismatch", folder_result.missing)
+        self.assertEqual(aggregate_verification_status(results), VerificationStatus.FAILED)
+
 
 class TidalAdapterFolderTests(unittest.TestCase):
     """Section 49: TIDAL adapter allowlist and folder root mapping."""

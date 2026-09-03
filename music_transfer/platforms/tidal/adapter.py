@@ -31,6 +31,7 @@ from ...core.domain import (
     LibrarySnapshot,
     Playlist,
     PlaylistItem,
+    PlaylistMediaRef,
     Track,
 )
 from ...core.enums import EntityType, InsertionBehavior, Platform
@@ -367,8 +368,21 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
 
 
 
+    def playlist_media_order(self, playlist_id: str) -> list[PlaylistMediaRef]:
+        """Return the exact typed media sequence of a destination playlist."""
+        raw_order = self._read("playlist_media_order", self._client.playlist_media_order, playlist_id)
+        refs: list[PlaylistMediaRef] = []
+        for entry in raw_order:
+            kind = str(entry.get("kind", "")).lower()
+            media_id = str(entry.get("id", ""))
+            if not media_id:
+                continue
+            entity_type = EntityType.VIDEO if kind == "video" else EntityType.TRACK
+            refs.append(PlaylistMediaRef(entity_type=entity_type, media_id=media_id))
+        return refs
+
     def playlist_item_ids(self, playlist_id: str) -> list[str]:
-        return self._read("playlist_item_ids", self._client.playlist_item_ids, playlist_id)
+        return [ref.media_id for ref in self.playlist_media_order(playlist_id)]
 
     # -- search ------------------------------------------------------------
 
@@ -412,7 +426,7 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
         except Exception as error:  # noqa: BLE001 - classified immediately below
             raise translate_provider_error(error, operation_is_write=True) from None
 
-    def add_playlist_item(self, playlist_id: str, track_id: str) -> None:
+    def add_playlist_item(self, playlist_id: str, media: PlaylistMediaRef | str) -> None:
         """Append one item, allowing duplicates.
 
         Raises:
@@ -420,12 +434,17 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
             UnavailableError: When the item is not available to this account.
         """
 
+        media_id = media.media_id if isinstance(media, PlaylistMediaRef) else str(media)
         try:
-            self._client.add_playlist_item(playlist_id, track_id)
+            self._client.add_playlist_item(playlist_id, media_id)
         except (TidalClientError, ItemUnavailableError) as error:
             raise translate_provider_error(error, operation_is_write=True) from None
         except Exception as error:  # noqa: BLE001 - classified immediately below
             raise translate_provider_error(error, operation_is_write=True) from None
+
+    def add_playlist_media(self, playlist_id: str, media: PlaylistMediaRef) -> None:
+        """Append one typed media item, allowing duplicates."""
+        self.add_playlist_item(playlist_id, media)
 
     def create_folder(self, name: str, parent_id: str | None = None) -> str:
         target_parent = "root" if parent_id is None else parent_id

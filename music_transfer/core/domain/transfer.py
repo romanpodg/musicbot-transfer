@@ -393,8 +393,19 @@ class TransferItem:
     mutation_state: MutationState = MutationState.NONE
     last_error: str | None = None
     last_failure_kind: str | None = None
+    playlist_item_type: EntityType | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
+
+    def __post_init__(self) -> None:
+        if self.playlist_item_type is None and self.entity_type is EntityType.PLAYLIST_ITEM:
+            meta = self.source_metadata or {}
+            if meta.get("kind") == "video":
+                self.playlist_item_type = EntityType.VIDEO
+            elif meta.get("kind") == "unresolved":
+                self.playlist_item_type = None
+            elif not meta or "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+                self.playlist_item_type = EntityType.TRACK
 
     @classmethod
     def create(
@@ -411,6 +422,7 @@ class TransferItem:
         source_metadata: dict[str, Any] | None = None,
         operation: TransferOperation = TransferOperation.NONE,
         mutation_state: MutationState = MutationState.NONE,
+        playlist_item_type: EntityType | None = None,
     ) -> TransferItem:
         """Create a pending item with a fresh identifier."""
 
@@ -427,6 +439,7 @@ class TransferItem:
             source_metadata=dict(source_metadata or {}),
             operation=operation,
             mutation_state=mutation_state,
+            playlist_item_type=playlist_item_type,
         )
 
     def touch(self) -> None:
@@ -521,6 +534,9 @@ class TransferItem:
             "operation": str(self.operation),
             "mutation_state": str(self.mutation_state),
             "attempt_count": self.attempt_count,
+            "playlist_item_type": (
+                self.playlist_item_type.value if self.playlist_item_type is not None else None
+            ),
             "last_error": self.last_error,
             "last_failure_kind": self.last_failure_kind,
             "created_at": self.created_at,
@@ -573,6 +589,24 @@ class TransferItem:
         else:
             mutation_state = MutationState.NONE
 
+        raw_playlist_item_type = value.get("playlist_item_type")
+        if raw_playlist_item_type is not None:
+            try:
+                playlist_item_type = EntityType(str(raw_playlist_item_type))
+            except ValueError:
+                playlist_item_type = None
+        else:
+            if entity_type is EntityType.PLAYLIST_ITEM:
+                meta = value.get("source_metadata") or {}
+                if meta.get("kind") == "video":
+                    playlist_item_type = EntityType.VIDEO
+                elif "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+                    playlist_item_type = EntityType.TRACK
+                else:
+                    playlist_item_type = EntityType.TRACK
+            else:
+                playlist_item_type = None
+
         raw_write_position = value.get("write_position")
         write_position = int(raw_write_position) if raw_write_position is not None else None
 
@@ -595,6 +629,7 @@ class TransferItem:
             operation=operation,
             mutation_state=mutation_state,
             attempt_count=int(value.get("attempt_count", 0)),
+            playlist_item_type=playlist_item_type,
             last_error=value.get("last_error"),
             last_failure_kind=value.get("last_failure_kind"),
             created_at=str(value.get("created_at", utc_now())),
@@ -613,6 +648,9 @@ class TransferItem:
             "operation": self.operation.value,
             "original_position": self.original_position,
             "planned_status": self.status.value,
+            "playlist_item_type": (
+                self.playlist_item_type.value if self.playlist_item_type is not None else None
+            ),
             "source_id": self.source_id,
             "source_metadata": canonicalize_metadata(self.source_metadata),
             "write_position": self.write_position,
@@ -682,7 +720,18 @@ class TransferPlanItem:
     container_destination_id: str | None = None
     original_position: int | None = None
     write_position: int | None = None
+    playlist_item_type: EntityType | None = None
     source_metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.playlist_item_type is None and self.entity_type is EntityType.PLAYLIST_ITEM:
+            meta = self.source_metadata or {}
+            if meta.get("kind") == "video":
+                object.__setattr__(self, "playlist_item_type", EntityType.VIDEO)
+            elif meta.get("kind") == "unresolved":
+                pass
+            elif not meta or "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+                object.__setattr__(self, "playlist_item_type", EntityType.TRACK)
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible values."""
@@ -698,14 +747,36 @@ class TransferPlanItem:
             "container_destination_id": self.container_destination_id,
             "original_position": self.original_position,
             "write_position": self.write_position,
+            "playlist_item_type": (
+                self.playlist_item_type.value if self.playlist_item_type is not None else None
+            ),
             "source_metadata": dict(self.source_metadata),
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> TransferPlanItem:
         """Rebuild a plan item snapshot from persisted data."""
+        entity_type = EntityType(str(value.get("entity_type")))
+        raw_playlist_item_type = value.get("playlist_item_type")
+        if raw_playlist_item_type is not None:
+            try:
+                playlist_item_type = EntityType(str(raw_playlist_item_type))
+            except ValueError:
+                playlist_item_type = None
+        else:
+            if entity_type is EntityType.PLAYLIST_ITEM:
+                meta = value.get("source_metadata") or {}
+                if meta.get("kind") == "video":
+                    playlist_item_type = EntityType.VIDEO
+                elif "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+                    playlist_item_type = EntityType.TRACK
+                else:
+                    playlist_item_type = EntityType.TRACK
+            else:
+                playlist_item_type = None
+
         return cls(
-            entity_type=EntityType(str(value.get("entity_type"))),
+            entity_type=entity_type,
             source_id=str(value.get("source_id", "")),
             destination_id=value.get("destination_id"),
             operation=TransferOperation(str(value.get("operation", TransferOperation.NONE.value))),
@@ -724,6 +795,7 @@ class TransferPlanItem:
                 if value.get("write_position") is not None
                 else None
             ),
+            playlist_item_type=playlist_item_type,
             source_metadata=dict(value.get("source_metadata") or {}),
         )
 
@@ -739,6 +811,9 @@ class TransferPlanItem:
             "operation": self.operation.value,
             "original_position": self.original_position,
             "planned_status": self.planned_status.value,
+            "playlist_item_type": (
+                self.playlist_item_type.value if self.playlist_item_type is not None else None
+            ),
             "source_id": self.source_id,
             "source_metadata": canonicalize_metadata(self.source_metadata),
             "write_position": self.write_position,
@@ -999,9 +1074,26 @@ class TransferPlan:
                     items.append(TransferPlanItem.from_dict(item))
                 else:
                     # Legacy TransferItem representation
+                    legacy_entity = EntityType(str(item.get("entity_type", EntityType.TRACK.value)))
+                    raw_pit = item.get("playlist_item_type")
+                    if raw_pit is not None:
+                        try:
+                            pit = EntityType(str(raw_pit))
+                        except ValueError:
+                            pit = None
+                    elif legacy_entity is EntityType.PLAYLIST_ITEM:
+                        meta = item.get("source_metadata") or {}
+                        if meta.get("kind") == "video":
+                            pit = EntityType.VIDEO
+                        elif "isrc" in meta or "artists" in meta or meta.get("kind") == "track":
+                            pit = EntityType.TRACK
+                        else:
+                            pit = EntityType.TRACK
+                    else:
+                        pit = None
                     items.append(
                         TransferPlanItem(
-                            entity_type=EntityType(str(item.get("entity_type", EntityType.TRACK.value))),
+                            entity_type=legacy_entity,
                             source_id=str(item.get("source_id", "")),
                             destination_id=item.get("destination_id"),
                             operation=TransferOperation(str(item.get("operation", TransferOperation.NONE.value))),
@@ -1012,6 +1104,7 @@ class TransferPlan:
                             container_destination_id=item.get("container_destination_id"),
                             original_position=item.get("original_position"),
                             write_position=item.get("write_position"),
+                            playlist_item_type=pit,
                             source_metadata=dict(item.get("source_metadata") or {}),
                         )
                     )

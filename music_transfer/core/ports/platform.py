@@ -33,6 +33,7 @@ from ..domain import (
     LibrarySnapshot,
     Playlist,
     PlaylistItem,
+    PlaylistMediaRef,
     Track,
 )
 from ..enums import DestinationPresence, EntityType, InsertionBehavior, OperationKind, Platform
@@ -408,6 +409,7 @@ class MusicPlatformAdapter(ABC):
             "get_playlists",
             "get_playlist_items",
             "get_destination_state",
+            "playlist_media_order",
             "playlist_item_ids",
             "search_track",
             "search_album",
@@ -426,6 +428,7 @@ class MusicPlatformAdapter(ABC):
             "save_mix",
             "create_playlist",
             "add_playlist_item",
+            "add_playlist_media",
             "add_playlist_items",
             "create_folder",
         }
@@ -520,16 +523,32 @@ class MusicPlatformAdapter(ABC):
             "capability_unsupported", capability="supports_already_exists_detection"
         )
 
-    def playlist_item_ids(self, playlist_id: str) -> list[str]:
-        """Return the exact media id sequence of a destination playlist.
+    def playlist_media_order(self, playlist_id: str) -> list[PlaylistMediaRef]:
+        """Return the exact typed media sequence of a destination playlist.
 
-        Read-only.  Essential for resuming an interrupted playlist write and
-        for order verification.  Duplicates appear once per occurrence.
+        Read-only. Essential for resuming an interrupted playlist write and
+        for order and type verification. Duplicates appear once per occurrence.
         """
 
         raise UnsupportedCapabilityError(
             "capability_unsupported", capability="read_playlists"
         )
+
+    def playlist_item_ids(self, playlist_id: str) -> list[str]:
+        """Return the exact media id sequence of a destination playlist.
+
+        Read-only. Preserved for backward compatibility; derives media IDs
+        from :meth:`playlist_media_order` when not overridden directly.
+        """
+
+        try:
+            return [ref.media_id for ref in self.playlist_media_order(playlist_id)]
+        except UnsupportedCapabilityError:
+            raise
+        except Exception:
+            raise UnsupportedCapabilityError(
+                "capability_unsupported", capability="read_playlists"
+            ) from None
 
     # --- search -----------------------------------------------------------
 
@@ -615,7 +634,18 @@ class MusicPlatformAdapter(ABC):
             "capability_unsupported", capability="write_playlist_items"
         )
 
-    def add_playlist_items(self, playlist_id: str, track_ids: list[str]) -> int:
+    def add_playlist_media(self, playlist_id: str, media: PlaylistMediaRef) -> None:
+        """Append one typed media item to a destination playlist.
+
+        Default implementation unpacks the media ID and delegates to
+        :meth:`add_playlist_item`.
+        """
+
+        self.add_playlist_item(playlist_id, media.media_id)
+
+    def add_playlist_items(
+        self, playlist_id: str, media_items: list[PlaylistMediaRef | str]
+    ) -> int:
         """Append several items at once; return how many were accepted.
 
         Only meaningful when the adapter declares

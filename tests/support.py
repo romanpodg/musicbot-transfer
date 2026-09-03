@@ -19,6 +19,7 @@ from music_transfer.core.domain import (
     LibrarySnapshot,
     Playlist,
     PlaylistItem,
+    PlaylistMediaRef,
     Track,
 )
 from music_transfer.core.enums import EntityType, Platform
@@ -289,14 +290,34 @@ class FakePlatformAdapter(MusicPlatformAdapter):
                 return list(item.tracks)
         return []
 
+    def playlist_media_order(self, playlist_id: str) -> list[PlaylistMediaRef]:
+        """Return the destination media refs of one playlist, in order."""
+        if "playlist_media_order" in self.fail_on:
+            if self.error_factory is not None:
+                raise self.error_factory()
+            raise RuntimeError("simulated failure in playlist_media_order")
+
+        if "playlist_item_ids" in self.__dict__:
+            raw_ids = self.playlist_item_ids(playlist_id)
+            return [PlaylistMediaRef(EntityType.TRACK, str(x)) for x in raw_ids]
+
+        refs: list[PlaylistMediaRef] = []
+        for item in self.get_playlist_items(playlist_id):
+            if item.track is not None:
+                refs.append(PlaylistMediaRef(EntityType.TRACK, item.track.source_id))
+            elif item.video is not None:
+                refs.append(PlaylistMediaRef(EntityType.VIDEO, item.video.source_id))
+        return refs
+
     def playlist_item_ids(self, playlist_id: str) -> list[str]:
         """Return the destination track ids of one playlist, in order."""
-
-        return [
-            item.track.source_id
-            for item in self.get_playlist_items(playlist_id)
-            if item.track is not None
-        ]
+        if "playlist_item_ids" in self.__dict__:
+            return [
+                item.track.source_id
+                for item in self.get_playlist_items(playlist_id)
+                if item.track is not None
+            ]
+        return [ref.media_id for ref in self.playlist_media_order(playlist_id)]
 
     def export_library(self, sections=None, progress=None) -> LibrarySnapshot:
         """Return the configured library."""
@@ -473,17 +494,42 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         )
         return identifier
 
-    def add_playlist_item(self, playlist_id: str, track_id: str) -> None:
-        """Append an item to a playlist, preserving duplicates."""
-
-        self._record("add_playlist_item", playlist_id, track_id)
+    def _raw_add(self, playlist_id: str, media: PlaylistMediaRef) -> None:
+        self._record("add_playlist_item", playlist_id, media.media_id)
         for item in self.playlists:
             if item.source_id == playlist_id:
-                item.tracks.append(
-                    PlaylistItem(position=len(item.tracks) + 1, track=track(track_id, identifier=track_id))
-                )
+                pos = len(item.tracks) + 1
+                if media.entity_type is EntityType.VIDEO:
+                    item.tracks.append(
+                        PlaylistItem(
+                            position=pos,
+                            video=LibraryRecord(
+                                source_platform=self._platform,
+                                source_id=media.media_id,
+                                title=f"Video {media.media_id}",
+                            ),
+                        )
+                    )
+                else:
+                    item.tracks.append(
+                        PlaylistItem(
+                            position=pos,
+                            track=track(media.media_id, identifier=media.media_id),
+                        )
+                    )
                 return
         raise LookupError(f"unknown playlist: {playlist_id}")
+
+    def add_playlist_media(self, playlist_id: str, media: PlaylistMediaRef) -> None:
+        """Append a typed media item to a playlist."""
+        if "add_playlist_item" in self.__dict__:
+            self.add_playlist_item(playlist_id, media.media_id)
+            return
+        self._raw_add(playlist_id, media)
+
+    def add_playlist_item(self, playlist_id: str, track_id: str) -> None:
+        """Append an item to a playlist, preserving duplicates."""
+        self._raw_add(playlist_id, PlaylistMediaRef(EntityType.TRACK, str(track_id)))
 
     def create_folder(self, name: str, parent_id: str | None = None) -> str:
         """Create a playlist folder and return its identifier."""

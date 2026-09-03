@@ -15,7 +15,13 @@ from collections import Counter
 from collections.abc import Collection, Sequence
 from typing import Any
 
-from ..domain import SequenceComparison, TransferItem, TransferJob, VerificationResult
+from ..domain import (
+    PlaylistMediaRef,
+    SequenceComparison,
+    TransferItem,
+    TransferJob,
+    VerificationResult,
+)
 from ..enums import EntityType, ItemStatus, VerificationStatus
 from ..errors import UnsupportedCapabilityError
 from ..ports import MusicPlatformAdapter, destination_section_for_entity
@@ -27,28 +33,35 @@ MAX_REPORTED_ORDER_MISMATCHES = 50
 
 
 def compare_sequences(
-    expected: Sequence[str], actual: Sequence[str]
+    expected: Sequence[Any], actual: Sequence[Any]
 ) -> SequenceComparison:
-    """Compare an expected id sequence against the actual one.
+    """Compare an expected id or media sequence against the actual one.
 
     Duplicates are compared as multisets, so a playlist that legitimately
     contains a track twice is verified correctly.
     """
 
+    def _format(val: Any) -> str:
+        if hasattr(val, "canonical_token"):
+            return str(val.canonical_token())
+        return str(val)
+
     expected_counter = Counter(expected)
     actual_counter = Counter(actual)
+    missing = [_format(x) for x in (expected_counter - actual_counter).elements()]
+    unexpected = [_format(x) for x in (actual_counter - expected_counter).elements()]
     comparison = SequenceComparison(
         expected_count=len(expected),
         actual_count=len(actual),
-        missing=sorted((expected_counter - actual_counter).elements()),
-        unexpected=sorted((actual_counter - expected_counter).elements()),
+        missing=sorted(missing),
+        unexpected=sorted(unexpected),
     )
     for position, (expected_id, actual_id) in enumerate(zip(expected, actual, strict=False)):
         if len(comparison.order_mismatches) >= MAX_REPORTED_ORDER_MISMATCHES:
             break
         if expected_id != actual_id:
             comparison.order_mismatches.append(
-                {"position": position, "expected": expected_id, "actual": actual_id}
+                {"position": position, "expected": _format(expected_id), "actual": _format(actual_id)}
             )
     return comparison
 
@@ -93,7 +106,9 @@ class TransferVerifier:
         self._logger = logger or _LOGGER
 
     def verify_playlist(
-        self, container_destination_id: str, expected_ids: Sequence[str]
+        self,
+        container_destination_id: str,
+        expected_ids: Sequence[PlaylistMediaRef | str],
     ) -> VerificationResult:
         """Verify one playlist's exact membership and order.
 
@@ -101,8 +116,12 @@ class TransferVerifier:
         read, rather than pretending verification succeeded.
         """
 
+        is_typed = any(isinstance(x, PlaylistMediaRef) for x in expected_ids)
         try:
-            actual = list(self._destination.playlist_item_ids(container_destination_id))
+            if is_typed:
+                actual = list(self._destination.playlist_media_order(container_destination_id))
+            else:
+                actual = list(self._destination.playlist_item_ids(container_destination_id))
         except UnsupportedCapabilityError as error:
             return VerificationResult(
                 success=False,
@@ -130,7 +149,7 @@ class TransferVerifier:
         """
 
         results: dict[str, VerificationResult] = {}
-        playlists: dict[str, list[str]] = {}
+        playlists: dict[str, list[PlaylistMediaRef]] = {}
         playlist_items = [
             item
             for item in items
@@ -148,7 +167,8 @@ class TransferVerifier:
         for item in playlist_items:
             container = item.container_destination_id or ""
             bucket = playlists.setdefault(container, [])
-            bucket.append(item.destination_id)
+            item_type = item.playlist_item_type or EntityType.TRACK
+            bucket.append(PlaylistMediaRef(item_type, item.destination_id))
         for container_id, expected in playlists.items():
             if not container_id:
                 continue

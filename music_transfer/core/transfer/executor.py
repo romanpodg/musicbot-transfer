@@ -27,6 +27,7 @@ from typing import Any
 
 from ..domain import (
     Playlist,
+    PlaylistMediaRef,
     TransferItem,
     TransferJob,
     TransferProgress,
@@ -648,9 +649,10 @@ class TransferExecutor:
         container_id = item.container_destination_id or self._find_container(all_items, item)
         if not container_id:
             raise _not_found(item)
-        if not item.destination_id:
+        if not item.destination_id or not item.playlist_item_type:
             raise _not_found(item)
-        self._reconcile(item, all_items, container_id)
+        media_ref = PlaylistMediaRef(item.playlist_item_type, item.destination_id)
+        self._reconcile(item, all_items, container_id, media_ref)
         if item.status is ItemStatus.TRANSFERRED:
             return
 
@@ -664,10 +666,13 @@ class TransferExecutor:
             raise
 
         try:
-            self._destination.add_playlist_item(container_id, item.destination_id)
+            if hasattr(self._destination, "add_playlist_media"):
+                self._destination.add_playlist_media(container_id, media_ref)
+            else:
+                self._destination.add_playlist_item(container_id, media_ref.media_id)
         except (AmbiguousOperationError, TemporaryPlatformError) as error:
             try:
-                actual = list(self._destination.playlist_item_ids(container_id))
+                actual = list(self._destination.playlist_media_order(container_id))
             except (AuthenticationError, AuthorizationError):
                 raise
             except UnsupportedCapabilityError:
@@ -683,9 +688,11 @@ class TransferExecutor:
                 raise AmbiguousOperationError("playlist_state_inconclusive") from inspect_err
 
             expected = [
-                entry.destination_id
+                PlaylistMediaRef(entry.playlist_item_type, entry.destination_id)
                 for entry in self._siblings(all_items, item.container_source_id)
-                if entry.write_position is not None and entry.destination_id
+                if entry.write_position is not None
+                and entry.destination_id
+                and entry.playlist_item_type
             ]
 
             if item.write_position is not None:
@@ -698,7 +705,7 @@ class TransferExecutor:
 
                 if (
                     len(actual) > item.write_position
-                    and actual[item.write_position] == item.destination_id
+                    and actual[item.write_position] == media_ref
                 ):
                     # The mutation actually committed remotely despite timeout/error!
                     item.mutation_state = MutationState.NONE
@@ -724,7 +731,11 @@ class TransferExecutor:
     # -- resume helpers ----------------------------------------------------
 
     def _reconcile(
-        self, item: TransferItem, all_items: list[TransferItem], container_id: str
+        self,
+        item: TransferItem,
+        all_items: list[TransferItem],
+        container_id: str,
+        media_ref: PlaylistMediaRef,
     ) -> None:
         """Skip an entry the destination already contains after a crash.
 
@@ -737,7 +748,7 @@ class TransferExecutor:
         if item.write_position is None:
             return
         try:
-            actual = list(self._destination.playlist_item_ids(container_id))
+            actual = list(self._destination.playlist_media_order(container_id))
         except (AuthenticationError, AuthorizationError):
             raise
         except UnsupportedCapabilityError as error:
@@ -754,9 +765,11 @@ class TransferExecutor:
             raise AmbiguousOperationError("playlist_state_inconclusive") from error
 
         expected = [
-            entry.destination_id
+            PlaylistMediaRef(entry.playlist_item_type, entry.destination_id)
             for entry in self._siblings(all_items, item.container_source_id)
-            if entry.write_position is not None and entry.destination_id
+            if entry.write_position is not None
+            and entry.destination_id
+            and entry.playlist_item_type
         ]
 
         if len(actual) < item.write_position:
@@ -777,7 +790,7 @@ class TransferExecutor:
             self._items.update(item)
             raise AmbiguousOperationError("playlist_resume_mismatch")
 
-        if len(actual) > item.write_position and actual[item.write_position] == item.destination_id:
+        if len(actual) > item.write_position and actual[item.write_position] == media_ref:
             # The write landed before the checkpoint was saved.
             item.mutation_state = MutationState.NONE
             item.mark(ItemStatus.TRANSFERRED)

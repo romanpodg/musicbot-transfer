@@ -543,6 +543,7 @@ class TransferPlanner:
                 container_destination_id=it.container_destination_id,
                 original_position=it.original_position,
                 write_position=it.write_position,
+                playlist_item_type=it.playlist_item_type,
                 source_metadata=dict(it.source_metadata),
             )
             for it in items
@@ -902,22 +903,42 @@ class TransferPlanner:
             if not playlist.tracks:
                 continue
             playlist_entries: list[TransferItem] = []
+            blocks_playlist = False
             for position, entry in enumerate(playlist.tracks):
-                if entry.track is None:
-                    warnings.append(f"playlist_item_unresolved:{playlist.source_id}:{position}")
-                    continue
                 planned_item = self._plan_playlist_item(
                     job, destination, playlist, entry, position, capabilities
                 )
                 playlist_entries.append(planned_item)
+                if not planned_item.is_executable():
+                    err_code = planned_item.last_error or "playlist_item_unresolved"
+                    warnings.append(f"{err_code}:{playlist.source_id}:{position}")
+                    if planned_item.last_error in (
+                        "playlist_item_unresolved",
+                        "playlist_item_resolution_unsupported:video",
+                        "playlist_item_resolution_unsupported:track",
+                    ):
+                        blocks_playlist = True
 
-            write_pos = 0
-            for item in playlist_entries:
-                if item.operation is TransferOperation.ADD_PLAYLIST_ITEM and item.is_executable():
-                    item.write_position = write_pos
-                    write_pos += 1
-                else:
+            if blocks_playlist:
+                playlist_item.status = ItemStatus.AMBIGUOUS
+                playlist_item.last_error = "playlist_sequence_unresolved"
+                warnings.append(f"playlist_sequence_unresolved:{playlist.source_id}")
+                for item in playlist_entries:
                     item.write_position = None
+                    if item.is_executable():
+                        item.status = ItemStatus.AMBIGUOUS
+                        item.last_error = "playlist_sequence_unresolved"
+            else:
+                write_pos = 0
+                for item in playlist_entries:
+                    if (
+                        item.operation is TransferOperation.ADD_PLAYLIST_ITEM
+                        and item.is_executable()
+                    ):
+                        item.write_position = write_pos
+                        write_pos += 1
+                    else:
+                        item.write_position = None
             planned.extend(playlist_entries)
         return planned
 
@@ -930,44 +951,103 @@ class TransferPlanner:
         position: int,
         capabilities: PlatformCapabilities,
     ) -> TransferItem:
-        """Plan one playlist entry, keeping its position and duplicates."""
+        """Plan one playlist entry, preserving exact media type, position, and duplicates."""
 
-        track: Track = entry.track
+        if entry.track is not None:
+            track: Track = entry.track
+            item = TransferItem.create(
+                job.id,
+                EntityType.PLAYLIST_ITEM,
+                job.source_platform,
+                track.source_id,
+                job.destination_platform,
+                original_position=position,
+                container_source_id=playlist.source_id,
+                source_metadata={
+                    "title": track.title,
+                    "artists": track.artist_names,
+                    "isrc": track.isrc,
+                    "duration_ms": track.duration_ms,
+                    "kind": "track",
+                },
+                operation=TransferOperation.ADD_PLAYLIST_ITEM,
+                playlist_item_type=EntityType.TRACK,
+            )
+            if destination.can_reuse_identifier(EntityType.TRACK, job.source_platform):
+                item.destination_id = track.source_id
+                item.match_method = _DIRECT_METHOD
+                item.match_score = 1.0
+                item.status = ItemStatus.MATCHED
+                return item
+            if capabilities.supports("search_tracks"):
+                match = self._matcher.match(track, destination.search_track(track))
+                item.match_method = match.method
+                item.match_score = match.score
+                item.destination_id = match.destination_id
+                item.status = {
+                    MatchOutcome.MATCHED: ItemStatus.MATCHED,
+                    MatchOutcome.AMBIGUOUS: ItemStatus.AMBIGUOUS,
+                    MatchOutcome.NOT_FOUND: ItemStatus.NOT_FOUND,
+                }[match.outcome]
+                if match.outcome is not MatchOutcome.MATCHED:
+                    item.last_error = match.outcome.value
+                return item
+            item.match_method = _NONE_METHOD
+            item.match_score = 0.0
+            item.destination_id = None
+            item.status = ItemStatus.NOT_FOUND
+            item.last_error = "playlist_item_resolution_unsupported:track"
+            return item
+
+        if entry.video is not None:
+            video: LibraryRecord = entry.video
+            source_meta = {"title": video.title, "kind": "video", **dict(video.metadata)}
+            item = TransferItem.create(
+                job.id,
+                EntityType.PLAYLIST_ITEM,
+                job.source_platform,
+                video.source_id,
+                job.destination_platform,
+                original_position=position,
+                container_source_id=playlist.source_id,
+                source_metadata=source_meta,
+                operation=TransferOperation.ADD_PLAYLIST_ITEM,
+                playlist_item_type=EntityType.VIDEO,
+            )
+            if destination.can_reuse_identifier(EntityType.VIDEO, job.source_platform):
+                item.destination_id = video.source_id
+                item.match_method = _DIRECT_METHOD
+                item.match_score = 1.0
+                item.status = ItemStatus.MATCHED
+                return item
+
+            # Video must never use track search; no video search capability declared
+            item.match_method = _NONE_METHOD
+            item.match_score = 0.0
+            item.destination_id = None
+            item.status = ItemStatus.NOT_FOUND
+            item.last_error = "playlist_item_resolution_unsupported:video"
+            return item
+
+        # Unresolved source occurrence: track is None and video is None
+        occurrence_id = entry.source_item_id or f"{playlist.source_id}:pos:{position}"
         item = TransferItem.create(
             job.id,
             EntityType.PLAYLIST_ITEM,
             job.source_platform,
-            track.source_id,
+            occurrence_id,
             job.destination_platform,
             original_position=position,
             container_source_id=playlist.source_id,
-            source_metadata={
-                "title": track.title,
-                "artists": track.artist_names,
-                "isrc": track.isrc,
-                "duration_ms": track.duration_ms,
-            },
+            source_metadata=dict(entry.metadata),
             operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            playlist_item_type=None,
         )
-
-        if destination.can_reuse_identifier(EntityType.TRACK, job.source_platform):
-            item.destination_id = track.source_id
-            item.match_method = _DIRECT_METHOD
-            item.match_score = 1.0
-            item.status = ItemStatus.MATCHED
-            return item
-        if capabilities.supports("search_tracks"):
-            match = self._matcher.match(track, destination.search_track(track))
-            item.match_method = match.method
-            item.match_score = match.score
-            item.destination_id = match.destination_id
-            item.status = {
-                MatchOutcome.MATCHED: ItemStatus.MATCHED,
-                MatchOutcome.AMBIGUOUS: ItemStatus.AMBIGUOUS,
-                MatchOutcome.NOT_FOUND: ItemStatus.NOT_FOUND,
-            }[match.outcome]
-            if match.outcome is not MatchOutcome.MATCHED:
-                item.last_error = match.outcome.value
+        item.match_method = _NONE_METHOD
+        item.match_score = 0.0
+        item.destination_id = None
+        item.status = ItemStatus.NOT_FOUND
+        item.last_error = "playlist_item_unresolved"
         return item
 
     # -- helpers -----------------------------------------------------------

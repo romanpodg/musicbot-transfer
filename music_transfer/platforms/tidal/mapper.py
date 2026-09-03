@@ -171,15 +171,44 @@ def playlist_item_from_tidal(value: Any, position: int) -> PlaylistItem:
     """Map one TIDAL playlist entry onto a universal :class:`PlaylistItem`.
 
     Position and per-occurrence identity are preserved so that duplicate
-    entries survive a transfer (Invariant D).
+    entries survive a transfer (Invariant D). Real videos map directly to
+    typed :class:`LibraryRecord` payloads instead of being converted into
+    Track domain objects.
     """
+
+    source_id = ensure_identifier(value)
+    date_added = date_value(value, "date_added")
+
+    if is_video(value):
+        duration_seconds = number_value(value, "duration")
+        video_meta: dict[str, Any] = {}
+        if duration_seconds is not None:
+            video_meta["duration_seconds"] = duration_seconds
+        release_date = date_value(value, "release_date", "available_release_date")
+        if release_date:
+            video_meta["release_date"] = release_date
+
+        return PlaylistItem(
+            position=position,
+            track=None,
+            video=LibraryRecord(
+                source_platform=_PLATFORM,
+                source_id=source_id,
+                title=text_value(value, "name", "title"),
+                metadata=video_meta,
+            ),
+            source_item_id=source_id,
+            date_added=date_added,
+            metadata={"kind": "video"},
+        )
 
     return PlaylistItem(
         position=position,
         track=track_from_tidal(value),
-        source_item_id=ensure_identifier(value),
-        date_added=date_value(value, "date_added"),
-        metadata={"kind": "video" if is_video(value) else "track"},
+        video=None,
+        source_item_id=source_id,
+        date_added=date_added,
+        metadata={"kind": "track"},
     )
 
 

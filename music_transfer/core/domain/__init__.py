@@ -18,7 +18,7 @@ from .matching import (
     MatchResult,
     ScoredCandidate,
 )
-from .playlist import Playlist, PlaylistItem
+from .playlist import Playlist, PlaylistItem, PlaylistMediaRef
 from .track import Track
 from .transfer import (
     PlanPrecondition,
@@ -49,6 +49,7 @@ __all__ = [
     "PlanPrecondition",
     "Playlist",
     "PlaylistItem",
+    "PlaylistMediaRef",
     "ScoredCandidate",
     "SequenceComparison",
     "Track",

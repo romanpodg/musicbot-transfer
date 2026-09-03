@@ -37,14 +37,17 @@ Provide safe, exact, platform-independent transfer of playlist folder hierarchie
   4. Playlists
   5. Playlist items (preserving sequential position)
 - Destination folder creation (`_write_folder`):
-  - Resolves parent destination ID (`None` for root, or looks up parent folder's runtime `destination_id`).
-  - Fails closed if parent destination ID is unresolved.
+  - Mandatory confirmed non-empty folder name check (`title`); rejects missing/whitespace name and never falls back to `source_id`.
+  - Resolves parent destination ID via `resolved_parent_destination_id` (parent must be confirmed `TRANSFERRED`; fails closed if missing or parent is failed/ambiguous).
+  - Dedicated recovery branch for persisted `IN_FLIGHT`: executes ONLY reconciliation and NEVER reaches `destination.create_folder()`.
   - Durably records `mutation_state = MutationState.IN_FLIGHT` before calling destination.
   - Calls `destination.create_folder(folder_name, parent_destination_id)`.
   - Records created `destination_id`, marks `TRANSFERRED`, and propagates runtime container destination ID to in-memory child folders and playlists.
-  - On timeout or ambiguous error, reconciles against destination state matching exact `(parent_id, name)`. Single match recovers destination ID; 0 or >1 matches marks `AMBIGUOUS`.
-- Failure cascade isolation:
-  - When any folder fails or is ambiguous, its source ID and destination ID are added to `blocked_containers`.
+  - On timeout or ambiguous error, reconciles against destination state matching exact `(parent_id, name)`.
+  - Explicit reconciliation outcomes: `FolderReconciliationOutcome.RECOVERED` (1 match) or `FolderReconciliationOutcome.INCONCLUSIVE` (0 or >1 matches, incomplete readback, or readback error).
+  - Zero destination matches does NOT authoritatively prove failure of a previous non-idempotent create; item transitions to `AMBIGUOUS` with 0 replay creates.
+- Failure cascade isolation across restarts:
+  - `blocked_containers` pre-seeds from persisted items with `status in (FAILED, AMBIGUOUS)` before execution begins.
   - All descendants (subfolders, playlists, and playlist items) are skipped immediately with `AMBIGUOUS` status and `container_blocked` (or `playlist_sequence_blocked` for entries).
   - Foldered playlists never fall back to root. Sibling subtrees continue normally.
 
@@ -55,12 +58,13 @@ Provide safe, exact, platform-independent transfer of playlist folder hierarchie
 - Incomplete destination sections yield `VerificationStatus.PARTIAL`.
 - Exact playlist item sequence and multiset duplicates verification preserved.
 
-### 5. TIDAL Adapter and Mapper Alignment
+### 5. Platform-Neutral Core and Provider Adapter Alignment
+- Universal root representation is strictly `None`; generic core logic (`planner`, `executor`, `verifier`) contains zero provider root sentinels (`"root"`, `""`). Legitimate identifiers named `"root"` remain ordinary identifiers.
 - `can_reuse_identifier` strictly allows catalog entities (`TRACK`, `ALBUM`, `ARTIST`, `VIDEO`, `MIX`), returning `False` for `FOLDER`, `PLAYLIST`, and `PLAYLIST_ITEM`.
 - Adapter translates universal `None` root to TIDAL SDK `"root"` parameter.
 - Client and mapper normalize `"root"` or `""` to `None`.
 
 ## Verification Results
-- 510 unit and legacy tests pass (30 dedicated Phase 1.5C tests in `tests/unit/test_playlist_folder_hierarchy.py`).
+- 525 unit and legacy tests pass (30 Phase 1.5C tests in `tests/unit/test_playlist_folder_hierarchy.py` + 15 Phase 1.5C.1 tests in `tests/unit/test_folder_resume_safety.py`).
 - 0 ruff errors.
 - 0 platform conditionals in `core/` or `app/`.

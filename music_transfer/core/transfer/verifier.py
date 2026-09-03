@@ -214,28 +214,17 @@ class TransferVerifier:
                         expected_parent_dest = parent_it.destination_id if parent_it else None
 
                     actual_parent_dest = folder_parent_source_id(dest_folder)
-                    norm_expected_parent = (
-                        None
-                        if expected_parent_dest in (None, "root", "")
-                        else str(expected_parent_dest)
-                    )
-                    norm_actual_parent = (
-                        None
-                        if actual_parent_dest in (None, "root", "")
-                        else str(actual_parent_dest)
-                    )
-
                     if dest_folder.title != expected_title:
                         results[f"folder:{fid}"] = VerificationResult(
                             success=False,
                             missing=["title_mismatch"],
                             warnings=[f"folder_title_mismatch:{dest_folder.title}!={expected_title}"],
                         )
-                    elif norm_actual_parent != norm_expected_parent:
+                    elif actual_parent_dest != expected_parent_dest:
                         results[f"folder:{fid}"] = VerificationResult(
                             success=False,
                             missing=["parent_mismatch"],
-                            warnings=[f"folder_parent_mismatch:{norm_actual_parent}!={norm_expected_parent}"],
+                            warnings=[f"folder_parent_mismatch:{actual_parent_dest}!={expected_parent_dest}"],
                         )
                     else:
                         results[f"folder:{fid}"] = VerificationResult(
@@ -257,19 +246,9 @@ class TransferVerifier:
 
                     dest_pl = dest_playlists_by_id[pid]
                     expected_folder_dest = p_item.container_destination_id
-                    norm_expected_folder = (
-                        None
-                        if expected_folder_dest in (None, "root", "")
-                        else str(expected_folder_dest)
-                    )
                     actual_folder_dest = dest_pl.folder_id
-                    norm_actual_folder = (
-                        None
-                        if actual_folder_dest in (None, "root", "")
-                        else str(actual_folder_dest)
-                    )
 
-                    if norm_actual_folder != norm_expected_folder:
+                    if actual_folder_dest != expected_folder_dest:
                         results[f"playlist_placement:{pid}"] = VerificationResult(
                             success=False,
                             missing=["playlist_folder_mismatch"],

@@ -227,6 +227,7 @@
     "folder_creation_ambiguous": "⚠️ The folder creation outcome is ambiguous and destination state could not confirm it. It was recorded for reconciliation.",
     "folder_creation_failed": "⚠️ The folder could not be created.",
     "folder_creation_unconfirmed": "⚠️ The folder may have been created, but the service did not confirm it. It was recorded for reconciliation.",
+    "folder_name_missing": "⚠️ Folder name is missing. The folder cannot be created.",
     "invalid_persisted_state": "⚠️ Saved state contains invalid or unrecognizable data.",
     "invalid_state_transition": "⚠️ Invalid job state change: {current} → {target}.",
     "item_unavailable": "⚠️ The item is not available for this account or region.",

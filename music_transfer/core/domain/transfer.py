@@ -487,7 +487,7 @@ class TransferItem:
             return bool(name or self.source_id)
 
         if self.operation is TransferOperation.CREATE_FOLDER:
-            # Creation requires folder name metadata and must not have already landed (destination_id)
+            # Creation requires non-empty folder name metadata and must not have already landed (destination_id)
             if self.destination_id is not None:
                 return False
             name = (
@@ -495,7 +495,7 @@ class TransferItem:
                 if self.source_metadata
                 else None
             )
-            return bool(name or self.source_id)
+            return bool(name and str(name).strip())
 
         return False
 

@@ -199,6 +199,7 @@ These are the rules the test suite enforces. Breaking one fails a test.
 | M | Re-planning creates a new revision and invalidates old confirmation; destination drift produces zero writes | `TransferService`, `tests/unit/test_plan_identity_and_confirmation.py` |
 | N | A transfer item must never become executable without a resolved destination identifier or explicit non-executable classification | `TransferPlanner`, `validate_plan_set_like_items`, `tests/unit/test_identifier_resolution.py` |
 | O | Foldered playlists and child folders must never execute or fall back to root when their parent container fails or is unconfirmed | `TransferExecutor`, `tests/unit/test_playlist_folder_hierarchy.py` |
+| P | A persisted in-flight folder creation must never be blindly replayed upon resume; zero destination matches must mark the item AMBIGUOUS rather than replaying create_folder | `TransferExecutor._write_folder`, `tests/unit/test_folder_resume_safety.py` |
 
 ---
 

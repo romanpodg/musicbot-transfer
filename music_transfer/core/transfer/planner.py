@@ -327,11 +327,11 @@ def source_export_sections(
 
 
 def folder_parent_source_id(record: LibraryRecord) -> str | None:
-    """Extract normalized parent folder source ID from a folder record (None = root)."""
+    """Extract parent folder source ID from a folder record (None = root)."""
     parent = record.metadata.get("parent_source_id")
     if parent is None and "parent_id" in record.metadata:
         parent = record.metadata.get("parent_id")
-    if parent in (None, "root", ""):
+    if parent is None:
         return None
     return str(parent)
 
@@ -344,11 +344,12 @@ def validate_folder_hierarchy(
 
     Rules:
     1. Every folder source_id is present, non-empty, and unique.
-    2. Each folder parent is None (root) or an existing folder source_id.
-    3. Folder cannot parent itself.
-    4. Folder graph contains no cycles.
-    5. Every non-root playlist.folder_id refers to an existing exported source folder.
-    6. Normalized hierarchy is deterministic (topological ordering, parent before child).
+    2. Every folder title/name is present and non-empty.
+    3. Each folder parent is None (root) or an existing folder source_id.
+    4. Folder cannot parent itself.
+    5. Folder graph contains no cycles.
+    6. Every non-root playlist.folder_id refers to an existing exported source folder.
+    7. Normalized hierarchy is deterministic (topological ordering, parent before child).
 
     Raises:
         TransferConfigurationError: If any hierarchy validation rule is violated.
@@ -359,6 +360,9 @@ def validate_folder_hierarchy(
         if not f.source_id or not str(f.source_id).strip():
             reason = "missing_folder_id"
             raise TransferConfigurationError(f"invalid_folder_hierarchy:{reason}")
+        if not f.title or not str(f.title).strip():
+            reason = "missing_folder_name"
+            raise TransferConfigurationError(f"invalid_folder_hierarchy:{reason}:{f.source_id}")
         fid = str(f.source_id)
         if fid in folder_map:
             raise TransferConfigurationError(f"invalid_folder_hierarchy:duplicate_folder_id:{fid}")
@@ -403,7 +407,7 @@ def validate_folder_hierarchy(
     # Validate playlist folder references
     for pl in playlists:
         pfid = pl.folder_id
-        if pfid in (None, "root", ""):
+        if pfid is None:
             continue
         if str(pfid) not in folder_map:
             raise TransferConfigurationError(
@@ -864,11 +868,7 @@ class TransferPlanner:
             planned.append(folder_item)
 
         for playlists_position, playlist in enumerate(source.playlists):
-            norm_folder_id = (
-                playlist.folder_id
-                if playlist.folder_id not in (None, "root", "")
-                else None
-            )
+            norm_folder_id = playlist.folder_id
             playlist_item = TransferItem.create(
                 job.id,
                 EntityType.PLAYLIST,

@@ -22,6 +22,7 @@ import logging
 import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 from ..domain import (
@@ -38,6 +39,7 @@ from ..errors import (
     AuthorizationError,
     MusicTransferError,
     TemporaryPlatformError,
+    TransferConfigurationError,
     UnsupportedCapabilityError,
     classify_error,
 )
@@ -48,8 +50,10 @@ __all__ = [
     "CancellationToken",
     "ExecutionOutcome",
     "ExecutionResult",
+    "FolderReconciliationOutcome",
     "TransferExecutor",
     "build_report",
+    "resolved_parent_destination_id",
     "scrub_credentials",
     "status_after_execution",
 ]
@@ -57,6 +61,26 @@ __all__ = [
 _LOGGER = logging.getLogger("music_transfer.executor")
 
 ProgressCallback = Callable[[TransferProgress], None]
+
+
+class FolderReconciliationOutcome(Enum):
+    RECOVERED = "recovered"
+    INCONCLUSIVE = "inconclusive"
+
+
+def resolved_parent_destination_id(parent_item: TransferItem | None) -> str | None:
+    """Return a usable destination ID only when the parent container is confirmed TRANSFERRED.
+
+    A parent container that is FAILED or AMBIGUOUS is unsafe to depend on,
+    even if it happens to contain a stale or conflicting destination_id.
+    """
+    if parent_item is None:
+        return None
+    if parent_item.status is not ItemStatus.TRANSFERRED:
+        return None
+    if not parent_item.destination_id:
+        return None
+    return parent_item.destination_id
 
 
 class CancellationToken:
@@ -210,6 +234,14 @@ class TransferExecutor:
         ordered = self._write_order(job, plan_items)
         total = len(ordered)
         blocked_containers: set[str] = set()
+        for it in plan_items:
+            if it.entity_type in (EntityType.FOLDER, EntityType.PLAYLIST) and it.status in (
+                ItemStatus.FAILED,
+                ItemStatus.AMBIGUOUS,
+            ):
+                blocked_containers.add(f"src:{it.source_id}")
+                if it.destination_id:
+                    blocked_containers.add(f"dst:{it.destination_id}")
         for _, item in enumerate(ordered, start=1):
             if self._cancellation.is_cancelled or job.cancellation_requested:
                 outcome.cancelled = True
@@ -434,22 +466,19 @@ class TransferExecutor:
 
         target_folder_id: str | None = None
         if item.container_source_id is not None:
-            target_folder_id = item.container_destination_id
-            if not target_folder_id:
-                parent_folder = next(
-                    (
-                        i
-                        for i in all_items
-                        if i.entity_type is EntityType.FOLDER
-                        and i.source_id == item.container_source_id
-                    ),
-                    None,
-                )
-                if parent_folder and parent_folder.destination_id:
-                    target_folder_id = parent_folder.destination_id
-                    item.container_destination_id = target_folder_id
-            if not target_folder_id:
+            parent_folder = next(
+                (
+                    i
+                    for i in all_items
+                    if i.entity_type is EntityType.FOLDER
+                    and i.source_id == item.container_source_id
+                ),
+                None,
+            )
+            target_folder_id = resolved_parent_destination_id(parent_folder)
+            if target_folder_id is None:
                 raise AmbiguousOperationError("playlist_parent_folder_destination_id_missing")
+            item.container_destination_id = target_folder_id
 
         playlist = Playlist(
             source_platform=job.source_platform,
@@ -483,34 +512,37 @@ class TransferExecutor:
 
         parent_destination_id: str | None = None
         if item.container_source_id is not None:
-            parent_destination_id = item.container_destination_id
-            if not parent_destination_id:
-                parent_folder = next(
-                    (
-                        i
-                        for i in all_items
-                        if i.entity_type is EntityType.FOLDER
-                        and i.source_id == item.container_source_id
-                    ),
-                    None,
-                )
-                if parent_folder and parent_folder.destination_id:
-                    parent_destination_id = parent_folder.destination_id
-                    item.container_destination_id = parent_destination_id
-            if not parent_destination_id:
+            parent_folder = next(
+                (
+                    i
+                    for i in all_items
+                    if i.entity_type is EntityType.FOLDER
+                    and i.source_id == item.container_source_id
+                ),
+                None,
+            )
+            parent_destination_id = resolved_parent_destination_id(parent_folder)
+            if parent_destination_id is None:
                 raise AmbiguousOperationError("parent_folder_destination_id_missing")
+            item.container_destination_id = parent_destination_id
 
-        folder_name = str(
-            item.source_metadata.get("name")
-            or item.source_metadata.get("title")
-            or item.source_id
+        raw_name = (
+            item.source_metadata.get("name") or item.source_metadata.get("title")
+            if item.source_metadata
+            else None
         )
+        folder_name = str(raw_name).strip() if raw_name else ""
+        if not folder_name:
+            raise TransferConfigurationError("folder_name_missing")
 
+        # Mandatory no-blind-replay: an item that enters _write_folder() already IN_FLIGHT
+        # must execute ONLY this recovery branch and NEVER reach create_folder().
         if item.mutation_state is MutationState.IN_FLIGHT:
-            self._reconcile_folder(item, folder_name, parent_destination_id)
-            if item.status is ItemStatus.TRANSFERRED and item.destination_id:
+            outcome = self._reconcile_folder(item, folder_name, parent_destination_id)
+            if outcome is FolderReconciliationOutcome.RECOVERED and item.destination_id:
                 self._propagate_folder_container(all_items, item.source_id, item.destination_id)
                 return
+            raise AmbiguousOperationError(item.last_error or "folder_creation_ambiguous")
 
         item.mutation_state = MutationState.IN_FLIGHT
         self._items.update(item)
@@ -531,8 +563,8 @@ class TransferExecutor:
                 parent_destination_id,
             )
         except (TemporaryPlatformError, AmbiguousOperationError) as error:
-            self._reconcile_folder(item, folder_name, parent_destination_id)
-            if item.status is ItemStatus.TRANSFERRED and item.destination_id:
+            outcome = self._reconcile_folder(item, folder_name, parent_destination_id)
+            if outcome is FolderReconciliationOutcome.RECOVERED and item.destination_id:
                 self._propagate_folder_container(all_items, item.source_id, item.destination_id)
                 return
             raise AmbiguousOperationError("folder_creation_ambiguous") from error
@@ -542,11 +574,13 @@ class TransferExecutor:
         item: TransferItem,
         folder_name: str,
         parent_destination_id: str | None,
-    ) -> None:
+    ) -> FolderReconciliationOutcome:
         """Attempt to reconcile an in-flight or failed folder creation against destination state."""
 
         try:
             snapshot = self._destination.export_library(sections=("folders",))
+        except (AuthenticationError, AuthorizationError):
+            raise
         except Exception as error:  # noqa: BLE001
             self._logger.warning(
                 "event=folder_reconciliation_failed job_id=%s item_id=%s error=%s",
@@ -557,32 +591,21 @@ class TransferExecutor:
             item.last_failure_kind = "ambiguous"
             item.mark(ItemStatus.AMBIGUOUS, error="folder_reconciliation_inconclusive")
             self._items.update(item)
-            return
+            return FolderReconciliationOutcome.INCONCLUSIVE
 
         if "folders" in snapshot.incomplete_sections:
             item.last_failure_kind = "ambiguous"
             item.mark(ItemStatus.AMBIGUOUS, error="folder_reconciliation_inconclusive")
             self._items.update(item)
-            return
+            return FolderReconciliationOutcome.INCONCLUSIVE
 
         from .planner import folder_parent_source_id
-
-        norm_expected_parent = (
-            None
-            if parent_destination_id in (None, "root", "")
-            else str(parent_destination_id)
-        )
 
         matching = [
             f
             for f in snapshot.folders
             if f.title == folder_name
-            and (
-                None
-                if folder_parent_source_id(f) in (None, "root", "")
-                else str(folder_parent_source_id(f))
-            )
-            == norm_expected_parent
+            and folder_parent_source_id(f) == parent_destination_id
         ]
 
         if len(matching) == 1:
@@ -599,10 +622,12 @@ class TransferExecutor:
                 item.id,
                 item.destination_id,
             )
-        else:
-            item.last_failure_kind = "ambiguous"
-            item.mark(ItemStatus.AMBIGUOUS, error="folder_creation_ambiguous")
-            self._items.update(item)
+            return FolderReconciliationOutcome.RECOVERED
+
+        item.last_failure_kind = "ambiguous"
+        item.mark(ItemStatus.AMBIGUOUS, error="folder_creation_ambiguous")
+        self._items.update(item)
+        return FolderReconciliationOutcome.INCONCLUSIVE
 
     @staticmethod
     def _propagate_folder_container(

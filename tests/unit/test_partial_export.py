@@ -31,6 +31,7 @@ from music_transfer.core.domain import (
 )
 from music_transfer.core.enums import ContentType, Platform
 from music_transfer.core.errors import UnsupportedCapabilityError
+from music_transfer.core.ports import PlatformCapabilities
 from music_transfer.infrastructure.persistence import (
     JsonTransferItemRepository,
     JsonTransferJobRepository,
@@ -239,7 +240,7 @@ class TransferServiceSectionSelectionTest(unittest.TestCase):
             ((ContentType.LIKED_TRACKS,), ("tracks",)),
             ((ContentType.SAVED_ALBUMS,), ("albums",)),
             ((ContentType.FOLLOWED_ARTISTS,), ("artists",)),
-            ((ContentType.PLAYLISTS,), ("playlists",)),
+            ((ContentType.PLAYLISTS,), ("folders", "playlists")),
             ((ContentType.LIKED_TRACKS, ContentType.SAVED_ALBUMS), ("albums", "tracks")),
             (
                 (
@@ -248,7 +249,7 @@ class TransferServiceSectionSelectionTest(unittest.TestCase):
                     ContentType.FOLLOWED_ARTISTS,
                     ContentType.PLAYLISTS,
                 ),
-                ("albums", "artists", "playlists", "tracks"),
+                ("albums", "artists", "folders", "playlists", "tracks"),
             ),
         ]
 
@@ -259,6 +260,19 @@ class TransferServiceSectionSelectionTest(unittest.TestCase):
                 job = service.create_job(src_account, dst_account, content=content)
                 service.analyze(job, source, destination)
                 self.assertEqual(source.received_sections, expected_sections)
+
+        # When source does NOT support read_folders, only playlists is exported
+        no_fld_caps = PlatformCapabilities(
+            platform=Platform.TIDAL,
+            read_playlists=True,
+            read_folders=False,
+        )
+        source_no_fld = SectionSpyAdapter()
+        source_no_fld._capabilities = no_fld_caps
+        destination = FakePlatformAdapter()
+        job = service.create_job(src_account, dst_account, content=(ContentType.PLAYLISTS,))
+        service.analyze(job, source_no_fld, destination)
+        self.assertEqual(source_no_fld.received_sections, ("playlists",))
 
     def test_content_sections_derivation_from_engine_specs(self) -> None:
         """Verify content_sections derives exactly the registered snapshot_sections."""
@@ -574,7 +588,7 @@ class EndToEndProviderReadRegressionTest(unittest.TestCase):
         self.assertEqual(session.calls["playlist_items"], 0)
 
     def test_playlist_only_analysis_does_not_read_liked_library_sections(self) -> None:
-        """PLAYLISTS transfer reads only playlists and playlist items (no liked libraries or folders)."""
+        """PLAYLISTS transfer reads playlists, playlist items, and folders (no liked libraries)."""
 
         session = CallSpySession()
         client = TidalLibraryClient(session, _LOGGER)
@@ -592,12 +606,12 @@ class EndToEndProviderReadRegressionTest(unittest.TestCase):
 
         self.assertGreater(session.calls["playlists"], 0)
         self.assertGreater(session.calls["playlist_items"], 0)
+        self.assertGreater(session.calls["folders"], 0)
         self.assertEqual(session.calls["tracks"], 0)
         self.assertEqual(session.calls["albums"], 0)
         self.assertEqual(session.calls["artists"], 0)
         self.assertEqual(session.calls["videos"], 0)
         self.assertEqual(session.calls["mixes"], 0)
-        self.assertEqual(session.calls["folders"], 0)
 
     def test_mixed_selection_analysis_reads_exact_union_of_required_sections(self) -> None:
         """Mixed LIKED_TRACKS + SAVED_ALBUMS reads exactly tracks and albums."""

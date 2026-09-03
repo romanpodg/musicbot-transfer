@@ -237,16 +237,26 @@ class TransferExecutor:
 
             c_keys = self._item_container_keys(item)
             if c_keys and any(k in blocked_containers for k in c_keys):
+                err_name = (
+                    "playlist_sequence_blocked"
+                    if item.entity_type is EntityType.PLAYLIST_ITEM
+                    else "container_blocked"
+                )
                 self._logger.warning(
-                    "event=playlist_sequence_blocked job_id=%s playlist_id=%s item_id=%s write_position=%s recovery_decision=playlist_blocked",
+                    "event=%s job_id=%s container_id=%s item_id=%s write_position=%s recovery_decision=blocked",
+                    err_name,
                     job.id,
                     c_keys[0],
                     item.id,
                     item.write_position,
                 )
                 item.last_failure_kind = "ambiguous"
-                item.mark(ItemStatus.AMBIGUOUS, error="playlist_sequence_blocked")
+                item.mark(ItemStatus.AMBIGUOUS, error=err_name)
                 self._items.update(item)
+                if item.entity_type in (EntityType.FOLDER, EntityType.PLAYLIST):
+                    blocked_containers.add(f"src:{item.source_id}")
+                    if item.destination_id:
+                        blocked_containers.add(f"dst:{item.destination_id}")
                 outcome.failed += 1
                 outcome.processed += 1
                 self._emit(progress, job, "importing", total, outcome, item)
@@ -272,9 +282,14 @@ class TransferExecutor:
                 )
                 break
 
-            if c_keys and item.status in (ItemStatus.FAILED, ItemStatus.AMBIGUOUS):
-                for k in c_keys:
-                    blocked_containers.add(k)
+            if item.status in (ItemStatus.FAILED, ItemStatus.AMBIGUOUS):
+                if item.entity_type in (EntityType.FOLDER, EntityType.PLAYLIST):
+                    blocked_containers.add(f"src:{item.source_id}")
+                    if item.destination_id:
+                        blocked_containers.add(f"dst:{item.destination_id}")
+                elif item.entity_type is EntityType.PLAYLIST_ITEM and c_keys:
+                    for k in c_keys:
+                        blocked_containers.add(k)
 
             outcome.processed += 1
             if item.status is ItemStatus.TRANSFERRED:
@@ -326,6 +341,8 @@ class TransferExecutor:
                 self._write_playlist(job, item, all_items)
             elif op is TransferOperation.ADD_PLAYLIST_ITEM or (op is TransferOperation.NONE and item.entity_type is EntityType.PLAYLIST_ITEM):
                 self._write_playlist_item(item, all_items)
+            elif op is TransferOperation.CREATE_FOLDER or (op is TransferOperation.NONE and item.entity_type is EntityType.FOLDER):
+                self._write_folder(job, item, all_items)
             else:
                 item.mark(ItemStatus.SKIPPED, error="operation_not_executable")
                 self._items.update(item)
@@ -414,11 +431,32 @@ class TransferExecutor:
         if item.destination_id:
             self._propagate_container(all_items, item.source_id, item.destination_id)
             return
+
+        target_folder_id: str | None = None
+        if item.container_source_id is not None:
+            target_folder_id = item.container_destination_id
+            if not target_folder_id:
+                parent_folder = next(
+                    (
+                        i
+                        for i in all_items
+                        if i.entity_type is EntityType.FOLDER
+                        and i.source_id == item.container_source_id
+                    ),
+                    None,
+                )
+                if parent_folder and parent_folder.destination_id:
+                    target_folder_id = parent_folder.destination_id
+                    item.container_destination_id = target_folder_id
+            if not target_folder_id:
+                raise AmbiguousOperationError("playlist_parent_folder_destination_id_missing")
+
         playlist = Playlist(
             source_platform=job.source_platform,
             source_id=item.source_id,
             name=str(item.source_metadata.get("name", "")),
             description=item.source_metadata.get("description") or "",
+            folder_id=target_folder_id,
         )
         created_id = self._destination.create_playlist(playlist)
         if not created_id:
@@ -427,11 +465,157 @@ class TransferExecutor:
         item.match_score = 1.0
         self._propagate_container(all_items, item.source_id, created_id)
         self._logger.info(
-            "event=playlist_created job_id=%s source_id=%s destination_id=%s",
+            "event=playlist_created job_id=%s source_id=%s destination_id=%s folder_id=%s",
             job.id,
             item.source_id,
             created_id,
+            target_folder_id,
         )
+
+    def _write_folder(
+        self, job: TransferJob, item: TransferItem, all_items: list[TransferItem]
+    ) -> None:
+        """Create a destination playlist folder exactly once, then record its id."""
+
+        if item.destination_id:
+            self._propagate_folder_container(all_items, item.source_id, item.destination_id)
+            return
+
+        parent_destination_id: str | None = None
+        if item.container_source_id is not None:
+            parent_destination_id = item.container_destination_id
+            if not parent_destination_id:
+                parent_folder = next(
+                    (
+                        i
+                        for i in all_items
+                        if i.entity_type is EntityType.FOLDER
+                        and i.source_id == item.container_source_id
+                    ),
+                    None,
+                )
+                if parent_folder and parent_folder.destination_id:
+                    parent_destination_id = parent_folder.destination_id
+                    item.container_destination_id = parent_destination_id
+            if not parent_destination_id:
+                raise AmbiguousOperationError("parent_folder_destination_id_missing")
+
+        folder_name = str(
+            item.source_metadata.get("name")
+            or item.source_metadata.get("title")
+            or item.source_id
+        )
+
+        if item.mutation_state is MutationState.IN_FLIGHT:
+            self._reconcile_folder(item, folder_name, parent_destination_id)
+            if item.status is ItemStatus.TRANSFERRED and item.destination_id:
+                self._propagate_folder_container(all_items, item.source_id, item.destination_id)
+                return
+
+        item.mutation_state = MutationState.IN_FLIGHT
+        self._items.update(item)
+
+        try:
+            created_id = self._destination.create_folder(folder_name, parent_destination_id)
+            if not created_id:
+                raise AmbiguousOperationError("folder_creation_unconfirmed")
+            item.destination_id = created_id
+            item.match_score = 1.0
+            item.mutation_state = MutationState.NONE
+            self._propagate_folder_container(all_items, item.source_id, created_id)
+            self._logger.info(
+                "event=folder_created job_id=%s source_id=%s destination_id=%s parent_destination_id=%s",
+                job.id,
+                item.source_id,
+                created_id,
+                parent_destination_id,
+            )
+        except (TemporaryPlatformError, AmbiguousOperationError) as error:
+            self._reconcile_folder(item, folder_name, parent_destination_id)
+            if item.status is ItemStatus.TRANSFERRED and item.destination_id:
+                self._propagate_folder_container(all_items, item.source_id, item.destination_id)
+                return
+            raise AmbiguousOperationError("folder_creation_ambiguous") from error
+
+    def _reconcile_folder(
+        self,
+        item: TransferItem,
+        folder_name: str,
+        parent_destination_id: str | None,
+    ) -> None:
+        """Attempt to reconcile an in-flight or failed folder creation against destination state."""
+
+        try:
+            snapshot = self._destination.export_library(sections=("folders",))
+        except Exception as error:  # noqa: BLE001
+            self._logger.warning(
+                "event=folder_reconciliation_failed job_id=%s item_id=%s error=%s",
+                item.job_id,
+                item.id,
+                error,
+            )
+            item.last_failure_kind = "ambiguous"
+            item.mark(ItemStatus.AMBIGUOUS, error="folder_reconciliation_inconclusive")
+            self._items.update(item)
+            return
+
+        if "folders" in snapshot.incomplete_sections:
+            item.last_failure_kind = "ambiguous"
+            item.mark(ItemStatus.AMBIGUOUS, error="folder_reconciliation_inconclusive")
+            self._items.update(item)
+            return
+
+        from .planner import folder_parent_source_id
+
+        norm_expected_parent = (
+            None
+            if parent_destination_id in (None, "root", "")
+            else str(parent_destination_id)
+        )
+
+        matching = [
+            f
+            for f in snapshot.folders
+            if f.title == folder_name
+            and (
+                None
+                if folder_parent_source_id(f) in (None, "root", "")
+                else str(folder_parent_source_id(f))
+            )
+            == norm_expected_parent
+        ]
+
+        if len(matching) == 1:
+            item.destination_id = matching[0].source_id
+            item.match_score = 1.0
+            item.mutation_state = MutationState.NONE
+            item.last_failure_kind = None
+            item.last_error = None
+            item.mark(ItemStatus.TRANSFERRED)
+            self._items.update(item)
+            self._logger.info(
+                "event=folder_reconciled job_id=%s item_id=%s destination_id=%s",
+                item.job_id,
+                item.id,
+                item.destination_id,
+            )
+        else:
+            item.last_failure_kind = "ambiguous"
+            item.mark(ItemStatus.AMBIGUOUS, error="folder_creation_ambiguous")
+            self._items.update(item)
+
+    @staticmethod
+    def _propagate_folder_container(
+        all_items: list[TransferItem], container_source_id: str, destination_id: str
+    ) -> None:
+        """Record a newly created folder container ID on all child folders and playlists."""
+
+        for entry in all_items:
+            if (
+                entry.entity_type in (EntityType.FOLDER, EntityType.PLAYLIST)
+                and entry.container_source_id == container_source_id
+            ):
+                entry.container_destination_id = destination_id
 
     def _write_playlist_item(self, item: TransferItem, all_items: list[TransferItem]) -> None:
         """Append one playlist entry, reconciling first when the API allows it."""
@@ -637,12 +821,8 @@ class TransferExecutor:
 
     @staticmethod
     def _item_container_keys(item: TransferItem) -> list[str]:
-        """Return container identification keys for playlist items."""
-        if (
-            item.entity_type is not EntityType.PLAYLIST_ITEM
-            and item.operation is not TransferOperation.ADD_PLAYLIST_ITEM
-        ):
-            return []
+        """Return container identification keys that this item depends on."""
+
         keys: list[str] = []
         if item.container_source_id:
             keys.append(f"src:{item.container_source_id}")
@@ -653,27 +833,51 @@ class TransferExecutor:
     # -- bookkeeping -------------------------------------------------------
 
     def _write_order(self, job: TransferJob, items: list[TransferItem]) -> list[TransferItem]:
-        """Return items in write order.
+        """Return items in write order across container tiers.
 
-        Playlists are grouped so a container is always created before its
-        entries, and entries stay in source position order.
-
-        Playlist *entries* are deliberately excluded from the leading group:
-        ``PLAYLIST_ITEM`` is a distinct entity type from ``PLAYLIST``, so a
-        naive "everything that is not a playlist" filter would place the
-        entries first and they would be written into a container that does not
-        exist yet.
+        Tiers:
+        1. Non-containers (tracks, albums, artists, videos, mixes)
+        2. Root folders and child folders (topological order, parent before child)
+        3. Playlists
+        4. Playlist items (immediately following their playlist, preserving sequence)
         """
 
         from .ordering import restore_positions
 
-        playlists = [item for item in items if item.entity_type is EntityType.PLAYLIST]
         others = [
             item
             for item in items
-            if item.entity_type not in (EntityType.PLAYLIST, EntityType.PLAYLIST_ITEM)
+            if item.entity_type not in (EntityType.FOLDER, EntityType.PLAYLIST, EntityType.PLAYLIST_ITEM)
         ]
+
+        folder_items = [item for item in items if item.entity_type is EntityType.FOLDER]
+        folder_by_src = {f.source_id: f for f in folder_items}
+        folder_indices = {f.id: idx for idx, f in enumerate(folder_items)}
+        depths: dict[str, int] = {}
+
+        def get_fld_depth(src_id: str) -> int:
+            if src_id in depths:
+                return depths[src_id]
+            f_item = folder_by_src.get(src_id)
+            if (
+                f_item is None
+                or f_item.container_source_id is None
+                or f_item.container_source_id not in folder_by_src
+            ):
+                depth = 0
+            else:
+                depth = get_fld_depth(f_item.container_source_id) + 1
+            depths[src_id] = depth
+            return depth
+
+        sorted_folders = sorted(
+            folder_items,
+            key=lambda f: (get_fld_depth(f.source_id), folder_indices[f.id]),
+        )
+
+        playlists = [item for item in items if item.entity_type is EntityType.PLAYLIST]
         grouped: list[TransferItem] = list(others)
+        grouped.extend(sorted_folders)
         for playlist in playlists:
             grouped.append(playlist)
             grouped.extend(

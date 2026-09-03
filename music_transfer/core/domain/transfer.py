@@ -486,6 +486,17 @@ class TransferItem:
             name = self.source_metadata.get("name") if self.source_metadata else None
             return bool(name or self.source_id)
 
+        if self.operation is TransferOperation.CREATE_FOLDER:
+            # Creation requires folder name metadata and must not have already landed (destination_id)
+            if self.destination_id is not None:
+                return False
+            name = (
+                self.source_metadata.get("name") or self.source_metadata.get("title")
+                if self.source_metadata
+                else None
+            )
+            return bool(name or self.source_id)
+
         return False
 
     def as_dict(self) -> dict[str, Any]:
@@ -543,6 +554,7 @@ class TransferItem:
                 EntityType.MIX: TransferOperation.SAVE_MIX,
                 EntityType.PLAYLIST: TransferOperation.CREATE_PLAYLIST,
                 EntityType.PLAYLIST_ITEM: TransferOperation.ADD_PLAYLIST_ITEM,
+                EntityType.FOLDER: TransferOperation.CREATE_FOLDER,
             }.get(entity_type, TransferOperation.NONE)
 
         # Invariant: missing mutation_state defaults to NONE for backward compatibility (Case A).

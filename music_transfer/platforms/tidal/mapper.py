@@ -188,7 +188,7 @@ def playlist_from_tidal(
     *,
     items: list[PlaylistItem] | None = None,
     account_id: str = "",
-    folder_id: str = "root",
+    folder_id: str | None = None,
 ) -> Playlist:
     """Map a TIDAL playlist object onto the universal :class:`Playlist`."""
 
@@ -197,6 +197,7 @@ def playlist_from_tidal(
     owned = "userplaylist" in type(value).__name__.lower() or (
         bool(creator_id) and creator_id == account_id
     )
+    norm_folder_id = None if folder_id in (None, "root", "") else folder_id
     return Playlist(
         source_platform=_PLATFORM,
         source_id=ensure_identifier(value),
@@ -207,7 +208,7 @@ def playlist_from_tidal(
         else None,
         is_owned=owned,
         owner_id=creator_id or None,
-        folder_id=folder_id,
+        folder_id=norm_folder_id,
         date_added=date_value(value, "created"),
         tracks=list(items or []),
         metadata={
@@ -217,14 +218,19 @@ def playlist_from_tidal(
     )
 
 
-def folder_record_from_tidal(value: Any, parent_id: str) -> LibraryRecord:
+def folder_record_from_tidal(value: Any, parent_id: str | None = None) -> LibraryRecord:
     """Map a TIDAL playlist folder onto a generic library record."""
 
+    norm_parent = None if parent_id in (None, "root", "") else parent_id
     return LibraryRecord(
         source_platform=_PLATFORM,
         source_id=ensure_identifier(value),
         title=text_value(value, "name"),
-        metadata={"parent_id": parent_id, "created_at": date_value(value, "created") or ""},
+        metadata={
+            "parent_source_id": norm_parent,
+            "parent_id": norm_parent,
+            "created_at": date_value(value, "created") or "",
+        },
     )
 
 

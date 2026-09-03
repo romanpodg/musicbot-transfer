@@ -115,6 +115,7 @@ def playlist(
     *,
     identifier: str | None = None,
     description: str | None = None,
+    folder_id: str | None = None,
 ) -> Playlist:
     """Build a playlist whose item positions follow the given order."""
 
@@ -123,6 +124,7 @@ def playlist(
         source_id=identifier or title.casefold().replace(" ", "-"),
         name=title,
         description=description,
+        folder_id=folder_id,
         tracks=[
             PlaylistItem(position=index, track=item)
             for index, item in enumerate(items, start=1)
@@ -181,6 +183,8 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         write_mixes=True,
         create_playlists=True,
         write_playlist_items=True,
+        read_folders=True,
+        create_folders=True,
         search_tracks=True,
         search_albums=True,
         search_artists=True,
@@ -199,6 +203,7 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         albums: list[Album] | None = None,
         artists: list[Artist] | None = None,
         playlists: list[Playlist] | None = None,
+        folders: list[LibraryRecord] | None = None,
         videos: list[LibraryRecord] | None = None,
         mixes: list[LibraryRecord] | None = None,
         catalog_tracks: list[Track] | None = None,
@@ -216,6 +221,7 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         self.albums: list[Album] = list(albums or [])
         self.artists: list[Artist] = list(artists or [])
         self.playlists: list[Playlist] = list(playlists or [])
+        self.folders: list[LibraryRecord] = list(folders or [])
         self.videos: list[LibraryRecord] = list(videos or [])
         self.mixes: list[LibraryRecord] = list(mixes or [])
         self.catalog_tracks = list(catalog_tracks) if catalog_tracks is not None else None
@@ -227,6 +233,7 @@ class FakePlatformAdapter(MusicPlatformAdapter):
         self.saved_videos: list[str] = []
         self.saved_mixes: list[str] = []
         self.created_playlists: list[str] = []
+        self.created_folders: list[tuple[str, str | None]] = []
         #: Method names that should raise, to exercise failure handling.
         self.fail_on = set(fail_on or ())
         self.error_factory = error_factory
@@ -294,15 +301,17 @@ class FakePlatformAdapter(MusicPlatformAdapter):
     def export_library(self, sections=None, progress=None) -> LibrarySnapshot:
         """Return the configured library."""
 
+        sec_set = set(sections) if sections is not None else None
         return LibrarySnapshot(
             account=self.get_profile(),
             platform=self._platform,
-            tracks=list(self.tracks),
-            albums=list(self.albums),
-            artists=list(self.artists),
-            playlists=list(self.playlists),
-            videos=list(self.videos),
-            mixes=list(self.mixes),
+            tracks=list(self.tracks) if sec_set is None or "tracks" in sec_set else [],
+            albums=list(self.albums) if sec_set is None or "albums" in sec_set else [],
+            artists=list(self.artists) if sec_set is None or "artists" in sec_set else [],
+            playlists=list(self.playlists) if sec_set is None or "playlists" in sec_set else [],
+            folders=list(self.folders) if sec_set is None or "folders" in sec_set else [],
+            videos=list(self.videos) if sec_set is None or "videos" in sec_set else [],
+            mixes=list(self.mixes) if sec_set is None or "mixes" in sec_set else [],
         )
 
     def get_destination_state(self, sections=None) -> DestinationState:
@@ -459,6 +468,7 @@ class FakePlatformAdapter(MusicPlatformAdapter):
                 source_id=identifier,
                 name=item.name,
                 tracks=[],
+                folder_id=item.folder_id,
             )
         )
         return identifier
@@ -475,17 +485,38 @@ class FakePlatformAdapter(MusicPlatformAdapter):
                 return
         raise LookupError(f"unknown playlist: {playlist_id}")
 
+    def create_folder(self, name: str, parent_id: str | None = None) -> str:
+        """Create a playlist folder and return its identifier."""
+
+        self._record("create_folder", name, parent_id)
+        identifier = f"dst-fld-{len(self.folders) + 1}"
+        self.folders.append(
+            LibraryRecord(
+                source_platform=self._platform,
+                source_id=identifier,
+                title=name,
+                metadata={"parent_source_id": parent_id, "parent_id": parent_id},
+            )
+        )
+        self.created_folders.append((name, parent_id))
+        return identifier
+
     def can_reuse_identifier(self, entity_type: EntityType, source: Platform) -> bool:
         """Return whether a source identifier is valid on this destination.
 
-        Catalogue entities (tracks, albums, artists, videos, mixes) are shared, so an id is
-        portable.  A playlist belongs to an account and must be created first,
-        so its id is never reusable even between two accounts on one platform.
+        Catalogue entities (tracks, albums, artists, videos, mixes) are shared.
+        Playlists, playlist items, and folders belong to an account and are not portable.
         """
 
         if source is not self._platform:
             return False
-        return entity_type is not EntityType.PLAYLIST
+        return entity_type in {
+            EntityType.TRACK,
+            EntityType.ALBUM,
+            EntityType.ARTIST,
+            EntityType.VIDEO,
+            EntityType.MIX,
+        }
 
     # -- helpers -----------------------------------------------------------
 

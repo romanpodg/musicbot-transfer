@@ -148,6 +148,16 @@ The engine supports `VIDEOS` and `MIXES` content transfer end-to-end:
 - **Destination Presence**: Canonical destination state sections include `"videos"` and `"mixes"` alongside `"tracks"`, `"albums"`, `"artists"`, and `"playlists"`. Observed presence semantics (PRESENT, ABSENT, UNKNOWN) govern exact preflight preconditions, already-exists skips, and post-write verification.
 - **Adapter Mutation**: Platform adapters declare `read_videos`/`write_videos` and `read_mixes`/`write_mixes` capabilities, executing mutations via `save_video(video_id)` and `save_mix(mix_id)`. `ReadOnlyAdapter` enforces safety by excluding mutating methods during planning.
 
+### 3.8 Playlist Folder Hierarchy Transfer and Runtime Container Binding (Phase 1.5C)
+
+Folders are structural components of `ContentType.PLAYLISTS`, not an independent selectable content type:
+- **Structural Content Dependency**: `ContentType.PLAYLISTS` declares a structural dependency on the `"folders"` snapshot section. `source_export_sections()` selectively reads folders before playlists when source supports `read_folders`. Flat playlists never require destination `create_folders`.
+- **Universal Root Representation**: The core engine uses `None` for unparented containers. Provider-specific root representations (such as TIDAL's `"root"`) are strictly translated at the platform adapter boundary.
+- **Topological Planning & Runtime Binding**: In confirmed plans, folders are planned with `TransferOperation.CREATE_FOLDER`, `container_source_id` bound to source parent folder ID, and `destination_id = None`. Execution runs in 5 topological tiers (non-containers → root folders → child folders → playlists → playlist items). Destination folder IDs are resolved and propagated at runtime to child folders and playlists.
+- **Failure Cascade Isolation**: A failed or ambiguous folder creation blocks all downstream child folders, playlists, and playlist items with `container_blocked` (or `playlist_sequence_blocked`), preventing orphan creation and order corruption while allowing sibling subtrees to proceed. Foldered playlists never fall back to the destination root.
+- **Durable Intent & Idempotent Reconciliation**: `MutationState.IN_FLIGHT` is persisted before remote folder creation. On timeout or ambiguous error, folder state is reconciled against destination state matching `(parent_id, name)`.
+- **Job-Scoped Post-Transfer Verification**: Destination folder existence, title, and parent ID, along with playlist folder placement, are verified post-execution via `export_library(sections=("folders", "playlists"))`.
+
 ---
 
 ## 4. Package contents
@@ -188,6 +198,7 @@ These are the rules the test suite enforces. Breaking one fails a test.
 | L | Writes require exact durable plan confirmation (`plan_id + revision + plan_hash`) | `TransferService`, `tests/unit/test_plan_identity_and_confirmation.py` |
 | M | Re-planning creates a new revision and invalidates old confirmation; destination drift produces zero writes | `TransferService`, `tests/unit/test_plan_identity_and_confirmation.py` |
 | N | A transfer item must never become executable without a resolved destination identifier or explicit non-executable classification | `TransferPlanner`, `validate_plan_set_like_items`, `tests/unit/test_identifier_resolution.py` |
+| O | Foldered playlists and child folders must never execute or fall back to root when their parent container fails or is unconfirmed | `TransferExecutor`, `tests/unit/test_playlist_folder_hierarchy.py` |
 
 ---
 

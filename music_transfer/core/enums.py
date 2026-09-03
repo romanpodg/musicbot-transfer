@@ -210,6 +210,7 @@ class TransferOperation(StrEnum):
     SAVE_MIX = "save_mix"
     CREATE_PLAYLIST = "create_playlist"
     ADD_PLAYLIST_ITEM = "add_playlist_item"
+    CREATE_FOLDER = "create_folder"
 
 
 class MutationState(StrEnum):

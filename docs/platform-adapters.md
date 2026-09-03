@@ -249,10 +249,13 @@ capability flag instead.
 
 ### Adapter checklist
 
-- [ ] `CAPABILITIES` is conservative and matches reality.
+- [ ] `CAPABILITIES` is conservative and matches reality (including `read_folders` and `create_folders`).
 - [ ] Unsupported methods are left raising `UnsupportedCapabilityError`.
 - [ ] `create_playlist` returns an id or raises; never returns `""`.
-- [ ] `can_reuse_identifier` returns `False` for playlists.
+- [ ] `create_folder` returns an id or raises; never returns `""`.
+- [ ] `create_folder(name, parent_id=None)` translates universal root (`None`) to provider root (e.g. `"root"`).
+- [ ] `can_reuse_identifier` returns `False` for `FOLDER`, `PLAYLIST`, and `PLAYLIST_ITEM`.
+- [ ] Playlists populate `folder_id` (with `None` representing root).
 - [ ] Pagination terminates on an empty page only.
 - [ ] Every SDK exception is translated; none escapes unclassified.
 - [ ] No token, password, or session blob is logged.
@@ -273,3 +276,25 @@ $ music-transfer capabilities spotify
 `registry.unimplemented(platform)` returns a factory that raises
 `UnsupportedCapabilityError("platform_not_implemented")` — a deliberate,
 loud refusal rather than an absence that looks like a bug.
+
+---
+
+## 7. Folder hierarchy porting requirements
+
+When porting or adding support for playlist folders on a platform:
+
+1. **Capabilities**:
+   Declare `read_folders=True` if the platform exposes an API to list folders, and `create_folders=True` if it allows creating folders.
+2. **Library Export**:
+   `export_library(sections=...)` must support `"folders"`. It should export folders as `LibraryRecord(source_platform=..., source_id=..., title=..., metadata={"parent_source_id": parent_id})`, where `parent_id` is normalized: `None` represents root.
+3. **Playlist Mapper**:
+   Map the playlist's parent folder into the `folder_id` field on the universal `Playlist` domain object. Provider-specific root values (e.g., `"root"` or `""`) must be normalized to `None`.
+4. **Folder Creation**:
+   Implement `create_folder(name: str, parent_id: str | None = None) -> str`.
+   If `parent_id is None`, map to the provider's native root concept (e.g., `"root"` in TIDAL).
+   Must return the newly created folder identifier, or raise a classified platform error.
+5. **Identifier Portability**:
+   `can_reuse_identifier` must return `False` for `EntityType.FOLDER`, `EntityType.PLAYLIST`, and `EntityType.PLAYLIST_ITEM`.
+6. **Error Translation**:
+   Translate provider SDK exceptions using the standard error hierarchy. Network drops, timeouts, and 5xx responses during `create_folder` must translate to `AmbiguousOperationError` on write so the engine can safely reconcile against destination state instead of creating duplicate folders.
+

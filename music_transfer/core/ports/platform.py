@@ -626,8 +626,13 @@ class MusicPlatformAdapter(ABC):
             "capability_unsupported", capability="supports_batch_playlist_writes"
         )
 
-    def create_folder(self, name: str, parent_id: str) -> str:
-        """Create a playlist folder and return its identifier."""
+    def create_folder(self, name: str, parent_id: str | None = None) -> str:
+        """Create a playlist folder and return its identifier.
+
+        Args:
+            name: Folder title/name.
+            parent_id: Destination identifier of parent folder, or None for root.
+        """
 
         raise UnsupportedCapabilityError(
             "capability_unsupported", capability="create_folders"

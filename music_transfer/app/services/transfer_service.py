@@ -70,6 +70,7 @@ from ...core.transfer import (
     build_report,
     content_sections,
     scrub_credentials,
+    source_export_sections,
     status_after_execution,
     transition,
     validate_transfer_content_support,
@@ -226,7 +227,9 @@ class TransferService:
         transition(job, JobStatus.EXPORTING)
         self._jobs.update(job)
         if snapshot is None:
-            sections = content_sections(job.requested_content)
+            sections = source_export_sections(
+                job.requested_content, source.capabilities
+            )
             snapshot = source.export_library(
                 sections=sections,
                 progress=export_progress,
@@ -892,5 +895,6 @@ __all__ = [
     "ExecutionOutcome",
     "TransferService",
     "content_sections",
+    "source_export_sections",
 ]
 

@@ -172,6 +172,7 @@ class TidalLibraryClient:
                     )
 
         self._logger.info("event=library_export_started platform=tidal")
+        self._folder_membership = {}
         snapshot = LibrarySnapshot(
             account=self.profile(),
             platform=Platform.TIDAL,
@@ -277,10 +278,10 @@ class TidalLibraryClient:
         visited: set[str] = set()
         membership: dict[str, str] = {}
 
-        def visit(parent_id: str) -> None:
+        def visit(parent_folder_id: str, parent_id: str | None) -> None:
             for folder in fetch_all(
                 lambda limit, offset: self._favorites().playlist_folders(
-                    limit=limit, offset=offset, parent_folder_id=parent_id
+                    limit=limit, offset=offset, parent_folder_id=parent_folder_id
                 ),
                 operation="export_folders",
                 logger=self._logger,
@@ -298,9 +299,9 @@ class TidalLibraryClient:
                     logger=self._logger,
                 ):
                     membership[_required_id(playlist)] = folder_id
-                visit(folder_id)
+                visit(folder_id, folder_id)
 
-        visit("root")
+        visit("root", None)
         self._folder_membership = membership
         return exported
 
@@ -324,7 +325,7 @@ class TidalLibraryClient:
                     raw,
                     items=items,
                     account_id=profile.account_id,
-                    folder_id=membership.get(playlist_id, "root"),
+                    folder_id=membership.get(playlist_id, None),
                 )
             )
             self._emit(progress, "playlists", len(result))
@@ -409,12 +410,13 @@ class TidalLibraryClient:
             f"favorite_remove_{category}", getattr(favorites, method_name), item_id
         )
 
-    def create_folder(self, title: str, parent_id: str) -> str:
+    def create_folder(self, title: str, parent_id: str | None = "root") -> str:
         """Create a playlist folder and return its TIDAL identifier."""
 
+        target_parent = "root" if (parent_id is None or parent_id == "root") else parent_id
         folder = self._invoke(
             "folder_create",
-            lambda: self._session.user.create_folder(title, parent_id),
+            lambda: self._session.user.create_folder(title, target_parent),
             retry_safe=False,
         )
         folder_id = getattr(folder, "id", None)

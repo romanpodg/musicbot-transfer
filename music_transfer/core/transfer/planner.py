@@ -29,6 +29,7 @@ from typing import Any
 
 from ..domain import (
     IdentifierResolution,
+    LibraryRecord,
     LibrarySnapshot,
     PlanPrecondition,
     Playlist,
@@ -76,6 +77,15 @@ _NONE_METHOD = MatchMethod.NONE
 
 
 @dataclass(frozen=True, slots=True)
+class StructuralContentDependency:
+    """A structural prerequisite section required by a content type (e.g. folders for playlists)."""
+
+    snapshot_section: str
+    source_read_capability: str
+    destination_write_capability: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TransferContentSpec:
     """Authoritative transfer specification for a single content type."""
 
@@ -87,6 +97,7 @@ class TransferContentSpec:
     source_read_capabilities: tuple[str, ...]
     destination_write_capabilities: tuple[str, ...]
     search_capability: str | None = None
+    structural_dependencies: tuple[StructuralContentDependency, ...] = ()
 
 
 #: Engine support registry: only content types with complete transfer paths.
@@ -130,6 +141,13 @@ ENGINE_TRANSFER_SPECS: dict[ContentType, TransferContentSpec] = {
         search_capability=None,
         source_read_capabilities=("read_playlists",),
         destination_write_capabilities=("create_playlists", "write_playlist_items"),
+        structural_dependencies=(
+            StructuralContentDependency(
+                snapshot_section="folders",
+                source_read_capability="read_folders",
+                destination_write_capability="create_folders",
+            ),
+        ),
     ),
     ContentType.VIDEOS: TransferContentSpec(
         content_type=ContentType.VIDEOS,
@@ -168,6 +186,26 @@ def validate_transfer_content_spec(spec: TransferContentSpec) -> None:
         raise TransferConfigurationError(
             f"invalid_transfer_content_spec_type:{type(spec).__name__}"
         )
+
+    for dep in spec.structural_dependencies:
+        if not isinstance(dep, StructuralContentDependency):
+            raise TransferConfigurationError(
+                f"invalid_structural_dependency_type:{type(dep).__name__}"
+            )
+        if not dep.snapshot_section or not isinstance(dep.snapshot_section, str):
+            raise TransferConfigurationError(
+                f"invalid_structural_dependency_section:{spec.content_type.value}"
+            )
+        if not dep.source_read_capability or not isinstance(dep.source_read_capability, str):
+            raise TransferConfigurationError(
+                f"invalid_structural_dependency_source_capability:{spec.content_type.value}"
+            )
+        if dep.destination_write_capability is not None and not isinstance(
+            dep.destination_write_capability, str
+        ):
+            raise TransferConfigurationError(
+                f"invalid_structural_dependency_destination_capability:{spec.content_type.value}"
+            )
 
     policy = spec.resolution_policy
     if policy is IdentifierResolutionPolicy.REUSE_OR_SEARCH:
@@ -255,6 +293,143 @@ def content_sections(
         spec = require_transfer_content_spec(item)
         sections.update(spec.snapshot_sections)
     return tuple(sorted(sections))
+
+
+CANONICAL_SOURCE_EXPORT_ORDER: tuple[str, ...] = (
+    "albums",
+    "artists",
+    "folders",
+    "mixes",
+    "playlists",
+    "tracks",
+    "videos",
+)
+
+
+def source_export_sections(
+    content: tuple[ContentType, ...] | list[ContentType] | Iterable[ContentType],
+    source_capabilities: PlatformCapabilities,
+) -> tuple[str, ...]:
+    """Return the snapshot sections required for source export, in canonical order.
+
+    Includes primary content sections, and conditionally includes structural dependency
+    sections (such as 'folders' for PLAYLISTS) if supported by the source platform.
+    Sections are returned in canonical order: 'folders' precedes 'playlists'.
+    """
+    sections: set[str] = set()
+    for item in content:
+        spec = require_transfer_content_spec(item)
+        sections.update(spec.snapshot_sections)
+        for dep in spec.structural_dependencies:
+            if source_capabilities.supports(dep.source_read_capability):
+                sections.add(dep.snapshot_section)
+    return tuple(s for s in CANONICAL_SOURCE_EXPORT_ORDER if s in sections)
+
+
+def folder_parent_source_id(record: LibraryRecord) -> str | None:
+    """Extract normalized parent folder source ID from a folder record (None = root)."""
+    parent = record.metadata.get("parent_source_id")
+    if parent is None and "parent_id" in record.metadata:
+        parent = record.metadata.get("parent_id")
+    if parent in (None, "root", ""):
+        return None
+    return str(parent)
+
+
+def validate_folder_hierarchy(
+    folders: list[LibraryRecord],
+    playlists: list[Playlist],
+) -> list[LibraryRecord]:
+    """Validate playlist folder hierarchy graph and return topologically sorted folders.
+
+    Rules:
+    1. Every folder source_id is present, non-empty, and unique.
+    2. Each folder parent is None (root) or an existing folder source_id.
+    3. Folder cannot parent itself.
+    4. Folder graph contains no cycles.
+    5. Every non-root playlist.folder_id refers to an existing exported source folder.
+    6. Normalized hierarchy is deterministic (topological ordering, parent before child).
+
+    Raises:
+        TransferConfigurationError: If any hierarchy validation rule is violated.
+    """
+    folder_map: dict[str, LibraryRecord] = {}
+    folder_indices: dict[str, int] = {}
+    for idx, f in enumerate(folders):
+        if not f.source_id or not str(f.source_id).strip():
+            reason = "missing_folder_id"
+            raise TransferConfigurationError(f"invalid_folder_hierarchy:{reason}")
+        fid = str(f.source_id)
+        if fid in folder_map:
+            raise TransferConfigurationError(f"invalid_folder_hierarchy:duplicate_folder_id:{fid}")
+        folder_map[fid] = f
+        folder_indices[fid] = idx
+
+    # Validate parent existence and self-parenting
+    for fid, f in folder_map.items():
+        pid = folder_parent_source_id(f)
+        if pid is not None:
+            if pid == fid:
+                raise TransferConfigurationError(f"invalid_folder_hierarchy:self_parent:{fid}")
+            if pid not in folder_map:
+                raise TransferConfigurationError(f"invalid_folder_hierarchy:missing_parent:{fid}:{pid}")
+
+    # Cycle detection
+    # 0 = unvisited, 1 = visiting (in current path), 2 = visited
+    state: dict[str, int] = {}
+    for fid in folder_map:
+        if state.get(fid) == 2:
+            continue
+        curr: str | None = fid
+        path: list[str] = []
+        while curr is not None:
+            curr_state = state.get(curr, 0)
+            if curr_state == 1:
+                cycle_start = path.index(curr)
+                cycle_nodes = path[cycle_start:] + [curr]
+                raise TransferConfigurationError(
+                    f"invalid_folder_hierarchy:cycle_detected:{'->'.join(cycle_nodes)}"
+                )
+            if curr_state == 2:
+                break
+            state[curr] = 1
+            path.append(curr)
+            parent_rec = folder_map.get(curr)
+            curr = folder_parent_source_id(parent_rec) if parent_rec else None
+
+        for node in path:
+            state[node] = 2
+
+    # Validate playlist folder references
+    for pl in playlists:
+        pfid = pl.folder_id
+        if pfid in (None, "root", ""):
+            continue
+        if str(pfid) not in folder_map:
+            raise TransferConfigurationError(
+                f"invalid_folder_hierarchy:playlist_missing_folder:{pl.source_id}:{pfid}"
+            )
+
+    # Compute depth for deterministic topological sorting
+    depths: dict[str, int] = {}
+
+    def get_depth(node_id: str) -> int:
+        if node_id in depths:
+            return depths[node_id]
+        parent_id = folder_parent_source_id(folder_map[node_id])
+        depth = 0 if parent_id is None else get_depth(parent_id) + 1
+        depths[node_id] = depth
+        return depth
+
+    for fid in folder_map:
+        get_depth(fid)
+
+    # Topological sort: lower depth first (root = 0, child = 1, etc.), tie-break by original index
+    sorted_folders = sorted(
+        folders,
+        key=lambda rec: (depths[str(rec.source_id)], folder_indices[str(rec.source_id)]),
+    )
+    return sorted_folders
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,7 +814,7 @@ class TransferPlanner:
         state: DestinationState | None,
         warnings: list[str],
     ) -> list[TransferItem]:
-        """Plan playlists and every playlist item, preserving duplicates.
+        """Plan folders, playlists, and every playlist item, preserving duplicates and hierarchy.
 
         Playlist content is sequence-like, never set-like: a playlist may
         intentionally contain the same track twice (Invariant D), so no global
@@ -649,11 +824,51 @@ class TransferPlanner:
         if "playlists" in source.incomplete_sections:
             warnings.append("source_section_incomplete:playlists")
             return []
+        if "folders" in source.incomplete_sections:
+            fld_section = "folders"
+            raise TransferConfigurationError(f"source_section_incomplete:{fld_section}")
+
         spec = require_transfer_content_spec(ContentType.PLAYLISTS)
         for write_cap in spec.destination_write_capabilities:
             capabilities.require(write_cap)
+
+        if source.folders:
+            capabilities.require("create_folders")
+            sorted_folders = validate_folder_hierarchy(source.folders, source.playlists)
+        else:
+            validate_folder_hierarchy([], source.playlists)
+            sorted_folders = []
+
         planned: list[TransferItem] = []
+        for folder_position, folder in enumerate(sorted_folders):
+            parent_source_id = folder_parent_source_id(folder)
+            folder_item = TransferItem.create(
+                job.id,
+                EntityType.FOLDER,
+                job.source_platform,
+                folder.source_id,
+                job.destination_platform,
+                original_position=folder_position,
+                container_source_id=parent_source_id,
+                source_metadata={
+                    "name": folder.title,
+                    "parent_source_id": parent_source_id,
+                },
+                operation=TransferOperation.CREATE_FOLDER,
+            )
+            folder_item.destination_id = None
+            folder_item.container_destination_id = None
+            folder_item.match_method = _NONE_METHOD
+            folder_item.match_score = 0.0
+            folder_item.status = ItemStatus.PENDING
+            planned.append(folder_item)
+
         for playlists_position, playlist in enumerate(source.playlists):
+            norm_folder_id = (
+                playlist.folder_id
+                if playlist.folder_id not in (None, "root", "")
+                else None
+            )
             playlist_item = TransferItem.create(
                 job.id,
                 EntityType.PLAYLIST,
@@ -661,17 +876,24 @@ class TransferPlanner:
                 playlist.source_id,
                 job.destination_platform,
                 original_position=playlists_position,
+                container_source_id=norm_folder_id,
                 source_metadata={
                     "name": playlist.name,
                     "description": playlist.description or "",
                     "track_count": playlist.track_count,
+                    "folder_id": norm_folder_id,
                 },
                 operation=TransferOperation.CREATE_PLAYLIST,
             )
-            playlist_item.destination_id = playlist.source_id if destination.can_reuse_identifier(
-                EntityType.PLAYLIST, job.source_platform
-            ) else None
-            playlist_item.match_method = _DIRECT_METHOD if playlist_item.destination_id else _NONE_METHOD
+            playlist_item.container_destination_id = None
+            playlist_item.destination_id = (
+                playlist.source_id
+                if destination.can_reuse_identifier(EntityType.PLAYLIST, job.source_platform)
+                else None
+            )
+            playlist_item.match_method = (
+                _DIRECT_METHOD if playlist_item.destination_id else _NONE_METHOD
+            )
             playlist_item.match_score = 1.0 if playlist_item.destination_id else 0.0
             playlist_item.status = (
                 ItemStatus.MATCHED if playlist_item.destination_id else ItemStatus.PENDING
@@ -728,7 +950,7 @@ class TransferPlanner:
             operation=TransferOperation.ADD_PLAYLIST_ITEM,
         )
 
-        if destination.can_reuse_identifier(EntityType.PLAYLIST_ITEM, job.source_platform):
+        if destination.can_reuse_identifier(EntityType.TRACK, job.source_platform):
             item.destination_id = track.source_id
             item.match_method = _DIRECT_METHOD
             item.match_score = 1.0

@@ -153,6 +153,140 @@ class TransferVerifier:
             if not container_id:
                 continue
             results[f"playlist:{container_id}"] = self.verify_playlist(container_id, expected)
+
+        # Verify folder hierarchy and playlist placement if any folders or playlists were transferred
+        transferred_folders = [
+            item
+            for item in items
+            if item.entity_type is EntityType.FOLDER
+            and item.status is ItemStatus.TRANSFERRED
+            and item.destination_id
+        ]
+        transferred_playlists = [
+            item
+            for item in items
+            if item.entity_type is EntityType.PLAYLIST
+            and item.status is ItemStatus.TRANSFERRED
+            and item.destination_id
+        ]
+        if transferred_folders or transferred_playlists:
+            try:
+                dest_snap = self._destination.export_library(sections=("folders", "playlists"))
+                if "folders" in dest_snap.incomplete_sections:
+                    results["incomplete:folders"] = VerificationResult(
+                        success=False,
+                        warnings=["verification_section_incomplete:folders"],
+                    )
+                if "playlists" in dest_snap.incomplete_sections:
+                    results["incomplete:playlists"] = VerificationResult(
+                        success=False,
+                        warnings=["verification_section_incomplete:playlists"],
+                    )
+
+                from .planner import folder_parent_source_id
+
+                dest_folders_by_id = {f.source_id: f for f in dest_snap.folders}
+                folder_items_by_src = {
+                    it.source_id: it for it in items if it.entity_type is EntityType.FOLDER
+                }
+
+                for f_item in transferred_folders:
+                    fid = str(f_item.destination_id)
+                    if fid not in dest_folders_by_id:
+                        results[f"folder:{fid}"] = VerificationResult(
+                            success=False,
+                            missing=[fid],
+                            warnings=["folder_missing"],
+                        )
+                        continue
+
+                    dest_folder = dest_folders_by_id[fid]
+                    expected_title = (
+                        f_item.source_metadata.get("name")
+                        or f_item.source_metadata.get("title")
+                        or f_item.source_id
+                    )
+                    parent_src = f_item.container_source_id
+                    if parent_src is None:
+                        expected_parent_dest = None
+                    else:
+                        parent_it = folder_items_by_src.get(parent_src)
+                        expected_parent_dest = parent_it.destination_id if parent_it else None
+
+                    actual_parent_dest = folder_parent_source_id(dest_folder)
+                    norm_expected_parent = (
+                        None
+                        if expected_parent_dest in (None, "root", "")
+                        else str(expected_parent_dest)
+                    )
+                    norm_actual_parent = (
+                        None
+                        if actual_parent_dest in (None, "root", "")
+                        else str(actual_parent_dest)
+                    )
+
+                    if dest_folder.title != expected_title:
+                        results[f"folder:{fid}"] = VerificationResult(
+                            success=False,
+                            missing=["title_mismatch"],
+                            warnings=[f"folder_title_mismatch:{dest_folder.title}!={expected_title}"],
+                        )
+                    elif norm_actual_parent != norm_expected_parent:
+                        results[f"folder:{fid}"] = VerificationResult(
+                            success=False,
+                            missing=["parent_mismatch"],
+                            warnings=[f"folder_parent_mismatch:{norm_actual_parent}!={norm_expected_parent}"],
+                        )
+                    else:
+                        results[f"folder:{fid}"] = VerificationResult(
+                            success=True,
+                            expected_count=1,
+                            actual_count=1,
+                        )
+
+                dest_playlists_by_id = {p.source_id: p for p in dest_snap.playlists}
+                for p_item in transferred_playlists:
+                    pid = str(p_item.destination_id)
+                    if pid not in dest_playlists_by_id:
+                        results[f"playlist_placement:{pid}"] = VerificationResult(
+                            success=False,
+                            missing=[pid],
+                            warnings=["playlist_missing"],
+                        )
+                        continue
+
+                    dest_pl = dest_playlists_by_id[pid]
+                    expected_folder_dest = p_item.container_destination_id
+                    norm_expected_folder = (
+                        None
+                        if expected_folder_dest in (None, "root", "")
+                        else str(expected_folder_dest)
+                    )
+                    actual_folder_dest = dest_pl.folder_id
+                    norm_actual_folder = (
+                        None
+                        if actual_folder_dest in (None, "root", "")
+                        else str(actual_folder_dest)
+                    )
+
+                    if norm_actual_folder != norm_expected_folder:
+                        results[f"playlist_placement:{pid}"] = VerificationResult(
+                            success=False,
+                            missing=["playlist_folder_mismatch"],
+                            warnings=["playlist_folder_mismatch"],
+                        )
+                    else:
+                        results[f"playlist_placement:{pid}"] = VerificationResult(
+                            success=True,
+                            expected_count=1,
+                            actual_count=1,
+                        )
+            except Exception as error:  # noqa: BLE001
+                self._logger.warning("event=folder_verification_unsupported error=%s", error)
+                results["folders"] = VerificationResult(
+                    success=False,
+                    warnings=[f"verification_unsupported:{error}"],
+                )
         for entity_type in (
             EntityType.TRACK,
             EntityType.ALBUM,

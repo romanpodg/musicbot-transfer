@@ -57,6 +57,17 @@ _TRACK_CATEGORY = "tracks"
 _ALBUM_CATEGORY = "albums"
 _ARTIST_CATEGORY = "artists"
 
+#: Explicit allowlist of portable catalog entity types for TIDAL.
+_REUSABLE_TIDAL_ENTITIES: frozenset[EntityType] = frozenset(
+    {
+        EntityType.TRACK,
+        EntityType.ALBUM,
+        EntityType.ARTIST,
+        EntityType.VIDEO,
+        EntityType.MIX,
+    }
+)
+
 
 class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
     """Expose TIDAL through the generic platform contract."""
@@ -416,10 +427,13 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
         except Exception as error:  # noqa: BLE001 - classified immediately below
             raise translate_provider_error(error, operation_is_write=True) from None
 
-    def create_folder(self, name: str, parent_id: str) -> str:
+    def create_folder(self, name: str, parent_id: str | None = None) -> str:
+        target_parent = "root" if parent_id is None else parent_id
         try:
-            return self._client.create_folder(name, parent_id)
+            return self._client.create_folder(name, target_parent)
         except (TidalClientError, ItemUnavailableError) as error:
+            raise translate_provider_error(error, operation_is_write=True) from None
+        except Exception as error:  # noqa: BLE001 - classified immediately below
             raise translate_provider_error(error, operation_is_write=True) from None
 
     def favorite_playlist(self, playlist_id: str, parent_id: str = "root") -> None:
@@ -466,19 +480,16 @@ class TidalAdapter(MusicPlatformAdapter, LibraryMaintenanceAdapter):
     def can_reuse_identifier(self, entity_type: EntityType, source: Platform) -> bool:
         """Return whether a source id can be written without a catalog search.
 
-        Tracks, albums, and artists live in TIDAL's shared catalogue, so an id
+        Tracks, albums, artists, videos, and mixes live in TIDAL's shared catalogue, so an id
         read from one account is valid on any other: a TIDAL -> TIDAL transfer
         can save it directly with no search at all.
 
-        A **playlist** is different.  Its id has the same shape, but the object
-        belongs to an account and does not exist on the destination until it is
-        created there.  Reporting a playlist id as reusable would let the
-        executor skip ``create_playlist`` and then fail writing every entry.
+        Playlists, playlist items, and folders belong to an account and are not portable.
         """
 
         if source is not Platform.TIDAL:
             return False
-        return entity_type is not EntityType.PLAYLIST
+        return entity_type in _REUSABLE_TIDAL_ENTITIES
 
     # -- internals ---------------------------------------------------------
 

@@ -39,6 +39,35 @@ def new_identifier(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
 
+_SENTINEL_UNSET: Any = object()
+
+
+def _is_resolved_media_metadata(meta: dict[str, Any] | None) -> bool:
+    """Return True if metadata describes a resolved track or video occurrence."""
+    if not meta:
+        return False
+    kind = str(meta.get("kind") or "").lower()
+    if kind in ("track", "video"):
+        return True
+    if kind == "unresolved":
+        return False
+    return bool("isrc" in meta or "artists" in meta or "duration_ms" in meta)
+
+
+def _infer_legacy_playlist_item_type(meta: dict[str, Any] | None) -> EntityType | None:
+    """Infer media type for legacy records where playlist_item_type is absent."""
+    if not meta:
+        return EntityType.TRACK
+    kind = str(meta.get("kind") or "").lower()
+    if kind == "video":
+        return EntityType.VIDEO
+    if kind == "unresolved":
+        return None
+    if kind in ("", "track"):
+        return EntityType.TRACK
+    return None
+
+
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
@@ -393,12 +422,12 @@ class TransferItem:
     mutation_state: MutationState = MutationState.NONE
     last_error: str | None = None
     last_failure_kind: str | None = None
-    playlist_item_type: EntityType | None = None
+    playlist_item_type: EntityType | None = _SENTINEL_UNSET  # type: ignore[assignment]
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
 
     def __post_init__(self) -> None:
-        if self.playlist_item_type is not None:
+        if self.playlist_item_type is not _SENTINEL_UNSET and self.playlist_item_type is not None:
             if self.playlist_item_type not in (EntityType.TRACK, EntityType.VIDEO):
                 raise InvalidPersistedStateError(
                     f"Unsupported playlist_item_type '{self.playlist_item_type}'"
@@ -407,14 +436,19 @@ class TransferItem:
                 raise InvalidPersistedStateError(
                     f"playlist_item_type '{self.playlist_item_type}' not allowed for entity_type '{self.entity_type}'"
                 )
-        elif self.entity_type is EntityType.PLAYLIST_ITEM:
-            meta = self.source_metadata or {}
-            if meta.get("kind") == "video":
-                self.playlist_item_type = EntityType.VIDEO
-            elif meta.get("kind") == "unresolved":
+        elif self.playlist_item_type is None:
+            if self.entity_type is EntityType.PLAYLIST_ITEM and _is_resolved_media_metadata(
+                self.source_metadata
+            ):
+                kind_label = (self.source_metadata or {}).get("kind", "media")
+                raise InvalidPersistedStateError(
+                    f"Contradictory persisted playlist item: playlist_item_type is null but metadata describes a resolved {kind_label}"
+                )
+        elif self.playlist_item_type is _SENTINEL_UNSET:
+            if self.entity_type is EntityType.PLAYLIST_ITEM:
+                self.playlist_item_type = _infer_legacy_playlist_item_type(self.source_metadata)
+            else:
                 self.playlist_item_type = None
-            elif meta.get("kind") in (None, "track"):
-                self.playlist_item_type = EntityType.TRACK
 
     @classmethod
     def create(
@@ -431,7 +465,7 @@ class TransferItem:
         source_metadata: dict[str, Any] | None = None,
         operation: TransferOperation = TransferOperation.NONE,
         mutation_state: MutationState = MutationState.NONE,
-        playlist_item_type: EntityType | None = None,
+        playlist_item_type: Any = _SENTINEL_UNSET,
     ) -> TransferItem:
         """Create a pending item with a fresh identifier."""
 
@@ -617,18 +651,19 @@ class TransferItem:
                     )
                 playlist_item_type = parsed_type
             else:
+                # Explicit null: do NOT infer TRACK/VIDEO
+                if entity_type is EntityType.PLAYLIST_ITEM and _is_resolved_media_metadata(
+                    value.get("source_metadata")
+                ):
+                    kind_label = (value.get("source_metadata") or {}).get("kind", "media")
+                    raise InvalidPersistedStateError(
+                        f"Contradictory persisted playlist item: playlist_item_type is null but metadata describes a resolved {kind_label}"
+                    )
                 playlist_item_type = None
         else:
+            # Field ABSENT: legacy inference allowed
             if entity_type is EntityType.PLAYLIST_ITEM:
-                meta = value.get("source_metadata") or {}
-                if meta.get("kind") == "video":
-                    playlist_item_type = EntityType.VIDEO
-                elif meta.get("kind") == "unresolved":
-                    playlist_item_type = None
-                elif meta.get("kind") in (None, "track"):
-                    playlist_item_type = EntityType.TRACK
-                else:
-                    playlist_item_type = None
+                playlist_item_type = _infer_legacy_playlist_item_type(value.get("source_metadata"))
             else:
                 playlist_item_type = None
 
@@ -745,11 +780,11 @@ class TransferPlanItem:
     container_destination_id: str | None = None
     original_position: int | None = None
     write_position: int | None = None
-    playlist_item_type: EntityType | None = None
+    playlist_item_type: EntityType | None = _SENTINEL_UNSET  # type: ignore[assignment]
     source_metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.playlist_item_type is not None:
+        if self.playlist_item_type is not _SENTINEL_UNSET and self.playlist_item_type is not None:
             if self.playlist_item_type not in (EntityType.TRACK, EntityType.VIDEO):
                 raise InvalidPersistedStateError(
                     f"Unsupported playlist_item_type '{self.playlist_item_type}'"
@@ -758,14 +793,23 @@ class TransferPlanItem:
                 raise InvalidPersistedStateError(
                     f"playlist_item_type '{self.playlist_item_type}' not allowed for entity_type '{self.entity_type}'"
                 )
-        elif self.entity_type is EntityType.PLAYLIST_ITEM:
-            meta = self.source_metadata or {}
-            if meta.get("kind") == "video":
-                object.__setattr__(self, "playlist_item_type", EntityType.VIDEO)
-            elif meta.get("kind") == "unresolved":
-                pass
-            elif meta.get("kind") in (None, "track"):
-                object.__setattr__(self, "playlist_item_type", EntityType.TRACK)
+        elif self.playlist_item_type is None:
+            if self.entity_type is EntityType.PLAYLIST_ITEM and _is_resolved_media_metadata(
+                self.source_metadata
+            ):
+                kind_label = (self.source_metadata or {}).get("kind", "media")
+                raise InvalidPersistedStateError(
+                    f"Contradictory persisted plan item: playlist_item_type is null but metadata describes a resolved {kind_label}"
+                )
+        elif self.playlist_item_type is _SENTINEL_UNSET:
+            if self.entity_type is EntityType.PLAYLIST_ITEM:
+                object.__setattr__(
+                    self,
+                    "playlist_item_type",
+                    _infer_legacy_playlist_item_type(self.source_metadata),
+                )
+            else:
+                object.__setattr__(self, "playlist_item_type", None)
 
     def as_dict(self) -> dict[str, Any]:
         """Serialize to JSON-compatible values."""
@@ -810,18 +854,19 @@ class TransferPlanItem:
                     )
                 playlist_item_type = parsed_type
             else:
+                # Explicit null: do NOT infer TRACK/VIDEO
+                if entity_type is EntityType.PLAYLIST_ITEM and _is_resolved_media_metadata(
+                    value.get("source_metadata")
+                ):
+                    kind_label = (value.get("source_metadata") or {}).get("kind", "media")
+                    raise InvalidPersistedStateError(
+                        f"Contradictory persisted plan item: playlist_item_type is null but metadata describes a resolved {kind_label}"
+                    )
                 playlist_item_type = None
         else:
+            # Field ABSENT: legacy inference allowed
             if entity_type is EntityType.PLAYLIST_ITEM:
-                meta = value.get("source_metadata") or {}
-                if meta.get("kind") == "video":
-                    playlist_item_type = EntityType.VIDEO
-                elif meta.get("kind") == "unresolved":
-                    playlist_item_type = None
-                elif meta.get("kind") in (None, "track"):
-                    playlist_item_type = EntityType.TRACK
-                else:
-                    playlist_item_type = None
+                playlist_item_type = _infer_legacy_playlist_item_type(value.get("source_metadata"))
             else:
                 playlist_item_type = None
 
@@ -1144,17 +1189,18 @@ class TransferPlan:
                                 )
                             pit = parsed_pit
                         else:
+                            # Explicit null: do NOT infer TRACK/VIDEO
+                            if legacy_entity is EntityType.PLAYLIST_ITEM and _is_resolved_media_metadata(
+                                item.get("source_metadata")
+                            ):
+                                kind_label = (item.get("source_metadata") or {}).get("kind", "media")
+                                raise InvalidPersistedStateError(
+                                    f"Contradictory persisted plan item: playlist_item_type is null but metadata describes a resolved {kind_label}"
+                                )
                             pit = None
                     elif legacy_entity is EntityType.PLAYLIST_ITEM:
-                        meta = item.get("source_metadata") or {}
-                        if meta.get("kind") == "video":
-                            pit = EntityType.VIDEO
-                        elif meta.get("kind") == "unresolved":
-                            pit = None
-                        elif meta.get("kind") in (None, "track"):
-                            pit = EntityType.TRACK
-                        else:
-                            pit = None
+                        # Field ABSENT: legacy inference allowed
+                        pit = _infer_legacy_playlist_item_type(item.get("source_metadata"))
                     else:
                         pit = None
                     items.append(

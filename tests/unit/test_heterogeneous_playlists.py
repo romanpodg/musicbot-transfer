@@ -360,6 +360,22 @@ class PlanIdentityAndCompatibilityTests(unittest.TestCase):
         plan_item = TransferPlanItem.from_dict(video_dict)
         self.assertEqual(plan_item.playlist_item_type, EntityType.VIDEO)
 
+        # Legacy TransferPlan.from_dict reconstruction
+        legacy_plan = TransferPlan.from_dict({
+            "plan_id": "p1", "revision": 1, "plan_hash": "h1", "job_id": "j1",
+            "source_platform": "tidal", "destination_platform": "tidal",
+            "items": [
+                {
+                    "entity_type": "playlist_item",
+                    "source_id": "video-1",
+                    "status": "matched",
+                    "operation": "add_playlist_item",
+                    "source_metadata": {"kind": "video", "title": "A Video"},
+                }
+            ],
+        })
+        self.assertEqual(legacy_plan.items[0].playlist_item_type, EntityType.VIDEO)
+
     def test_missing_legacy_playlist_item_type_with_clear_track_metadata_normalizes_to_track(self) -> None:
         """Legacy dictionary with missing playlist_item_type and track metadata normalizes to track."""
         track_dict = {
@@ -380,6 +396,168 @@ class PlanIdentityAndCompatibilityTests(unittest.TestCase):
         self.assertEqual(item.playlist_item_type, EntityType.TRACK)
         plan_item = TransferPlanItem.from_dict(track_dict)
         self.assertEqual(plan_item.playlist_item_type, EntityType.TRACK)
+
+        # Legacy TransferPlan.from_dict reconstruction
+        legacy_plan = TransferPlan.from_dict({
+            "plan_id": "p1", "revision": 1, "plan_hash": "h1", "job_id": "j1",
+            "source_platform": "tidal", "destination_platform": "tidal",
+            "items": [
+                {
+                    "entity_type": "playlist_item",
+                    "source_id": "track-1",
+                    "status": "matched",
+                    "operation": "add_playlist_item",
+                    "source_metadata": {"isrc": "US123", "artists": ["Artist A"]},
+                }
+            ],
+        })
+        self.assertEqual(legacy_plan.items[0].playlist_item_type, EntityType.TRACK)
+
+    def test_explicit_null_playlist_item_type_does_not_infer_track(self) -> None:
+        """Explicit null playlist_item_type with track metadata fails closed instead of inferring TRACK."""
+        track_dict: dict[str, Any] = {
+            "id": "item-null-1",
+            "job_id": "job-1",
+            "entity_type": "playlist_item",
+            "source_platform": "tidal",
+            "source_id": "track-null-1",
+            "destination_platform": "tidal",
+            "destination_id": "dst-track-1",
+            "operation": "add_playlist_item",
+            "planned_status": "matched",
+            "match_method": "direct_id",
+            "match_score": 1.0,
+            "playlist_item_type": None,
+            "source_metadata": {"kind": "track"},
+        }
+
+        # TransferItem.from_dict fails closed
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferItem.from_dict(track_dict)
+
+        # TransferPlanItem.from_dict fails closed
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferPlanItem.from_dict(track_dict)
+
+        # Direct construction fails closed
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferItem(
+                id="item-null-1",
+                job_id="job-1",
+                entity_type=EntityType.PLAYLIST_ITEM,
+                source_platform=Platform.TIDAL,
+                source_id="track-null-1",
+                destination_platform=Platform.TIDAL,
+                playlist_item_type=None,
+                source_metadata={"kind": "track"},
+            )
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferPlanItem(
+                entity_type=EntityType.PLAYLIST_ITEM,
+                source_id="track-null-1",
+                destination_id="dst-track-1",
+                operation=TransferOperation.ADD_PLAYLIST_ITEM,
+                planned_status=ItemStatus.MATCHED,
+                match_method=MatchMethod.DIRECT_ID,
+                match_score=1.0,
+                playlist_item_type=None,
+                source_metadata={"kind": "track"},
+            )
+
+        # Legacy TransferPlan.from_dict reconstruction fails closed
+        legacy_plan_dict: dict[str, Any] = {
+            "plan_id": "p1",
+            "revision": 1,
+            "plan_hash": "h1",
+            "job_id": "j1",
+            "source_platform": "tidal",
+            "destination_platform": "tidal",
+            "items": [
+                {
+                    "entity_type": "playlist_item",
+                    "source_id": "track-null-1",
+                    "status": "matched",
+                    "operation": "add_playlist_item",
+                    "playlist_item_type": None,
+                    "source_metadata": {"kind": "track"},
+                }
+            ],
+        }
+        with self.assertRaises(InvalidPersistedStateError):
+            TransferPlan.from_dict(legacy_plan_dict)
+
+    def test_explicit_null_unresolved_playlist_item_remains_none(self) -> None:
+        """Explicit null playlist_item_type with unresolved metadata remains None."""
+        unresolved_dict: dict[str, Any] = {
+            "id": "item-unres-1",
+            "job_id": "job-1",
+            "entity_type": "playlist_item",
+            "source_platform": "tidal",
+            "source_id": "unres-1",
+            "destination_platform": "tidal",
+            "destination_id": None,
+            "operation": "add_playlist_item",
+            "planned_status": "not_found",
+            "match_method": "none",
+            "match_score": 0.0,
+            "playlist_item_type": None,
+            "source_metadata": {"kind": "unresolved"},
+        }
+
+        item = TransferItem.from_dict(unresolved_dict)
+        self.assertIsNone(item.playlist_item_type)
+
+        plan_item = TransferPlanItem.from_dict(unresolved_dict)
+        self.assertIsNone(plan_item.playlist_item_type)
+
+        # Direct construction
+        item_direct = TransferItem(
+            id="item-unres-1",
+            job_id="job-1",
+            entity_type=EntityType.PLAYLIST_ITEM,
+            source_platform=Platform.TIDAL,
+            source_id="unres-1",
+            destination_platform=Platform.TIDAL,
+            playlist_item_type=None,
+            source_metadata={"kind": "unresolved"},
+        )
+        self.assertIsNone(item_direct.playlist_item_type)
+
+        plan_item_direct = TransferPlanItem(
+            entity_type=EntityType.PLAYLIST_ITEM,
+            source_id="unres-1",
+            destination_id=None,
+            operation=TransferOperation.ADD_PLAYLIST_ITEM,
+            planned_status=ItemStatus.NOT_FOUND,
+            match_method=MatchMethod.NONE,
+            match_score=0.0,
+            playlist_item_type=None,
+            source_metadata={"kind": "unresolved"},
+        )
+        self.assertIsNone(plan_item_direct.playlist_item_type)
+
+        # Legacy TransferPlan.from_dict reconstruction
+        legacy_plan_dict: dict[str, Any] = {
+            "plan_id": "p1",
+            "revision": 1,
+            "plan_hash": "h1",
+            "job_id": "j1",
+            "source_platform": "tidal",
+            "destination_platform": "tidal",
+            "items": [
+                {
+                    "entity_type": "playlist_item",
+                    "source_id": "unres-1",
+                    "status": "not_found",
+                    "operation": "add_playlist_item",
+                    "playlist_item_type": None,
+                    "source_metadata": {"kind": "unresolved"},
+                }
+            ],
+        }
+        plan = TransferPlan.from_dict(legacy_plan_dict)
+        self.assertEqual(len(plan.items), 1)
+        self.assertIsNone(plan.items[0].playlist_item_type)
 
     def test_transfer_plan_item_rejects_invalid_playlist_item_type(self) -> None:
         """TransferPlanItem constructor rejects invalid or non-playlist_item entity types."""
